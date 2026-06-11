@@ -6,6 +6,7 @@
 pub mod finalize_slot;
 pub mod grpc;
 pub mod hash_checker;
+pub mod health;
 pub mod lt_hash;
 pub mod panic_handler;
 pub mod save_block;

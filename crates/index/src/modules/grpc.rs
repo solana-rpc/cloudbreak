@@ -64,13 +64,11 @@ pub fn subscribe_grpc_with_reconnection(
     buffer_channel_rx_len: Arc<Mutex<usize>>,
     last_slot_received: Arc<Mutex<u64>>,
     cancel: Arc<AtomicBool>,
-    grpc_reconnected: Arc<AtomicBool>,
     db: DatabaseConnection,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let _guard = metrics::TokioTaskCounterGuard::new("grpc");
         let mut log_first_message = true;
-        let mut is_first_connect = true;
         let mut connect_failed_since: Option<Instant> = None;
 
         loop {
@@ -78,12 +76,6 @@ pub fn subscribe_grpc_with_reconnection(
                 tracing::info!("GRPC subscription cancelled");
                 return;
             }
-
-            if !is_first_connect {
-                // Used to trigger (only once) the `force_finalize_lost_slots` if a gap was created
-                grpc_reconnected.store(true, Ordering::SeqCst);
-            }
-            is_first_connect = false;
 
             let grpc_timeout = Duration::from_secs(config.grpc.timeout);
 

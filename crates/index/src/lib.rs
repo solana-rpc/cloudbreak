@@ -8,3 +8,4 @@ pub mod error;
 pub mod indexer;
 pub mod metrics;
 pub mod modules;
+pub mod operational_endpoints;

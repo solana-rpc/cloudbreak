@@ -32,11 +32,10 @@ pub async fn save_block(
     let IndexerState {
         snapshot_processing_state,
         self_healing_state: _,
-        updated_accounts_map,
+        slot_finalizer,
         updated_accounts_during_startup: _,
         buffer_channel_rx_len: _,
         finalize_slot_buffer_size,
-        pending_gap_fill_replays: _,
         accounts_owner_map,
     } = indexer_state;
 
@@ -186,28 +185,20 @@ pub async fn save_block(
         None
     };
 
-    // Update the HashMap with the accounts that were updated in the slot
-    let result = updated_accounts_map
-        .lock()
-        .expect("Failed to lock updated_accounts_map")
-        .insert(
-            slot,
-            AccountsReceivedPerBlock {
-                block_time: block.block_time,
-                accounts: updated_accounts_for_slot,
-                closed_accounts: closed_accounts_for_slot,
-            },
-        );
-    if result.is_some() {
-        tracing::error!(
-            "Updated accounts for slot {} already exists - MAP LEN: {}",
-            slot,
-            updated_accounts_map
-                .lock()
-                .expect("Failed to lock updated_accounts_map")
-                .len()
-        );
-    }
+    // Record the block data in the finalizer map (keyed by slot). It is held there until the slot
+    // is finalized (via a finalized notification or the ancestor walk). For snapshot-repaired
+    // blocks the chain fields are empty/zero.
+    slot_finalizer.record_block(
+        slot,
+        AccountsReceivedPerBlock {
+            block_time: block.block_time,
+            accounts: updated_accounts_for_slot,
+            closed_accounts: closed_accounts_for_slot,
+        },
+        block.blockhash.clone(),
+        block.parent_slot,
+        block.parent_blockhash.clone(),
+    );
 
     let chunks_length = chunks.len();
     tracing::debug!(target: "chunks_length", "chunks_length: {}", chunks_length);

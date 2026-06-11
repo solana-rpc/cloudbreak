@@ -172,6 +172,22 @@ impl SnapshotPair {
 
 const RETRY_WAIT_SECS: Duration = Duration::from_secs(10);
 
+/// Base directory where a snapshot for `slot` is downloaded and unpacked (e.g. `./snapshot_123`).
+pub fn snapshot_base_dir(slot: u64) -> PathBuf {
+    PathBuf::from(format!("./snapshot_{}", slot))
+}
+
+/// Like [`snapshot_base_dir`] but suffixed with a millisecond timestamp (e.g.
+/// `./snapshot_123_1700000000000`). Used by self-healing gap fills so concurrent/sequential
+/// downloads for the same slot never collide on disk.
+pub fn snapshot_base_dir_timestamped(slot: u64) -> PathBuf {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    PathBuf::from(format!("./snapshot_{}_{}", slot, timestamp))
+}
+
 /// Returns what are the correct snapshots to be downloaded based on the received slot and sidecar available snapshots
 /// If target_slot is not provided, it will return the latest available full and incremental snapshot pair
 ///
@@ -250,6 +266,7 @@ pub async fn download_snapshot_file(
     sidecar_endpoint: &str,
     snapshot_data: SnapshotData,
     snapshot_type: SnapshotType,
+    base_dir: &Path,
 ) -> Result<()> {
     let url = if let Some(download_url) = snapshot_data.download_url {
         download_url
@@ -281,13 +298,10 @@ pub async fn download_snapshot_file(
         sidecar_endpoint,
     );
 
-    let file_path = format!(
-        "./snapshot_{}/{}",
-        snapshot_data.slot, snapshot_data.file_name
-    );
+    let file_path = base_dir.join(&snapshot_data.file_name);
 
     // Create the directory if it doesn't exist
-    if let Some(parent) = Path::new(&file_path).parent() {
+    if let Some(parent) = file_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
 
@@ -330,12 +344,13 @@ pub async fn download_snapshot_file(
 
 pub fn unpack_compressed_snapshot<P: Into<PathBuf>>(
     path: P,
+    base_dir: &Path,
     slot: u64,
 ) -> Result<Vec<AccountFileData>> {
     let start_time = Instant::now();
     let path_buf: PathBuf = path.into();
 
-    let temp_dir = PathBuf::from(format!("./snapshot_{}/uncompressed_snapshot", slot));
+    let temp_dir = base_dir.join("uncompressed_snapshot");
 
     let file = std::fs::File::open(path_buf)?;
 
