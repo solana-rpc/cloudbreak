@@ -37,8 +37,10 @@ timeout = 60
 chunk-size = 1000
 max-chunk-bytes-data = 2097152
 # The max number of grpc errors before trying to reconnect
-#  (it will always reconnect on a single stream `None`)
-max-grpc-errors = 1
+#  (it will always reconnect on a single stream `None`).
+#  Keep this at 10 or higher; setting it to 1 causes the indexer to exit on
+#  the first transient gRPC hiccup (e.g. a brief network blip).
+max-grpc-errors = 10
 # The buffer size for queuing subscription events
 channel-size = 1000
 
