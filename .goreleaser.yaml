@@ -1,0 +1,76 @@
+# .goreleaser.yaml for solana-rpc/cloudbreak
+#
+# All workspace binaries are built in a single cargo build invocation via
+# before.hooks (avoids cargo file-lock contention from parallel builds).
+# Each build entry then uses tool:/bin/true so goreleaser skips cargo entirely
+# and picks up the already-compiled binaries from the target directory.
+#
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+
+version: 2
+
+before:
+  hooks:
+    - sh -c "git rev-parse --short HEAD > short-commit-hash.txt"
+    - cargo build --release --target x86_64-unknown-linux-gnu --package=cloudbreak --package=cloudbreak-migration --package=cloudbreak-dbtools --package=integration_tests
+
+builds:
+  - id: cloudbreak
+    builder: rust
+    tool: /bin/true
+    binary: cloudbreak
+    targets:
+      - x86_64-unknown-linux-gnu
+    flags:
+      - --package=cloudbreak
+
+  - id: cloudbreak-migration
+    builder: rust
+    tool: /bin/true
+    binary: cloudbreak-migration
+    targets:
+      - x86_64-unknown-linux-gnu
+    flags:
+      - --package=cloudbreak-migration
+
+  - id: cloudbreak-dbtools
+    builder: rust
+    tool: /bin/true
+    binary: cloudbreak-dbtools
+    targets:
+      - x86_64-unknown-linux-gnu
+    flags:
+      - --package=cloudbreak-dbtools
+
+  - id: integration_tests
+    builder: rust
+    tool: /bin/true
+    binary: integration_tests
+    targets:
+      - x86_64-unknown-linux-gnu
+    flags:
+      - --package=integration_tests
+
+archives:
+  - formats: [binary]
+    name_template: >-
+      {{ .Binary }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else }}{{ .Arch }}{{ end }}
+      {{- if .Arm }}v{{ .Arm }}{{ end }}
+    files:
+      - short-commit-hash.txt
+
+release:
+  github:
+    owner: solana-rpc
+    name: cloudbreak
+  draft: true
+  header: |
+    rust {{ .Env.RUST_VERSION }}
+
+changelog:
+  sort: asc
+  use: github
