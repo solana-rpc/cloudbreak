@@ -167,7 +167,9 @@ impl SlotFinalizer {
                 // If queue lenght < bound, insert and return immediately. Else wait for space to be available.
                 if inner.pending.len() < self.bound {
                     inner.pending.insert(slot);
-                    self.set_pending_metric();
+                    let len = inner.pending.len();
+                    drop(inner);
+                    self.set_pending_metric(len);
                     self.work_available.notify_one();
                     return;
                 }
@@ -179,13 +181,13 @@ impl SlotFinalizer {
     /// Inserts a slot directly into the pending queue without respecting the back-pressure bound.
     /// (vs [`Self::note_finalized`] which respects the bound).
     pub fn enqueue_unbounded(&self, slot: u64) {
-        self.inner
-            .lock()
-            .expect("Failed to lock finalizer")
-            .pending
-            .insert(slot);
+        let len = {
+            let mut inner = self.inner.lock().expect("Failed to lock finalizer");
+            inner.pending.insert(slot);
+            inner.pending.len()
+        };
 
-        self.set_pending_metric();
+        self.set_pending_metric(len);
         self.work_available.notify_one();
     }
 
@@ -235,14 +237,7 @@ impl SlotFinalizer {
             .map(|e| e.blockhash.clone())
     }
 
-    fn set_pending_metric(&self) {
-        let len = self
-            .inner
-            .lock()
-            .expect("Failed to lock finalizer")
-            .pending
-            .len();
-
+    fn set_pending_metric(&self, len: usize) {
         metrics::FINALIZE_SLOT_HANDLER_QUEUE_SIZE.set(len as i64);
     }
 
@@ -279,7 +274,14 @@ impl SlotFinalizer {
 
                 self.finalize_slot_with_ancestors(slot).await;
 
-                self.set_pending_metric();
+                let len = self
+                    .inner
+                    .lock()
+                    .expect("Failed to lock finalizer")
+                    .pending
+                    .len();
+
+                self.set_pending_metric(len);
                 // Notify (for `Self::note_finalized`) that a slot was finalized and there is space in the queue.
                 self.space_available.notify_one();
             }
