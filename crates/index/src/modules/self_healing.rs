@@ -4,7 +4,7 @@
  */
 
 use cloudbreak_core::{IndexConfig, SnapshotConfig};
-use cloudbreak_snapshot::sidecar::SnapshotType;
+use cloudbreak_snapshot::sidecar::{SnapshotPair, SnapshotType};
 use sea_orm::DatabaseConnection;
 use std::{
     collections::{BTreeSet, HashSet},
@@ -145,6 +145,10 @@ impl SelfHealingState {
     /// newest slot in the gaps list and processing only the slots that are in the gaps list. The
     /// repaired slots are recorded and enqueued for finalization; once the gaps list drains,
     /// finalization is resumed (which marks the service healthy again).
+    ///
+    /// Gap slots at or below the incremental snapshot's base slot are outside the snapshot range
+    /// and can never be repaired from it (see the coverage NOTE in the loop body). They are logged
+    /// as an error and intentionally left in the gaps list.
     pub async fn fill_gaps(
         self,
         db: DatabaseConnection,
@@ -214,17 +218,75 @@ impl SelfHealingState {
                     pg_indexes: snapshot_config.pg_indexes.clone(),
                 };
 
-                let (handle, mut rx) = match download_and_process_snapshot_for_gap_filling(
-                    Some(newest_slot_in_gaps_list),
-                    snapshot_config,
-                    confirmed_gaps_list.clone(),
+                let snapshot_pair = match fetch_snapshot_pair_for_gap_filling(
+                    &snapshot_config.tracker_endpoint.endpoint,
+                    newest_slot_in_gaps_list,
                 )
                 .await
                 {
-                    Ok((handle, rx)) => (handle, rx),
+                    Ok(snapshot_pair) => snapshot_pair,
                     Err(e) => {
                         tracing::warn!(
                             "Snapshot is not available for gap filling yet, waiting for next iteration (error: {:?})",
+                            e
+                        );
+                        continue;
+                    }
+                };
+
+                let (base_slot, snapshot_slot) = match snapshot_pair
+                    .incremental_snapshot
+                    .as_ref()
+                    .and_then(|incremental| {
+                        incremental.base_slot.map(|base| (base, incremental.slot))
+                    }) {
+                    Some(slots) => slots,
+                    None => {
+                        tracing::error!(
+                            "Snapshot pair for gap filling is missing the incremental snapshot or its base slot, waiting for next iteration"
+                        );
+                        continue;
+                    }
+                };
+
+                // An incremental snapshot only contains account storages for slots in
+                // `(base_slot, snapshot_slot]`.
+                //
+                // NOTE: the lower bound is *exclusive*. An account whose last write happened
+                // exactly at `base_slot` lives in the FULL snapshot's storage for that slot, not
+                // in the incremental one.
+                let (covered_gaps_list, uncovered_gaps_list): (Vec<u64>, Vec<u64>) =
+                    confirmed_gaps_list
+                        .iter()
+                        .copied()
+                        .partition(|&slot| slot > base_slot);
+
+                if !uncovered_gaps_list.is_empty() {
+                    // Intentionally left in the gaps list: they can never be repaired from this
+                    // (or any newer) incremental snapshot, so finalization stays paused and the
+                    // service stays unhealthy until an operator intervenes.
+                    tracing::error!(
+                        target: "self_healing",
+                        "Gap slots {:?} are not repaired: they are outside the snapshot range (incremental snapshot covers slots > {} up to {}) - leaving them in the gaps list, the service stays unhealthy",
+                        uncovered_gaps_list,
+                        base_slot,
+                        snapshot_slot
+                    );
+                }
+
+                if covered_gaps_list.is_empty() {
+                    continue;
+                }
+
+                let (handle, mut rx) = match download_and_process_snapshot_for_gap_filling(
+                    snapshot_pair,
+                    snapshot_config,
+                    covered_gaps_list.clone(),
+                ) {
+                    Ok((handle, rx)) => (handle, rx),
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to start snapshot processing for gap filling, waiting for next iteration (error: {:?})",
                             e
                         );
                         continue;
@@ -254,11 +316,11 @@ impl SelfHealingState {
 
                 handle.await??;
 
-                // Every gap slot the snapshot did NOT emit a block for had no account data: it is an
-                // empty/skipped slot with nothing to repair. Crucially these slots are not part of
-                // the chain the ancestor walk follows (they have no blockhash), so they are expected
-                // to be absent.
-                let empty_slots: Vec<u64> = confirmed_gaps_list
+                // Every covered gap slot the snapshot did NOT emit a block for has no surviving
+                // account data in the snapshot: either the slot was skipped/empty, or it was a
+                // real block whose account writes were all superseded by later slots (so there is
+                // nothing left to repair).
+                let empty_slots: Vec<u64> = covered_gaps_list
                     .iter()
                     .copied()
                     .filter(|slot| !repaired_slots.contains(slot))
@@ -266,9 +328,9 @@ impl SelfHealingState {
                 if !empty_slots.is_empty() {
                     tracing::debug!(
                         target: "self_healing_empty_slots",
-                        "Gap fill from snapshot: {} of {} gap slot(s) had no accounts (empty slots, nothing to repair, not in the ancestor chain): {:?}",
+                        "Gap fill from snapshot: {} of {} covered gap slot(s) had no accounts in the snapshot (skipped slots or fully superseded blocks, nothing to repair): {:?}",
                         empty_slots.len(),
-                        confirmed_gaps_list.len(),
+                        covered_gaps_list.len(),
                         empty_slots
                     );
                     for slot in &empty_slots {
@@ -297,7 +359,7 @@ impl SelfHealingState {
                 let elapsed = start_time.elapsed().as_secs_f64();
                 tracing::info!(
                     "Finished filling gaps: {:?} - in {} seconds",
-                    confirmed_gaps_list,
+                    covered_gaps_list,
                     elapsed
                 );
 
@@ -357,8 +419,30 @@ impl SelfHealingState {
     }
 }
 
-async fn download_and_process_snapshot_for_gap_filling(
-    received_slot: Option<u64>,
+/// Fetches a snapshot pair from the tracker whose incremental snapshot covers `target_slot`,
+/// giving up after 60 seconds if no covering pair is available yet.
+async fn fetch_snapshot_pair_for_gap_filling(
+    tracker_endpoint: &str,
+    target_slot: u64,
+) -> Result<SnapshotPair, anyhow::Error> {
+    let snapshot_pair_future = cloudbreak_snapshot::sidecar::get_snapshot_data(
+        tracker_endpoint,
+        Some(target_slot),
+        true,
+        true,
+    );
+
+    tokio::time::timeout(Duration::from_secs(60), snapshot_pair_future).await?
+}
+
+/// Spawns the download and processing of the pair's incremental snapshot, emitting a block on the
+/// returned channel for every gap slot that has account data in the snapshot.
+///
+/// `gaps_list` must only contain slots covered by the incremental snapshot (strictly greater than
+/// its base slot); the caller is responsible for partitioning out uncovered slots.
+#[allow(clippy::type_complexity)]
+fn download_and_process_snapshot_for_gap_filling(
+    snapshot_pair: SnapshotPair,
     config: SnapshotConfig,
     gaps_list: Vec<u64>,
 ) -> Result<
@@ -368,16 +452,6 @@ async fn download_and_process_snapshot_for_gap_filling(
     ),
     anyhow::Error,
 > {
-    let snapshot_pair_future = cloudbreak_snapshot::sidecar::get_snapshot_data(
-        &config.tracker_endpoint.endpoint,
-        received_slot,
-        true,
-        true,
-    );
-
-    let snapshot_pair =
-        tokio::time::timeout(Duration::from_secs(60), snapshot_pair_future).await??;
-
     let (tx, rx) = tokio::sync::mpsc::channel::<SubscribeUpdateBlock>(100);
 
     // We passed the force_returned_incremental flag to true, so we know that the snapshot pair contains an incremental snapshot
