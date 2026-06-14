@@ -326,7 +326,7 @@ impl SelfHealingState {
                     .filter(|slot| !repaired_slots.contains(slot))
                     .collect();
                 if !empty_slots.is_empty() {
-                    tracing::debug!(
+                    tracing::info!(
                         target: "self_healing_empty_slots",
                         "Gap fill from snapshot: {} of {} covered gap slot(s) had no accounts in the snapshot (skipped slots or fully superseded blocks, nothing to repair): {:?}",
                         empty_slots.len(),

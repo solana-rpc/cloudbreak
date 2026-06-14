@@ -336,18 +336,15 @@ impl SlotFinalizer {
         loop {
             let parent_matches = match inner.blocks.get(&parent_slot) {
                 Some(parent) => {
-                    let incorrect_parent =
-                        !parent_hash.is_empty() && parent.blockhash == parent_hash;
-                    if incorrect_parent {
+                    let parent_matches = !parent_hash.is_empty() && parent.blockhash == parent_hash;
+                    if !parent_matches {
                         tracing::warn!(
                             target: "finalize_anomaly",
-                            "Slot {} has incorrect parent: {} (expected: {})",
-                            slot,
-                            parent.blockhash,
-                            parent_hash
+                            "Slot {} points at parent_blockhash: {}, but parent slot {} has: {} (possible fork)",
+                            slot, parent_hash, parent_slot, parent.blockhash
                         );
                     }
-                    incorrect_parent
+                    parent_matches
                 }
                 None => false,
             };
