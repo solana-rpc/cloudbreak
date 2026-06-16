@@ -146,7 +146,8 @@ pub fn log_filter_handler(req: &Request<Incoming>) -> Result<HttpHandlerResponse
 ///   "enabled": true,
 ///   "config": {
 ///     "max_total_bytes": 1073741824,
-///     "min_bytes_per_query": 65536
+///     "min_bytes_per_query": 65536,
+///     "max_bytes_query_cleanup": 104857600
 ///   },
 ///   "stats": {
 ///     "size_bytes": 234567890,
@@ -377,6 +378,8 @@ struct GpaCacheResponse {
 struct GpaCacheConfigInfo {
     max_total_bytes: usize,
     min_bytes_per_query: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_bytes_query_cleanup: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -450,6 +453,7 @@ fn build_gpa_cache_response(
     let config = GpaCacheConfigInfo {
         max_total_bytes,
         min_bytes_per_query: cache.config.min_bytes_per_query,
+        max_bytes_query_cleanup: cache.config.max_bytes_query_cleanup,
     };
 
     let queries = match params.detail {

@@ -57,3 +57,5 @@ interval_ms = 200
 [gpa-cache]
 max-total-bytes = 1_073_741_824 # 1GB
 min-bytes-per-query = 1_048_576 # 1MB
+# Optional: queries larger than this are pinned and never evicted by cleanup.
+# max-bytes-query-cleanup = 104_857_600 # 100MB

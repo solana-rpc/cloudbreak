@@ -535,6 +535,12 @@ pub struct GpaCacheConfig {
     /// And for avoid cleaning up more relevant queries.
     #[serde(rename = "min-bytes-per-query")]
     pub min_bytes_per_query: usize,
+    /// Optional upper bound (in bytes) on the size of a query that is eligible
+    /// for eviction. Queries larger than this are kept in the cache and never
+    /// evicted by cleanup (they remain until replaced by a newer version of the
+    /// same query). `None` (key omitted) means every cached query is evictable.
+    #[serde(rename = "max-bytes-query-cleanup", default)]
+    pub max_bytes_query_cleanup: Option<usize>,
 }
 
 #[derive(Deserialize, Debug, Clone)]

@@ -4,6 +4,7 @@
  */
 
 use bytes::Bytes;
+use cloudbreak_core::GpaCacheConfig;
 use sea_orm::sqlx::Row;
 use sea_orm::sqlx::postgres::PgRow;
 use solana_account_decoder::UiAccountEncoding;
@@ -19,7 +20,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
-use cloudbreak_core::GpaCacheConfig;
 
 use crate::error::RpcError;
 use crate::methods::program;
@@ -464,30 +464,62 @@ impl GpaCache {
     /// Returns the number of bytes freed.
     ///
     /// It will only cleanup if space is needed for the new query.
+    ///
+    /// Queries larger than `config.max_bytes_query_cleanup` (when set) are
+    /// pinned: they are skipped during eviction and kept in the cache. Because
+    /// of this, cleanup may free less than requested when the oldest slots hold
+    /// mostly pinned queries.
     pub fn cleanup_old_queries(&mut self, mut bytes_to_free: u64) -> Option<u64> {
         let mut bytes_freed: u64 = 0;
 
-        let available_bytes = self.config.max_total_bytes as u64 - self.size;
+        let available_bytes = match (self.config.max_total_bytes as u64).checked_sub(self.size) {
+            Some(available_bytes) => available_bytes,
+            None => {
+                tracing::error!(target: "gpa_cache", "Cache size is greater than max total bytes");
+                return None;
+            }
+        };
         if available_bytes >= bytes_to_free {
             return None;
         } else {
             bytes_to_free -= available_bytes;
         }
 
-        while bytes_freed < bytes_to_free && !self.queries_for_slot.is_empty() {
-            // Grab and remove the oldest slot.
-            let Some((_slot, bucket)) = self.queries_for_slot.pop_first() else {
-                break; // cache is empty
-            };
-            for q in bucket {
-                if let Some(cached) = self.queries.remove(&q) {
-                    self.size = self.size.saturating_sub(cached.size);
+        let max_evictable = self.config.max_bytes_query_cleanup.map(|b| b as u64);
+
+        // Walk slots oldest-first (`BTreeMap::retain` visits in ascending key
+        // order), draining evictable queries from each bucket in place. Queries
+        // larger than the threshold are pinned: left in their bucket and skipped.
+        // A slot whose bucket becomes empty is dropped from the map.
+        //
+        // Borrow `queries`/`size` separately from `queries_for_slot` so the
+        // closure can mutate them while iterating.
+        let queries = &mut self.queries;
+        let size = &mut self.size;
+        self.queries_for_slot.retain(|_slot, bucket| {
+            if bytes_freed >= bytes_to_free {
+                return true; // enough freed: leave remaining slots untouched
+            }
+            bucket.retain(|q| {
+                if bytes_freed >= bytes_to_free {
+                    return true;
+                }
+                // Pin (keep) queries larger than the configured threshold.
+                if let Some(max_evictable) = max_evictable
+                    && queries.get(q).is_some_and(|c| c.size > max_evictable)
+                {
+                    return true;
+                }
+                if let Some(cached) = queries.remove(q) {
+                    *size = size.saturating_sub(cached.size);
                     bytes_freed = bytes_freed.saturating_add(cached.size);
                 }
-            }
-        }
+                false
+            });
+            !bucket.is_empty()
+        });
 
-        Some(bytes_freed)
+        Some(bytes_freed + available_bytes)
     }
 }
 
