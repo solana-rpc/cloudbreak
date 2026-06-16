@@ -96,6 +96,8 @@ pub fn log_filter_handler(req: &Request<Incoming>) -> Result<HttpHandlerResponse
 /// | `with_pubkeys`    | bool    | `false`   | When `true`, each query in the listing also includes the cached account pubkeys. Requires `program` to be set, otherwise the response could be huge. |
 /// | `min_size_bytes`  | u64     | unset     | Filters the per-query listing to queries whose cached `size_bytes` is `>= min_size_bytes`. Ignored when `detail=summary`. |
 /// | `max_size_bytes`  | u64     | unset     | Filters the per-query listing to queries whose cached `size_bytes` is `<= max_size_bytes`. Ignored when `detail=summary`. |
+/// | `min_cache_hit_percent` | f64 | unset   | Filters the per-query listing to queries whose `cache_hit_percent` is `>= min_cache_hit_percent` (0–100). Ignored when `detail=summary`. |
+/// | `max_cache_hit_percent` | f64 | unset   | Filters the per-query listing to queries whose `cache_hit_percent` is `<= max_cache_hit_percent` (0–100). Ignored when `detail=summary`. |
 /// | `limit`           | usize   | unset     | Caps the per-query listing to at most this many entries (applied after all filters and the default newest-slot-first sort). Ignored when `detail=summary`. |
 ///
 /// ### `detail` values
@@ -127,7 +129,9 @@ pub fn log_filter_handler(req: &Request<Incoming>) -> Result<HttpHandlerResponse
 ///
 /// - `200 OK` — successful response.
 /// - `400 Bad Request` — invalid query parameter (bad `detail` value,
-///   un-parseable `program`, `with_pubkeys=true` without `program`).
+///   un-parseable `program`, `with_pubkeys=true` without `program`,
+///   `min_size_bytes > max_size_bytes`, a cache-hit percent outside `0..=100`,
+///   or `min_cache_hit_percent > max_cache_hit_percent`).
 /// - `503 Service Unavailable` — cache `RwLock` is poisoned (a prior request
 ///   panicked while holding the write lock).
 ///
@@ -211,6 +215,12 @@ pub fn log_filter_handler(req: &Request<Incoming>) -> Result<HttpHandlerResponse
 /// ```text
 /// curl 'http://localhost:8899/debug/modules/gpa_cache?detail=queries&min_size_bytes=1048576&limit=20'
 /// ```
+///
+/// Poorly-cached queries (per-account hit ratio below 50%):
+///
+/// ```text
+/// curl 'http://localhost:8899/debug/modules/gpa_cache?detail=queries&max_cache_hit_percent=50'
+/// ```
 pub fn gpa_cache_handler(
     req: &Request<Incoming>,
     state: &CloudbreakRpcState,
@@ -257,6 +267,8 @@ struct GpaCacheParams {
     with_pubkeys: bool,
     min_size_bytes: Option<u64>,
     max_size_bytes: Option<u64>,
+    min_cache_hit_percent: Option<f64>,
+    max_cache_hit_percent: Option<f64>,
     limit: Option<usize>,
 }
 
@@ -274,6 +286,8 @@ impl GpaCacheParams {
         let mut with_pubkeys = false;
         let mut min_size_bytes: Option<u64> = None;
         let mut max_size_bytes: Option<u64> = None;
+        let mut min_cache_hit_percent: Option<f64> = None;
+        let mut max_cache_hit_percent: Option<f64> = None;
         let mut limit: Option<usize> = None;
 
         if let Some(q) = query {
@@ -322,6 +336,14 @@ impl GpaCacheParams {
                                 format!("invalid `max_size_bytes` value '{v}': {e}")
                             })?);
                     }
+                    "min_cache_hit_percent" => {
+                        min_cache_hit_percent =
+                            Some(parse_percent("min_cache_hit_percent", v.as_ref())?);
+                    }
+                    "max_cache_hit_percent" => {
+                        max_cache_hit_percent =
+                            Some(parse_percent("max_cache_hit_percent", v.as_ref())?);
+                    }
                     "limit" => {
                         limit = Some(
                             v.parse::<usize>()
@@ -350,15 +372,48 @@ impl GpaCacheParams {
             ));
         }
 
+        if let (Some(min), Some(max)) = (min_cache_hit_percent, max_cache_hit_percent)
+            && min > max
+        {
+            return Err(format!(
+                "`min_cache_hit_percent` ({min}) must be <= `max_cache_hit_percent` ({max})"
+            ));
+        }
+
         Ok(Self {
             detail,
             program,
             with_pubkeys,
             min_size_bytes,
             max_size_bytes,
+            min_cache_hit_percent,
+            max_cache_hit_percent,
             limit,
         })
     }
+}
+
+/// Per-account cache-hit ratio of a cached query, as a percentage in `[0, 100]`.
+/// Returns `0.0` for an empty query to avoid dividing by zero.
+fn compute_cache_hit_percent(cache_hits: u64, account_count: usize) -> f64 {
+    if account_count == 0 {
+        0.0
+    } else {
+        (cache_hits as f64) / (account_count as f64) * 100.0
+    }
+}
+
+/// Parses a percentage query-param value, requiring a finite number in `[0, 100]`.
+fn parse_percent(key: &str, value: &str) -> Result<f64, String> {
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|e| format!("invalid `{key}` value '{value}': {e}"))?;
+    if !parsed.is_finite() || !(0.0..=100.0).contains(&parsed) {
+        return Err(format!(
+            "`{key}` value '{value}' must be a number between 0 and 100"
+        ));
+    }
+    Ok(parsed)
 }
 
 // ----- Response structs ------------------------------------------------------
@@ -473,6 +528,22 @@ fn build_gpa_cache_response(
                     params.min_size_bytes.map(|m| cq.size >= m).unwrap_or(true)
                         && params.max_size_bytes.map(|m| cq.size <= m).unwrap_or(true)
                 })
+                .filter(|(_, cq)| {
+                    if params.min_cache_hit_percent.is_none()
+                        && params.max_cache_hit_percent.is_none()
+                    {
+                        return true;
+                    }
+                    let hit_percent = compute_cache_hit_percent(cq.cache_hits, cq.accounts.len());
+                    params
+                        .min_cache_hit_percent
+                        .map(|m| hit_percent >= m)
+                        .unwrap_or(true)
+                        && params
+                            .max_cache_hit_percent
+                            .map(|m| hit_percent <= m)
+                            .unwrap_or(true)
+                })
                 .map(|(nq, cq)| {
                     let account_pubkeys = if params.with_pubkeys {
                         Some(cq.accounts.keys().map(|pk| pk.to_string()).collect())
@@ -481,11 +552,7 @@ fn build_gpa_cache_response(
                     };
 
                     let account_count = cq.accounts.len();
-                    let cache_hit_percent = if account_count == 0 {
-                        0.0
-                    } else {
-                        (cq.cache_hits as f64) / (account_count as f64) * 100.0
-                    };
+                    let cache_hit_percent = compute_cache_hit_percent(cq.cache_hits, account_count);
 
                     GpaCacheQueryInfo {
                         program: nq.program.to_string(),
