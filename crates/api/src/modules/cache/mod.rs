@@ -269,8 +269,12 @@ impl GpaProcessor {
             .queries
             .insert(normalized_query.clone(), new_entry);
 
-        // Update map size
+        // Update map size, crediting back the bytes of the query we just
+        // replaced (if any) so the counter tracks what is actually held.
         cache_guard.size += query_bytes;
+        if let Some(older_query) = &older_query {
+            cache_guard.size = cache_guard.size.saturating_sub(older_query.size);
+        }
 
         cache_guard.insert_query_for_slot(normalized_query.clone(), *new_slot, older_query);
 
