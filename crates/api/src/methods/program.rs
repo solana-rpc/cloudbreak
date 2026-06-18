@@ -316,14 +316,22 @@ fn gpa_db_query(
     let (tx, rx) = mpsc::unbounded_channel::<Result<Vec<PgRow>, RpcError>>();
 
     let metrics_data_clone = input.metrics_data.clone();
+    let parent_span = tracing::Span::current();
     tokio::spawn(async move {
         let db_query = async {
             let mut db_query_total_ms = Duration::from_millis(0);
             let mut db_first_row_time = Duration::from_millis(0);
 
-            let db_span = tracing::info_span!("gpa_db", wall_time = tracing::field::Empty);
-            let db_execution_span =
-                tracing::info_span!("gpa_db_execution", wall_time = tracing::field::Empty);
+            let db_span = tracing::info_span!(
+                parent: &parent_span,
+                "gpa_db",
+                wall_time = tracing::field::Empty
+            );
+            let db_execution_span = tracing::info_span!(
+                parent: &parent_span,
+                "gpa_db_execution",
+                wall_time = tracing::field::Empty
+            );
             let mut first_loop_iteration = true;
 
             let mut rows = sqlx::raw_sql(&sql).fetch(&pool);
