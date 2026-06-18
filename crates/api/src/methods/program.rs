@@ -208,11 +208,6 @@ pub async fn get_program_accounts(
         }
     }
 
-    // Buffer query for batch submission to remote query tracker (if enabled)
-    if let Some(client) = &state.query_tracker_client {
-        client.buffer_query(program, Some(config.clone()));
-    }
-
     if let Some(ref filters) = config.filters {
         for filter in filters {
             filter
@@ -323,7 +318,7 @@ fn gpa_db_query(
     let parent_span = tracing::Span::current();
     tokio::spawn(async move {
         let db_query = async {
-            let mut db_query_total_ms = Duration::from_millis(0);
+            let mut db_query_total_time = Duration::from_millis(0);
             let mut db_first_row_time = Duration::from_millis(0);
 
             let db_span = tracing::info_span!(
@@ -361,7 +356,7 @@ fn gpa_db_query(
                     rows.next().instrument(db_span.clone()).await
                 };
 
-                db_query_total_ms += before.elapsed();
+                db_query_total_time += before.elapsed();
 
                 let Some(row) = next_row else { break };
 
@@ -390,12 +385,20 @@ fn gpa_db_query(
                 let _ = tx.send(Ok(batch));
             }
 
+            if let Some(client) = &input.state.query_tracker_client {
+                client.buffer_query(
+                    input.program,
+                    Some(input.config.clone()),
+                    db_query_total_time.as_micros() as u64,
+                );
+            }
+
             // Record db metrics
             metrics_data_clone.set_db_metrics(
-                db_query_total_ms.as_millis() as f64,
+                db_query_total_time.as_millis() as f64,
                 db_first_row_time.as_millis() as f64,
             );
-            db_span.record("wall_time", db_query_total_ms.as_millis() as i64);
+            db_span.record("wall_time", db_query_total_time.as_millis() as i64);
         };
 
         if timeout(queries_timeout, db_query).await.is_err() {

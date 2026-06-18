@@ -607,6 +607,16 @@ impl SlotSyncronizerConfig {
 #[derive(Deserialize, Debug, Clone)]
 pub struct QueryTrackerConfig {
     #[serde(
+        rename = "cost-eligibility-threshold-us",
+        default = "QueryTrackerConfig::default_cost_eligibility_threshold_us"
+    )]
+    pub cost_eligibility_threshold_us: Option<u64>,
+    #[serde(
+        rename = "cost-weighting",
+        default = "QueryTrackerConfig::default_cost_weighting"
+    )]
+    pub cost_weighting: bool,
+    #[serde(
         rename = "create-database-indexes",
         default = "QueryTrackerConfig::default_create_database_indexes"
     )]
@@ -656,6 +666,14 @@ pub struct QueryTrackerConfig {
 }
 
 impl QueryTrackerConfig {
+    const fn default_cost_eligibility_threshold_us() -> Option<u64> {
+        None
+    }
+
+    const fn default_cost_weighting() -> bool {
+        false
+    }
+
     const fn default_create_database_indexes() -> bool {
         false
     }
@@ -694,6 +712,8 @@ impl Default for QueryTrackerConfig {
     fn default() -> Self {
         Self {
             create_database_indexes: Self::default_create_database_indexes(),
+            cost_eligibility_threshold_us: Self::default_cost_eligibility_threshold_us(),
+            cost_weighting: Self::default_cost_weighting(),
             index_generation_threshold: Self::default_index_generation_threshold(),
             index_creation_delay: Self::default_index_creation_delay(),
             query_counts_reset_interval: Self::default_query_counts_reset_interval(),
