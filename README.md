@@ -428,10 +428,12 @@ The first batch is always peeked synchronously before the response status line i
 
 Optional in-memory cache for `getProgramAccounts` responses. Omitting this section disables the module entirely.
 
-| Key                   | Type    | Default      | Description                                                                                                                                          |
-| --------------------- | ------- | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `max-total-bytes`     | `usize` | **required** | Maximum cache size in bytes. When inserting a new query would exceed this, the oldest cached queries (by slot) are evicted until enough room exists. |
-| `min-bytes-per-query` | `usize` | **required** | Minimum serialized size of a query for it to be cached at all. Smaller queries are skipped so they don't dilute room available for heavier ones.     |
+| Key                      | Type     | Default      | Description                                                                                                                                                                                                                                                              |
+| ------------------------ | -------- | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `max-total-bytes`        | `usize`  | **required** | Maximum cache size in bytes. When inserting a new query would exceed this, the oldest cached queries (by slot) are evicted until enough room exists.                                                                                                                          |
+| `min-bytes-per-query`    | `usize`  | **required** | Minimum serialized size of a query for it to be cached at all. Smaller queries are skipped so they don't dilute room available for heavier ones.                                                                                                                             |
+| `max-bytes-query-cleanup`| `usize`  | (unset)      | Optional upper bound on the size of a query that is eligible for eviction. Queries **larger** than this are pinned: they are normally skipped by cleanup and stay cached (until replaced by a newer version of the same query). The pin is *soft* — see `max-pinned-bytes-ratio`. Omit to make every cached query evictable. Note: when the oldest slots are mostly pinned (and under the pinned cap), a new insert may fail to free enough room and be skipped. |
+| `max-pinned-bytes-ratio` | `f64`    | (unset)      | Cap on how much space pinned queries may collectively occupy, expressed as a fraction of `max-total-bytes` (e.g. `0.5` = at most half the cache). When pinned usage exceeds `max-total-bytes × ratio`, the **oldest** pinned queries are evicted via the normal cleanup process until usage drops back under the cap — so the pin set can never grow unbounded. **Required** when `max-bytes-query-cleanup` is set (config load fails otherwise); ignored when it is unset (nothing is pinned). Must be in the range `(0.0, 1.0]`. |
 
 The cache is keyed by `(program, sorted filters, encoding, data_slice, commitment)` and holds the **pre-serialized JSON bytes** of each account, ref-counted via `bytes::Bytes`. Concretely:
 
@@ -439,7 +441,7 @@ The cache is keyed by `(program, sorted filters, encoding, data_slice, commitmen
 - **Cache hits are zero-copy and zero-allocation.** Cached account bytes are appended into the outgoing response buffer by ref-counting an existing `Bytes` slice — no clone, no re-encode, no extra allocation.
 - **No JSON re-serialization.** Cached entries store the exact JSON fragment that already left the encoder once; on subsequent serves the same bytes are emitted verbatim.
 
-Eviction is age-ordered by slot (oldest cached query goes first). Cache state is observable at runtime via [`/debug/modules/gpa_cache`](#api-server-default-4000).
+Eviction is age-ordered by slot (oldest cached query goes first), skipping any query pinned by `max-bytes-query-cleanup`. Pinning is bounded: once pinned queries collectively exceed `max-total-bytes × max-pinned-bytes-ratio`, the oldest pinned queries are evicted in the same age order until usage is back under the cap. Current pinned usage, the configured ratio, and the resulting threshold are reported by [`/debug/modules/gpa_cache`](#api-server-default-4000) (`stats.pinned_size_bytes`, `config.max_pinned_bytes_ratio`, `stats.pinned_threshold_bytes`).
 
 #### `[database]`
 

@@ -527,14 +527,66 @@ pub struct ApiConfig {
 
 /// Config for the `cache` optional module for the API.
 #[derive(Deserialize, Debug, Clone)]
+#[serde(try_from = "GpaCacheConfigRaw")]
 pub struct GpaCacheConfig {
     /// Max total size of the cache in bytes.
-    #[serde(rename = "max-total-bytes")]
     pub max_total_bytes: usize,
     /// Used to avoid small queries for which the cache is not worth it.
     /// And for avoid cleaning up more relevant queries.
-    #[serde(rename = "min-bytes-per-query")]
     pub min_bytes_per_query: usize,
+    /// Optional upper bound (in bytes) on the size of a query that is eligible
+    /// for eviction. Queries larger than this are kept in the cache and never
+    /// evicted by cleanup (they remain until replaced by a newer version of the
+    /// same query). `None` (key omitted) means every cached query is evictable.
+    pub max_bytes_query_cleanup: Option<usize>,
+    /// Max fraction of `max_total_bytes` that pinned (non-evictable) queries may
+    /// collectively occupy. When pinned usage exceeds this cap, the oldest
+    /// pinned queries are evicted via the normal cleanup process until usage is
+    /// back under the cap. Required when `max_bytes_query_cleanup` is set, and
+    /// ignored otherwise (no query is pinned without `max_bytes_query_cleanup`).
+    pub max_pinned_bytes_ratio: Option<f64>,
+}
+
+/// Raw, file-facing shape of [`GpaCacheConfig`]. Deserialized first so we can
+/// run cross-field validation in `TryFrom` before exposing the typed config.
+#[derive(Deserialize, Debug, Clone)]
+struct GpaCacheConfigRaw {
+    #[serde(rename = "max-total-bytes")]
+    max_total_bytes: usize,
+    #[serde(rename = "min-bytes-per-query")]
+    min_bytes_per_query: usize,
+    #[serde(rename = "max-bytes-query-cleanup", default)]
+    max_bytes_query_cleanup: Option<usize>,
+    #[serde(rename = "max-pinned-bytes-ratio", default)]
+    max_pinned_bytes_ratio: Option<f64>,
+}
+
+impl TryFrom<GpaCacheConfigRaw> for GpaCacheConfig {
+    type Error = String;
+
+    fn try_from(raw: GpaCacheConfigRaw) -> std::result::Result<Self, Self::Error> {
+        if raw.max_bytes_query_cleanup.is_some() && raw.max_pinned_bytes_ratio.is_none() {
+            return Err(
+                "`max-pinned-bytes-ratio` is required when `max-bytes-query-cleanup` is set"
+                    .to_string(),
+            );
+        }
+
+        if let Some(ratio) = raw.max_pinned_bytes_ratio
+            && !(ratio > 0.0 && ratio <= 1.0)
+        {
+            return Err(format!(
+                "`max-pinned-bytes-ratio` must be greater than 0.0 and at most 1.0, got {ratio}"
+            ));
+        }
+
+        Ok(Self {
+            max_total_bytes: raw.max_total_bytes,
+            min_bytes_per_query: raw.min_bytes_per_query,
+            max_bytes_query_cleanup: raw.max_bytes_query_cleanup,
+            max_pinned_bytes_ratio: raw.max_pinned_bytes_ratio,
+        })
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]

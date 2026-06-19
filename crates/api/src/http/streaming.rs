@@ -32,7 +32,7 @@ use solana_rpc_client_api::response::RpcResponseContext;
 use tokio::time::Instant;
 
 use crate::error::RpcError;
-use crate::methods::program::GpaStreamingResponse;
+use crate::methods::program::{GpaStreamingResponse, encoding_to_string};
 use crate::metrics;
 use crate::modules::cache::MaybeJsonAccount;
 
@@ -54,9 +54,12 @@ pub async fn gpa_streaming_response_body(
     gpa_global_start_time: Instant,
     subscription_id: String,
 ) -> Result<UnsyncBoxBody<Bytes, Infallible>, RpcError> {
+    let _guard = metrics::InFlightRequestGuard::new("gpa_streaming");
     let mut accounts_stream = gpa_response.accounts_stream;
     let metrics_data = gpa_response.metrics_data;
     let mut gpa_processor = gpa_response.gpa_processor;
+    let program = gpa_response.program;
+    let encoding = gpa_response.encoding;
 
     let first_batch = match accounts_stream.next().await {
         Some(Err(e)) => return Err(e),
@@ -68,10 +71,19 @@ pub async fn gpa_streaming_response_body(
         StreamingResponseBodyWrapper::new(gpa_response.context_slot, id);
 
     let body_stream = stream! {
-        let json_span = tracing::info_span!("json_encoding", wall_time = tracing::field::Empty, json_bytes = tracing::field::Empty, total_wall_time = tracing::field::Empty);
+        let json_span = tracing::info_span!(
+            "json_encoding",
+            program = %program,
+            encoding = encoding_to_string(&encoding),
+            accounts = tracing::field::Empty,
+            wall_time = tracing::field::Empty,
+            json_bytes = tracing::field::Empty,
+            total_wall_time = tracing::field::Empty,
+        );
 
         let mut json_encode_ms = Duration::from_millis(0);
         let mut json_bytes = 0u64;
+        let mut accounts_count = first_batch.len() as u64;
         json_bytes += streaming_response_body_wrapper.start.len() as u64;
 
         // Yield with the start of the JSON array
@@ -106,6 +118,8 @@ pub async fn gpa_streaming_response_body(
                     return;
                 }
             };
+
+            accounts_count += batch.len() as u64;
 
             for acc in batch {
                 let account_start_time = Instant::now();
@@ -182,8 +196,9 @@ pub async fn gpa_streaming_response_body(
             );
         }
 
+        json_span.record("accounts", accounts_count as i64);
         json_span.record("wall_time", json_encode_ms.as_millis() as i64);
-        json_span.record("json_bytes", json_bytes);
+        json_span.record("json_bytes", json_bytes as i64);
         json_span.record("total_wall_time", gpa_global_start_time.elapsed().as_millis() as i64);
 
         // Commit the accumulated `(pubkey, bytes)` pairs as the new cached query

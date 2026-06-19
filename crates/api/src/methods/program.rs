@@ -18,6 +18,7 @@ use crate::metrics::GpaMetricsData;
 use crate::modules::cache::{GpaProcessor, KeyedRpcAccount, MaybeJsonAccount};
 use crate::{db_query, metrics};
 use async_stream::try_stream;
+use cloudbreak_entity::slots;
 use futures::{Stream, StreamExt};
 use rust_decimal::prelude::ToPrimitive;
 use sea_orm::EntityTrait;
@@ -33,7 +34,6 @@ use solana_rpc_client_api::response::RpcKeyedAccount;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio::time::{Instant, timeout};
 use tracing::Instrument;
-use cloudbreak_entity::slots;
 
 pub const MAX_BASE58_BYTES: usize = 128;
 
@@ -48,6 +48,8 @@ pub struct GpaStreamingResponse {
     /// All context slot data will be added to json using this on [`gpa_streaming_response_body`]
     pub context_slot: Option<u64>,
     pub gpa_processor: GpaProcessor,
+    pub program: Pubkey,
+    pub encoding: UiAccountEncoding,
 }
 
 #[tracing::instrument(name = "gpa_rpc", skip_all, fields(program = %program))]
@@ -63,6 +65,11 @@ pub async fn get_program_accounts(
     let program = program
         .parse::<solana_pubkey::Pubkey>()
         .map_err(|_| RpcError::InvalidParams)?;
+
+    let encoding = config
+        .account_config
+        .encoding
+        .unwrap_or(UiAccountEncoding::Binary);
 
     if !state.indexer_filter.is_program_selected(&program) {
         return Err(RpcError::KeyExcludedFromSecondaryIndex {
@@ -164,6 +171,8 @@ pub async fn get_program_accounts(
                     })),
                     metrics_data: response.metrics_data,
                     gpa_processor: GpaProcessor::Standard,
+                    program,
+                    encoding,
                 });
             }
             Err(_) => {
@@ -267,6 +276,8 @@ pub async fn get_program_accounts(
         accounts_stream: encoded_accounts_stream,
         metrics_data: Some(metrics_data),
         gpa_processor: request_processor,
+        program,
+        encoding,
     })
 }
 
@@ -305,14 +316,22 @@ fn gpa_db_query(
     let (tx, rx) = mpsc::unbounded_channel::<Result<Vec<PgRow>, RpcError>>();
 
     let metrics_data_clone = input.metrics_data.clone();
+    let parent_span = tracing::Span::current();
     tokio::spawn(async move {
         let db_query = async {
             let mut db_query_total_ms = Duration::from_millis(0);
             let mut db_first_row_time = Duration::from_millis(0);
 
-            let db_span = tracing::info_span!("gpa_db", wall_time = tracing::field::Empty);
-            let db_execution_span =
-                tracing::info_span!("gpa_db_execution", wall_time = tracing::field::Empty);
+            let db_span = tracing::info_span!(
+                parent: &parent_span,
+                "gpa_db",
+                wall_time = tracing::field::Empty
+            );
+            let db_execution_span = tracing::info_span!(
+                parent: &parent_span,
+                "gpa_db_execution",
+                wall_time = tracing::field::Empty
+            );
             let mut first_loop_iteration = true;
 
             let mut rows = sqlx::raw_sql(&sql).fetch(&pool);
