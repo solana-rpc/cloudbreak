@@ -4,11 +4,12 @@
  */
 
 use crate::tracker;
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbErr, Statement};
+use cloudbreak_core::QueryTrackerConfig;
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement, TransactionTrait};
 use solana_pubkey::Pubkey;
 use cloudbreak_core::modules::rpc_filter_type::RpcProgramAccountsConfig;
+use std::collections::{HashMap, HashSet};
 use tracing::{error, info, warn};
-use cloudbreak_core::QueryTrackerConfig;
 
 const COUNT_AUTO_INDEXES_SQL: &str = "SELECT COUNT(*) FROM pg_indexes \
     WHERE schemaname = 'public' \
@@ -39,6 +40,213 @@ async fn count_auto_indexes(db: &DatabaseConnection) -> Option<usize> {
             None
         }
     }
+}
+
+const READ_AUTO_INDEX_USAGE_SQL: &str = "SELECT u.index_name, \
+    COALESCE(SUM(s.idx_scan), 0)::bigint AS idx_scan, \
+    COALESCE(SUM(pg_relation_size(COALESCE(t.relid, c.oid))), 0)::bigint AS bytes \
+    FROM auto_index_usage u \
+    JOIN pg_class c ON c.relname = u.index_name AND c.relkind IN ('i', 'I') \
+    JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = 'public' \
+    LEFT JOIN LATERAL pg_partition_tree(c.oid) t ON true \
+    LEFT JOIN pg_stat_user_indexes s ON s.indexrelid = COALESCE(t.relid, c.oid) \
+    GROUP BY u.index_name";
+
+#[tracing::instrument(name = "index_eviction_task", skip_all)]
+pub async fn index_eviction_task(db: DatabaseConnection, config: QueryTrackerConfig) {
+    if !config.index_eviction_enabled {
+        info!(
+            target: "query_tracker_index_eviction",
+            "Index eviction disabled; task not running"
+        );
+        return;
+    }
+
+    let interval = config.index_eviction_interval;
+    info!(
+        target: "query_tracker_index_eviction",
+        "Index eviction task started (interval: {:?}, min-idle: {:?}, min-age-grace: {:?})",
+        interval, config.index_min_idle, config.index_min_age_grace
+    );
+
+    loop {
+        tokio::time::sleep(interval).await;
+        if let Err(e) = run_eviction_pass(&db, &config).await {
+            error!(
+                target: "query_tracker_index_eviction",
+                "Index eviction pass failed: {:?}", e
+            );
+        }
+    }
+}
+
+async fn run_eviction_pass(
+    db: &DatabaseConnection,
+    config: &QueryTrackerConfig,
+) -> Result<(), DbErr> {
+    let backend = db.get_database_backend();
+
+    let track_counts_on = db
+        .query_one(Statement::from_string(
+            backend,
+            "SELECT current_setting('track_counts') = 'on' AS enabled",
+        ))
+        .await?
+        .map(|row| row.try_get::<bool>("", "enabled"))
+        .transpose()?
+        .unwrap_or(false);
+    if !track_counts_on {
+        warn!(
+            target: "query_tracker_index_eviction",
+            "track_counts is off; index scan stats are frozen — skipping eviction pass to avoid \
+             dropping in-use indexes"
+        );
+        return Ok(());
+    }
+
+    db.execute(Statement::from_string(
+        backend,
+        "DELETE FROM auto_index_usage WHERE index_name NOT IN (\
+            SELECT c.relname FROM pg_class c \
+            JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = 'public' \
+            WHERE c.relkind IN ('i', 'I'))",
+    ))
+    .await?;
+
+    let rows = db
+        .query_all(Statement::from_string(backend, READ_AUTO_INDEX_USAGE_SQL))
+        .await?;
+
+    let mut index_bytes: HashMap<String, i64> = HashMap::new();
+
+    for row in &rows {
+        let name: String = row.try_get("", "index_name")?;
+        let idx_scan: i64 = row.try_get("", "idx_scan")?;
+        let bytes: i64 = row.try_get("", "bytes")?;
+        index_bytes.insert(name.clone(), bytes);
+
+        db.execute(Statement::from_sql_and_values(
+            backend,
+            "UPDATE auto_index_usage SET \
+               last_seen_used = CASE WHEN $2 <> last_idx_scan THEN now() ELSE last_seen_used END, \
+               last_idx_scan = $2 \
+             WHERE index_name = $1",
+            [name.into(), idx_scan.into()],
+        ))
+        .await?;
+    }
+
+    let min_idle_secs = config.index_min_idle.as_secs() as i64;
+    let min_age_grace_secs = config.index_min_age_grace.as_secs() as i64;
+    let candidate_rows = db
+        .query_all(Statement::from_sql_and_values(
+            backend,
+            "SELECT index_name FROM auto_index_usage \
+             WHERE EXTRACT(EPOCH FROM (now() - last_seen_used)) > $1 \
+               AND EXTRACT(EPOCH FROM (now() - created_at)) > $2",
+            [min_idle_secs.into(), min_age_grace_secs.into()],
+        ))
+        .await?;
+
+    let candidates: HashSet<String> = candidate_rows
+        .iter()
+        .map(|r| r.try_get::<String>("", "index_name"))
+        .collect::<Result<_, _>>()?;
+
+    if candidates.is_empty() {
+        return Ok(());
+    }
+
+    let existing: HashSet<String> = index_bytes.keys().cloned().collect();
+
+    let to_evict = indexes_to_evict(&candidates, &existing);
+    let mut reclaimed_bytes: i64 = 0;
+    let mut evicted = 0usize;
+    for idx in &to_evict {
+        match drop_auto_index(db, backend, idx).await {
+            Ok(()) => {
+                reclaimed_bytes += index_bytes.get(idx).copied().unwrap_or(0);
+                evicted += 1;
+            }
+            Err(e) => {
+                warn!(
+                    target: "query_tracker_index_eviction",
+                    "Failed to evict idle auto-index '{}': {:?}; will retry next pass", idx, e
+                );
+            }
+        }
+    }
+
+    if evicted > 0 {
+        info!(
+            target: "query_tracker_index_eviction",
+            "Evicted {} idle auto-index(es), reclaiming ~{} bytes",
+            evicted, reclaimed_bytes
+        );
+    }
+
+    Ok(())
+}
+
+fn twin_index_name(name: &str) -> Option<String> {
+    if let Some(suffix) = name.strip_prefix("idx_snapshot_accounts_") {
+        (!suffix.is_empty()).then(|| format!("idx_accounts_{suffix}"))
+    } else if let Some(suffix) = name.strip_prefix("idx_accounts_") {
+        (!suffix.is_empty()).then(|| format!("idx_snapshot_accounts_{suffix}"))
+    } else {
+        None
+    }
+}
+
+fn indexes_to_evict(candidates: &HashSet<String>, existing: &HashSet<String>) -> Vec<String> {
+    candidates
+        .iter()
+        .filter(|name| match twin_index_name(name) {
+            Some(twin) => candidates.contains(&twin) || !existing.contains(&twin),
+            None => false,
+        })
+        .cloned()
+        .collect()
+}
+
+fn is_safe_index_identifier(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+async fn drop_auto_index(
+    db: &DatabaseConnection,
+    backend: DbBackend,
+    index_name: &str,
+) -> Result<(), DbErr> {
+    if !is_safe_index_identifier(index_name) {
+        return Err(DbErr::Custom(format!(
+            "refusing to drop index with unexpected name '{index_name}'"
+        )));
+    }
+
+    let txn = db.begin().await?;
+    txn.execute(Statement::from_string(
+        backend,
+        "SET LOCAL lock_timeout = '5s'".to_string(),
+    ))
+    .await?;
+    txn.execute(Statement::from_string(
+        backend,
+        format!("DROP INDEX IF EXISTS {index_name}"),
+    ))
+    .await?;
+    txn.execute(Statement::from_sql_and_values(
+        backend,
+        "DELETE FROM auto_index_usage WHERE index_name = $1",
+        [index_name.into()],
+    ))
+    .await?;
+    txn.commit().await?;
+
+    Ok(())
 }
 
 pub fn check_program_in_index_list(program: Pubkey, config: &QueryTrackerConfig) -> bool {
@@ -176,6 +384,22 @@ async fn create_index_for_table(
                 index_name,
                 start_time.elapsed().as_secs_f64()
             );
+
+            let full_name = format!("idx_{table_name}_{index_name}").to_lowercase();
+            let register = Statement::from_sql_and_values(
+                db.get_database_backend(),
+                "INSERT INTO auto_index_usage (index_name, last_idx_scan, last_seen_used, created_at) \
+                 VALUES ($1, 0, now(), now()) \
+                 ON CONFLICT (index_name) DO UPDATE SET \
+                   last_idx_scan = 0, last_seen_used = now(), created_at = now()",
+                [full_name.as_str().into()],
+            );
+            if let Err(e) = db.execute(register).await {
+                warn!(
+                    target: "query_tracker_index_listener",
+                    "Failed to register auto-index '{}' for eviction tracking: {:?}", full_name, e
+                );
+            }
         }
         Err(e) => {
             if is_duplicate_index_error(&e) {
@@ -220,4 +444,66 @@ fn is_duplicate_index_error(err: &DbErr) -> bool {
 
 fn is_connection_error(err: &DbErr) -> bool {
     matches!(err, DbErr::ConnectionAcquire(_) | DbErr::Conn(_))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn twin_maps_between_the_two_tables() {
+        assert_eq!(
+            twin_index_name("idx_accounts_abc_o0l8").as_deref(),
+            Some("idx_snapshot_accounts_abc_o0l8")
+        );
+        assert_eq!(
+            twin_index_name("idx_snapshot_accounts_abc_o0l8").as_deref(),
+            Some("idx_accounts_abc_o0l8")
+        );
+        assert_eq!(twin_index_name("pg_unrelated_index"), None);
+        assert_eq!(twin_index_name("idx_accounts_"), None);
+        assert_eq!(twin_index_name("idx_snapshot_accounts_"), None);
+    }
+
+    #[test]
+    fn evicts_both_when_pair_is_idle() {
+        let pair = set(&["idx_accounts_abc", "idx_snapshot_accounts_abc"]);
+        let mut got = indexes_to_evict(&pair, &pair);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                "idx_accounts_abc".to_string(),
+                "idx_snapshot_accounts_abc".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn keeps_idle_index_when_twin_still_active() {
+        let candidates = set(&["idx_snapshot_accounts_abc"]);
+        let existing = set(&["idx_accounts_abc", "idx_snapshot_accounts_abc"]);
+        assert!(indexes_to_evict(&candidates, &existing).is_empty());
+    }
+
+    #[test]
+    fn evicts_orphan_when_twin_no_longer_exists() {
+        let candidates = set(&["idx_snapshot_accounts_abc"]);
+        let existing = set(&["idx_snapshot_accounts_abc"]);
+        assert_eq!(
+            indexes_to_evict(&candidates, &existing),
+            vec!["idx_snapshot_accounts_abc".to_string()]
+        );
+    }
+
+    #[test]
+    fn ignores_names_outside_the_auto_index_convention() {
+        let candidates = set(&["some_random_index"]);
+        let existing = set(&["some_random_index"]);
+        assert!(indexes_to_evict(&candidates, &existing).is_empty());
+    }
 }

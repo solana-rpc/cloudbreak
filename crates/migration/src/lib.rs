@@ -18,6 +18,7 @@ mod m20260325_000000_drop_temp_tables;
 mod m20260414_000000_create_indexer_filters_table;
 mod m20260522_000000_create_environment_info_table;
 mod m20260528_000000_create_epoch_stakes_table;
+mod m20260618_000000_create_auto_index_usage_table;
 
 pub struct Migrator;
 
@@ -36,6 +37,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260414_000000_create_indexer_filters_table::Migration),
             Box::new(m20260522_000000_create_environment_info_table::Migration),
             Box::new(m20260528_000000_create_epoch_stakes_table::Migration),
+            Box::new(m20260618_000000_create_auto_index_usage_table::Migration),
         ]
     }
 }
