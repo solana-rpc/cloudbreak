@@ -5,7 +5,7 @@
 
 use jsonrpsee::proc_macros::rpc;
 use serde::{Deserialize, Serialize};
-use solana_rpc_client_api::config::RpcProgramAccountsConfig;
+use cloudbreak_core::modules::rpc_filter_type::RpcProgramAccountsConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryTrackerStatus {

@@ -27,9 +27,8 @@ use solana_account_decoder::{
 };
 use solana_commitment_config::CommitmentLevel;
 use solana_pubkey::Pubkey;
-use solana_rpc_client_api::config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
-
-use solana_rpc_client_api::filter::RpcFilterType;
+use cloudbreak_core::modules::rpc_filter_type::{RpcFilterType, RpcProgramAccountsConfig};
+use solana_rpc_client_api::config::RpcAccountInfoConfig;
 use solana_rpc_client_api::response::{
     Response as RpcResponse, RpcKeyedAccount, RpcResponseContext,
 };

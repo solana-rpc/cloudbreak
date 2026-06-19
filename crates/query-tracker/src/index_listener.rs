@@ -6,7 +6,7 @@
 use crate::tracker;
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbErr, Statement};
 use solana_pubkey::Pubkey;
-use solana_rpc_client_api::config::RpcProgramAccountsConfig;
+use cloudbreak_core::modules::rpc_filter_type::RpcProgramAccountsConfig;
 use tracing::{error, info, warn};
 use cloudbreak_core::QueryTrackerConfig;
 

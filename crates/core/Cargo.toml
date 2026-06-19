@@ -30,5 +30,9 @@ cloudbreak-entity = { workspace = true }
 yellowstone-grpc-proto = { workspace = true }
 solana-pubkey = { workspace = true }
 solana-program = { workspace = true }
+solana-rpc-client-api = { workspace = true }
 rust_decimal = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+serde_json = "1.0.143"

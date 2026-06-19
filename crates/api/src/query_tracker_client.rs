@@ -5,8 +5,8 @@
 
 use reqwest::Client;
 use serde::Serialize;
+use cloudbreak_core::modules::rpc_filter_type::RpcProgramAccountsConfig;
 use solana_pubkey::Pubkey;
-use solana_rpc_client_api::config::RpcProgramAccountsConfig;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

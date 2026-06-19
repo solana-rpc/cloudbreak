@@ -3,10 +3,9 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+use cloudbreak_core::modules::rpc_filter_type::{RpcFilterType, RpcProgramAccountsConfig};
 use serde::Serialize;
 use solana_pubkey::Pubkey;
-use solana_rpc_client_api::config::RpcProgramAccountsConfig;
-use solana_rpc_client_api::filter::RpcFilterType;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -204,6 +203,9 @@ fn parse_gpa_config(
                 }
             }
             RpcFilterType::TokenAccountState => {}
+            // ValueCmp is a value comparison, not an equality/substring match,
+            // so it does not map onto index generation; ignore it here.
+            RpcFilterType::ValueCmp(_) => {}
         }
     }
 
@@ -390,7 +392,7 @@ mod tests {
     use std::str::FromStr;
 
     use super::*;
-    use solana_rpc_client_api::filter::{Memcmp, MemcmpEncodedBytes};
+    use cloudbreak_core::modules::rpc_filter_type::{Memcmp, MemcmpEncodedBytes};
 
     #[test]
     fn test_parse_memcmp_bytes_encoding() {

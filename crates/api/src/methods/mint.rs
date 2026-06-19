@@ -7,9 +7,8 @@ use crate::error::RpcError;
 use crate::methods::is_token_program;
 use sea_orm::sqlx::Row;
 use sea_orm::{DatabaseConnection, sqlx};
+use cloudbreak_core::modules::rpc_filter_type::{RpcFilterType, RpcProgramAccountsConfig};
 use solana_pubkey::Pubkey;
-use solana_rpc_client_api::config::RpcProgramAccountsConfig;
-use solana_rpc_client_api::filter::RpcFilterType;
 use std::time::Duration;
 use tokio::time::{Instant, timeout};
 

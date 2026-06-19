@@ -7,7 +7,7 @@ use hyper::body::Incoming;
 use hyper::{Request, StatusCode};
 use serde::Serialize;
 use solana_pubkey::Pubkey;
-use solana_rpc_client_api::filter::RpcFilterType;
+use cloudbreak_core::modules::rpc_filter_type::RpcFilterType;
 use std::convert::Infallible;
 use std::str::FromStr;
 use tracing_subscriber::EnvFilter;

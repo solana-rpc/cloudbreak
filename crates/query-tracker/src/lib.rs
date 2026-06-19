@@ -41,7 +41,7 @@ impl rpc::QueryTrackerRpcServer for QueryTrackerRpcImpl {
     async fn track_query(
         &self,
         program: String,
-        config: Option<solana_rpc_client_api::config::RpcProgramAccountsConfig>,
+        config: Option<cloudbreak_core::modules::rpc_filter_type::RpcProgramAccountsConfig>,
     ) -> Result<(), jsonrpsee_types::ErrorObject<'static>> {
         let pubkey = solana_pubkey::Pubkey::from_str(&program).map_err(|e| {
             jsonrpsee_types::ErrorObject::owned(

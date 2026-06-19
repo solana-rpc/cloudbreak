@@ -18,6 +18,9 @@ use crate::metrics::GpaMetricsData;
 use crate::modules::cache::{GpaProcessor, KeyedRpcAccount, MaybeJsonAccount};
 use crate::{db_query, metrics};
 use async_stream::try_stream;
+use cloudbreak_core::modules::rpc_filter_type::{
+    RpcProgramAccountsConfig, account_matches_value_cmps, has_value_cmp,
+};
 use cloudbreak_entity::slots;
 use futures::{Stream, StreamExt};
 use rust_decimal::prelude::ToPrimitive;
@@ -29,7 +32,6 @@ use solana_account_decoder::parse_account_data::AccountAdditionalDataV3;
 use solana_account_decoder::{UiAccountEncoding, UiDataSliceConfig, encode_ui_account};
 use solana_commitment_config::CommitmentLevel;
 use solana_pubkey::Pubkey;
-use solana_rpc_client_api::config::RpcProgramAccountsConfig;
 use solana_rpc_client_api::response::RpcKeyedAccount;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio::time::{Instant, timeout};
@@ -246,7 +248,9 @@ pub async fn get_program_accounts(
 
     let metrics_data = GpaMetricsData::new(format!("gpa{mint_filter_label}"));
 
-    let mut request_processor = state.gpa_processor.for_request();
+    let mut request_processor = state
+        .gpa_processor
+        .for_request(config.filters.as_deref().unwrap_or(&[]));
 
     // Database query
     let rx = gpa_db_query(
@@ -432,6 +436,12 @@ pub fn gpa_encoding_stream(input: GpaEncodingInput) -> EncodedAccountBatchStream
         .unwrap_or(UiAccountEncoding::Binary);
     let data_slice = config.account_config.data_slice;
 
+    // ValueCmp filters are applied here as an in-memory post-filter over the streamed rows.
+    // Captured once; the per-row pass is skipped entirely when no ValueCmp filters are present.
+    // Note: a request with ValueCmp filters always uses the `Standard` (non-cached) processor
+    let filters = config.filters.clone().unwrap_or_default();
+    let apply_value_cmp = has_value_cmp(&filters);
+
     // Accounts encoding step
     let stream = try_stream! {
         let encode_span = tracing::info_span!(
@@ -448,6 +458,17 @@ pub fn gpa_encoding_stream(input: GpaEncodingInput) -> EncodedAccountBatchStream
         while let Some(batch_result) = rx.recv().await {
             let encode_iteration_start_time = Instant::now();
             let batch = batch_result?;
+
+            // Apply the ValueCmp post-filter before encoding so non-matching
+            // accounts are never encoded or counted.
+            let batch = if apply_value_cmp {
+                batch
+                    .into_iter()
+                    .filter(|row| account_matches_value_cmps(&filters, &row.get::<Vec<u8>, _>(6)))
+                    .collect::<Vec<_>>()
+            } else {
+                batch
+            };
 
             let encode_span_clone = encode_span.clone();
             let gpa_processor = gpa_processor.clone();

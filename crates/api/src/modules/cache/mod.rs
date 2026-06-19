@@ -5,6 +5,9 @@
 
 use bytes::Bytes;
 use cloudbreak_core::GpaCacheConfig;
+use cloudbreak_core::modules::rpc_filter_type::{
+    RpcFilterType, RpcProgramAccountsConfig, has_value_cmp,
+};
 use sea_orm::sqlx::Row;
 use sea_orm::sqlx::postgres::PgRow;
 use solana_account_decoder::UiAccountEncoding;
@@ -12,8 +15,6 @@ use solana_account_decoder::UiDataSliceConfig;
 use solana_account_decoder::parse_account_data::AccountAdditionalDataV3;
 use solana_commitment_config::CommitmentLevel;
 use solana_pubkey::Pubkey;
-use solana_rpc_client_api::config::RpcProgramAccountsConfig;
-use solana_rpc_client_api::filter::RpcFilterType;
 use solana_rpc_client_api::response::RpcKeyedAccount;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -85,9 +86,15 @@ impl GpaProcessor {
         }
     }
 
-    pub fn for_request(&self) -> Self {
+    /// Builds the processor for a single request.
+    ///
+    /// Caching is **bypassed** (a `Standard` processor is returned) whenever the
+    /// request carries a `ValueCmp` filter, even if the cache is configured.
+    pub fn for_request(&self, filters: &[RpcFilterType]) -> Self {
         match self {
             Self::Standard => Self::Standard,
+            // ValueCmp queries are not cacheable.
+            Self::Cached { .. } if has_value_cmp(filters) => Self::Standard,
             Self::Cached { cache, .. } => Self::Cached {
                 cache: cache.clone(),
                 cached_query: None,
@@ -348,6 +355,9 @@ impl NormalizedQuery {
         commitment: CommitmentLevel,
     ) -> Self {
         // Sort using a discriminator plus the bytes for memcmp (and length for data size)
+        // `ValueCmp` is unreachable: requests carrying a `ValueCmp` filter bypass
+        // the cache entirely (see `GpaProcessor::for_request`), so they never
+        // reach `NormalizedQuery`.
         filters.sort_by_cached_key(|f| match f {
             RpcFilterType::DataSize(n) => (0u8, *n, Vec::<u8>::new()),
             RpcFilterType::Memcmp(m) => (
@@ -356,6 +366,9 @@ impl NormalizedQuery {
                 m.bytes().map(|b| b.into_owned()).unwrap_or_default(),
             ),
             RpcFilterType::TokenAccountState => (2u8, 0, Vec::<u8>::new()),
+            RpcFilterType::ValueCmp(_) => {
+                unreachable!("ValueCmp queries bypass the cache and never reach NormalizedQuery")
+            }
         });
 
         Self {
@@ -570,8 +583,9 @@ impl GpaCache {
                     return true;
                 }
 
-                let is_pinned = max_evictable
-                    .is_some_and(|max_evictable| queries.get(q).is_some_and(|c| c.size > max_evictable));
+                let is_pinned = max_evictable.is_some_and(|max_evictable| {
+                    queries.get(q).is_some_and(|c| c.size > max_evictable)
+                });
 
                 if is_pinned {
                     // Keep pinned queries unless we are over the pinned cap.

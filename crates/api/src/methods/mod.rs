@@ -5,8 +5,8 @@
 
 use solana_commitment_config::CommitmentLevel;
 use solana_pubkey::Pubkey;
-use solana_rpc_client_api::filter::RpcFilterType;
 use cloudbreak_core::ProcessedCommitmentBehavior;
+use cloudbreak_core::modules::rpc_filter_type::RpcFilterType;
 
 use crate::error::RpcError;
 
@@ -103,6 +103,10 @@ impl<'a> SqlDataSliceFilter<'a> {
                 ))
             }
             RpcFilterType::TokenAccountState => None,
+            // ValueCmp is applied as an in-memory post-filter (see
+            // `account_matches_value_cmps`), so it is intentionally not pushed
+            // down to SQL here.
+            RpcFilterType::ValueCmp(_) => None,
         }
     }
 }
