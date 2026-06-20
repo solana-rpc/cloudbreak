@@ -314,6 +314,8 @@ impl GpaProcessor {
 
         cache_guard.insert_query_for_slot(normalized_query.clone(), *new_slot, older_query);
 
+        cache_guard.update_size_metrics();
+
         finalize_query_span.record("wall_time", start_time.elapsed().as_millis() as i64);
     }
 }
@@ -383,13 +385,22 @@ impl NormalizedQuery {
 
 impl GpaCache {
     pub fn new(config: GpaCacheConfig) -> Self {
-        Self {
+        let cache = Self {
             queries: HashMap::new(),
             queries_for_slot: BTreeMap::new(),
             config,
             size: 0,
             pinned_size: 0,
-        }
+        };
+        cache.update_size_metrics();
+        cache
+    }
+
+    /// Publishes the current cache size and configured maximum to Prometheus.
+    /// Utilization (0-100) is derived from these two gauges in Grafana.
+    fn update_size_metrics(&self) {
+        crate::metrics::CLOUDBREAK_GPA_CACHE_SIZE_BYTES.set(self.size as i64);
+        crate::metrics::CLOUDBREAK_GPA_CACHE_MAX_BYTES.set(self.config.max_total_bytes as i64);
     }
 
     /// Whether a query of the given size is pinned (skipped by cleanup). A query
@@ -603,11 +614,27 @@ impl GpaCache {
                         *pinned_size = pinned_size.saturating_sub(cached.size);
                     }
                     bytes_freed = bytes_freed.saturating_add(cached.size);
+
+                    // An evicted query is "used" if it ever served a cache hit.
+                    // A high rate of "unused" evictions signals cache churn.
+                    let used = if cached.cache_hits > 0 {
+                        "used"
+                    } else {
+                        "unused"
+                    };
+                    crate::metrics::CLOUDBREAK_GPA_CACHE_EVICTIONS_TOTAL
+                        .with_label_values(&[used])
+                        .inc();
+                    crate::metrics::CLOUDBREAK_GPA_CACHE_EVICTED_BYTES_TOTAL
+                        .with_label_values(&[used])
+                        .inc_by(cached.size);
                 }
                 false
             });
             !bucket.is_empty()
         });
+
+        self.update_size_metrics();
 
         Some(bytes_freed + available_bytes)
     }

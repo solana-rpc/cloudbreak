@@ -292,7 +292,7 @@ impl DatabaseConfig {
     }
 
     const fn default_max_db_errors_threshold() -> Option<f64> {
-        Some(100.0)
+        Some(1.0)
     }
 }
 

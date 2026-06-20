@@ -364,7 +364,7 @@ pub fn increment_grpc_gap_errors() {
 pub fn increment_db_errors() {
     DB_ERRORS.inc();
 
-    let threshold = DB_ERRORS_THRESHOLD.get().copied().unwrap_or(100.0);
+    let threshold = DB_ERRORS_THRESHOLD.get().copied().unwrap_or(1.0);
     if threshold > 0.0 && DB_ERRORS.get() > threshold {
         error!("DB errors threshold reached: {}", DB_ERRORS.get());
         std::process::exit(1);
@@ -378,7 +378,7 @@ pub fn record_closed_accounts_per_slot(count: usize) {
 /// Initializes metrics-related global state from config (currently the DB error threshold).
 pub fn setup(config: &IndexConfig) {
     DB_ERRORS_THRESHOLD
-        .set(config.database.max_db_errors_threshold.unwrap_or(100.0))
+        .set(config.database.max_db_errors_threshold.unwrap_or(1.0))
         .ok();
 }
 
@@ -416,4 +416,3 @@ pub fn register_collectors() {
         register!(FINALIZE_SLOT_DELETED_ACCOUNTS);
     });
 }
-

@@ -5,7 +5,7 @@
 
 use hyper::StatusCode;
 use prometheus::{
-    HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder,
+    HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
 };
 use std::{
     convert::Infallible,
@@ -71,6 +71,41 @@ lazy_static::lazy_static! {
         Opts::new("cloudbreak_api_batch_requests_total", "Total number of batched requests by batch size"),
         &["batch_size"]
     ).unwrap();
+
+    /// Current size of the GPA cache in bytes.
+    pub static ref CLOUDBREAK_GPA_CACHE_SIZE_BYTES: IntGauge = IntGauge::new(
+        "cloudbreak_gpa_cache_size_bytes",
+        "Current size of the GPA cache in bytes"
+    ).unwrap();
+
+    /// Configured maximum size of the GPA cache in bytes. Exposed so utilization
+    /// (`size / max`) can be computed at query time in Grafana.
+    pub static ref CLOUDBREAK_GPA_CACHE_MAX_BYTES: IntGauge = IntGauge::new(
+        "cloudbreak_gpa_cache_max_bytes",
+        "Configured maximum size of the GPA cache in bytes"
+    ).unwrap();
+
+    /// Total number of GPA cache entries evicted by cleanup to make room for a
+    /// different query. Labelled by `used` ("used"/"unused") indicating whether
+    /// the evicted entry had ever served a cache hit. A high rate of `unused`
+    /// evictions indicates cache churn (e.g. `min-bytes-per-query` set too low).
+    pub static ref CLOUDBREAK_GPA_CACHE_EVICTIONS_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new(
+            "cloudbreak_gpa_cache_evictions_total",
+            "Total GPA cache entries evicted by cleanup, labelled by whether the entry was ever a cache hit"
+        ),
+        &["used"],
+    ).unwrap();
+
+    /// Total number of bytes evicted from the GPA cache by cleanup. Same `used`
+    /// labelling as `CLOUDBREAK_GPA_CACHE_EVICTIONS_TOTAL`.
+    pub static ref CLOUDBREAK_GPA_CACHE_EVICTED_BYTES_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new(
+            "cloudbreak_gpa_cache_evicted_bytes_total",
+            "Total bytes evicted from the GPA cache by cleanup, labelled by whether the entry was ever a cache hit"
+        ),
+        &["used"],
+    ).unwrap();
 }
 
 /// We use a guard to increment the in-flight requests metric when a request starts and
@@ -128,6 +163,10 @@ pub fn setup_metrics(config: &ApiConfig) -> anyhow::Result<()> {
         register!(CLOUDBREAK_API_REQUESTS_BY_SUBSCRIPTION_ID);
         register!(CLOUDBREAK_API_INFLIGHT_REQUESTS);
         register!(CLOUDBREAK_API_BATCH_REQUESTS);
+        register!(CLOUDBREAK_GPA_CACHE_SIZE_BYTES);
+        register!(CLOUDBREAK_GPA_CACHE_MAX_BYTES);
+        register!(CLOUDBREAK_GPA_CACHE_EVICTIONS_TOTAL);
+        register!(CLOUDBREAK_GPA_CACHE_EVICTED_BYTES_TOTAL);
     });
 
     // Set the max connections as a reference metric at startup
