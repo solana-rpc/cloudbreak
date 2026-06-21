@@ -12,12 +12,25 @@ use hyper::{
     service::service_fn,
 };
 use hyper_util::{rt::TokioIo, server::conn::auto};
-use prometheus::{Registry, TextEncoder};
+use prometheus::{IntGauge, Registry, TextEncoder};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
 lazy_static::lazy_static! {
     static ref METRICS_REGISTRY: Registry = Registry::new();
+
+    /// Current number of indexes present on the `snapshot_accounts` table.
+    pub static ref SNAPSHOT_ACCOUNTS_INDEXES: IntGauge = {
+        let gauge = IntGauge::new(
+            "query_tracker_snapshot_accounts_indexes_total",
+            "Current number of indexes on the snapshot_accounts table",
+        )
+        .expect("failed to create snapshot_accounts indexes gauge");
+        METRICS_REGISTRY
+            .register(Box::new(gauge.clone()))
+            .expect("failed to register snapshot_accounts indexes gauge");
+        gauge
+    };
 }
 
 fn metrics_handler() -> Result<Response<Full<Bytes>>, Infallible> {
