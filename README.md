@@ -428,10 +428,12 @@ The first batch is always peeked synchronously before the response status line i
 
 Optional in-memory cache for `getProgramAccounts` responses. Omitting this section disables the module entirely.
 
-| Key                   | Type    | Default      | Description                                                                                                                                          |
-| --------------------- | ------- | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `max-total-bytes`     | `usize` | **required** | Maximum cache size in bytes. When inserting a new query would exceed this, the oldest cached queries (by slot) are evicted until enough room exists. |
-| `min-bytes-per-query` | `usize` | **required** | Minimum serialized size of a query for it to be cached at all. Smaller queries are skipped so they don't dilute room available for heavier ones.     |
+| Key                      | Type     | Default      | Description                                                                                                                                                                                                                                                              |
+| ------------------------ | -------- | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `max-total-bytes`        | `usize`  | **required** | Maximum cache size in bytes. When inserting a new query would exceed this, the oldest cached queries (by slot) are evicted until enough room exists.                                                                                                                          |
+| `min-bytes-per-query`    | `usize`  | **required** | Minimum serialized size of a query for it to be cached at all. Smaller queries are skipped so they don't dilute room available for heavier ones.                                                                                                                             |
+| `max-bytes-query-cleanup`| `usize`  | (unset)      | Optional upper bound on the size of a query that is eligible for eviction. Queries **larger** than this are pinned: they are normally skipped by cleanup and stay cached (until replaced by a newer version of the same query). The pin is *soft* — see `max-pinned-bytes-ratio`. Omit to make every cached query evictable. Note: when the oldest slots are mostly pinned (and under the pinned cap), a new insert may fail to free enough room and be skipped. |
+| `max-pinned-bytes-ratio` | `f64`    | (unset)      | Cap on how much space pinned queries may collectively occupy, expressed as a fraction of `max-total-bytes` (e.g. `0.5` = at most half the cache). When pinned usage exceeds `max-total-bytes × ratio`, the **oldest** pinned queries are evicted via the normal cleanup process until usage drops back under the cap — so the pin set can never grow unbounded. **Required** when `max-bytes-query-cleanup` is set (config load fails otherwise); ignored when it is unset (nothing is pinned). Must be in the range `(0.0, 1.0]`. |
 
 The cache is keyed by `(program, sorted filters, encoding, data_slice, commitment)` and holds the **pre-serialized JSON bytes** of each account, ref-counted via `bytes::Bytes`. Concretely:
 
@@ -439,7 +441,7 @@ The cache is keyed by `(program, sorted filters, encoding, data_slice, commitmen
 - **Cache hits are zero-copy and zero-allocation.** Cached account bytes are appended into the outgoing response buffer by ref-counting an existing `Bytes` slice — no clone, no re-encode, no extra allocation.
 - **No JSON re-serialization.** Cached entries store the exact JSON fragment that already left the encoder once; on subsequent serves the same bytes are emitted verbatim.
 
-Eviction is age-ordered by slot (oldest cached query goes first). Cache state is observable at runtime via [`/debug/modules/gpa_cache`](#api-server-default-4000).
+Eviction is age-ordered by slot (oldest cached query goes first), skipping any query pinned by `max-bytes-query-cleanup`. Pinning is bounded: once pinned queries collectively exceed `max-total-bytes × max-pinned-bytes-ratio`, the oldest pinned queries are evicted in the same age order until usage is back under the cap. Current pinned usage, the configured ratio, and the resulting threshold are reported by [`/debug/modules/gpa_cache`](#api-server-default-4000) (`stats.pinned_size_bytes`, `config.max_pinned_bytes_ratio`, `stats.pinned_threshold_bytes`).
 
 #### `[database]`
 
@@ -588,19 +590,24 @@ The indexer includes a self-healing mechanism that automatically detects and rep
 
 ### How It Works
 
-1. **Gap detection:** As each block arrives from the gRPC stream, the indexer checks whether its slot is the next expected one. If there is a gap (e.g. slot 100 arrives after slot 95, meaning slots 96-99 are missing), those slots are added to a `gaps_to_confirm` list and a `gaps_list`.
+1. **Gap detection (no RPC):** As each block arrives from the gRPC stream, the indexer checks that it builds directly on the last block it received, using the block's own `parent_slot` / `parent_blockhash` against the in-memory blocks map. If it does, any slots in between were simply empty/skipped by the validator and are ignored. If it does not, at least one real block was missed: the whole intervening range is queued for repair in `gaps_list`. This replaces the previous `getBlocksWithLimit` RPC confirmation — gaps are confirmed purely from the chain.
 
-2. **Gap confirmation:** Every 30 seconds, a background task queries the Solana RPC (`getBlocksWithLimit`) to determine which missing slots actually correspond to valid blocks. Slots that were simply skipped by the validator (no block produced) are removed from the list. Slots that belong to real blocks are marked as **confirmed** gaps, and the service is flagged as **unhealthy** via the `service_health` table.
+2. **Pause + mark unhealthy:** The instant a gap is confirmed, finalization is **paused** and the service is flagged **unhealthy** via the `service_health` table. Live finalized notifications keep buffering (bounded by `finalize-slot-buffer-size`, then back-pressuring the stream) but are not applied until the gap is repaired, preserving in-order finalization.
 
-3. **Gap filling via incremental snapshots:** Another background task processes confirmed gaps by querying the cluster tracker for an incremental snapshot pair that covers the newest missing slot, downloading the incremental archive directly from the source reported by the tracker, and processing **only the accounts affected by the gap slots** from that snapshot. The accounts are written to the database and sent through the finalize-slot pipeline. If the tracker doesn't yet have a covering pair, the task logs a warning and retries on the next 30 s tick.
+3. **Gap filling via incremental snapshots:** Every 30 s a background task processes confirmed gaps by asking the cluster tracker for an incremental snapshot pair covering the newest missing slot, downloading it (into a timestamped directory), and processing **only the gap slots**. Repaired accounts are written to the database and enqueued for finalization directly (snapshot data is already finalized). Gap slots that have **no accounts in the snapshot** are empty/skipped slots: they are logged (target `self_healing_empty_slots`) and dropped from the list. If the tracker has no covering pair yet, the task retries on the next tick.
 
-4. **Recovery:** Once all confirmed gaps have been filled, the service health is restored to healthy. Out-of-order slots that arrive late (e.g. due to gRPC buffering) are automatically removed from the gaps list when they are received.
+4. **Missed finalized notifications:** A reconnect can also drop finalized notifications for slots just *below* a large gap. When finalizing a live slot the finalizer walks its ancestor chain (hash-checked) to finalize any ancestors whose notification was missed; additionally the slot just before each repaired gap (`gap_start - 1`) is seeded so its ancestors are caught even though repaired slots carry no chain data to bridge the walk.
+
+5. **Recovery:** Once `gaps_list` drains, finalization is **resumed**, which restores the service to healthy. Out-of-order slots that arrive late (e.g. gRPC buffering) are removed from the gaps list when received.
+
+> A confirmed gap is only expected after startup has finished. During startup the (now-paused) finalizer worker is what completes startup, so a gap there can never be repaired; the fill task fails fast (panics) rather than stalling forever.
 
 ### Monitoring
 
-Use the indexer's debug endpoints to inspect gap state:
+Use the indexer's [operational debug endpoints](#indexer-default-metrics-port-8875) to inspect gap and finalizer state:
 
-- `/debug/gaps_list` — shows current missing slots and their confirmation status, plus slot ranges pending confirmation.
+- `/debug/modules/self_healing` — chain tips, still-missing slots grouped into gaps (with boundary, length, and distance behind confirmed), and summary counts.
+- `/debug/modules/finalizer` — the confirmed-but-not-finalized blocks map, the ordered pending queue, and pause state.
 
 The `[snapshot]` section (with `[snapshot.tracker_endpoint]`) must be present in the indexer config for gap filling to work, since it relies on the cluster tracker to discover and download incremental snapshots.
 
@@ -662,8 +669,8 @@ Each service exposes HTTP endpoints on its metrics port (or server port for the 
 | Endpoint                      | Method | Description                                                                                                                                                                                                                            |
 | ----------------------------- | ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `/metrics`                    | GET    | Prometheus metrics (block processing, chunk processing, slot finalization, gRPC stats, etc.).                                                                                                                                          |
-| `/debug/updated_accounts_map` | GET    | Returns the in-memory map of recently updated accounts with their slot numbers. Shows how many slots are being tracked and lists each slot. Useful for verifying the indexer is receiving and processing updates.                      |
-| `/debug/gaps_list`            | GET    | Returns two lists: **gaps_list** (missing slots with their confirmation status) and **gaps_to_confirm** (slot ranges pending confirmation). Useful for diagnosing self-healing behavior and checking if the indexer has fallen behind. |
+| `/debug/modules/finalizer`    | GET    | Inspects the live slot finalizer (confirmed-but-not-finalized blocks map, ordered pending queue, pause state). Returns JSON with the DB chain tips (`confirmed`/`finalized` + lag). Supports `?detail=summary\|slots\|full`, `?kind=all\|live\|repaired`, `?min_slot`, `?max_slot`, `?limit`, `?with_pubkeys=true`. See the rustdoc on `handle` in `crates/index/src/operational_endpoints/finalizer.rs` for the full reference.                       |
+| `/debug/modules/self_healing` | GET    | Inspects self-healing gap state. Returns JSON with the DB chain tips and the still-missing slots grouped into gaps (each with `boundary_slot`, `start`/`end`, `len`, and `slots_behind_confirmed`). Supports `?detail=summary\|slots\|full` (`summary` returns only the `stats` counts, omitting the gap list), plus `?min_slot`, `?max_slot`, `?limit` to filter the gap view. See the rustdoc on `handle` in `crates/index/src/operational_endpoints/self_healing.rs`.                                                                                                                   |
 | `/debug/accounts_owner_map`   | GET    | Returns debug info about the in-memory account-to-owner map. Only populated when `accounts-owner-map-enabled = true` in the indexer config.                                                                                            |
 
 ### Query Tracker (default metrics port `:8876`)
@@ -840,10 +847,10 @@ docker compose up -d
 
 ### Indexer shows unhealthy status
 
-The `service_health` table is set to unhealthy when confirmed slot gaps are detected. Check the indexer's `/debug/gaps_list` endpoint to see which slots are missing:
+The `service_health` table is set to unhealthy when confirmed slot gaps are detected. Check the indexer's `/debug/modules/self_healing` endpoint to see which slots are missing:
 
 ```sh
-curl http://localhost:8875/debug/gaps_list
+curl http://localhost:8875/debug/modules/self_healing
 ```
 
 If the `[snapshot]` section is configured, the self-healing mechanism will automatically attempt to fill gaps via incremental snapshots fetched through the cluster tracker. If it's not configured (or the tracker has no source producing usable snapshots), gaps cannot be repaired automatically and require manual intervention (e.g. re-running a snapshot or restarting the indexer).

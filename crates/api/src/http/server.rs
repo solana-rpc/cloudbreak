@@ -78,8 +78,11 @@ impl HttpServer {
                     }
                 });
 
-                let connection_span =
-                    tracing::info_span!("http_connection", requests_in_connection = 0);
+                let connection_span = tracing::info_span!(
+                    "http_connection",
+                    requests_in_connection = 0,
+                    wall_time = tracing::field::Empty
+                );
 
                 if let Err(err) = auto::Builder::new(TokioExecutor::new())
                     .serve_connection(io, service)
@@ -93,6 +96,7 @@ impl HttpServer {
                     "requests_in_connection",
                     *requests_in_connection_clone.lock().unwrap(),
                 );
+                connection_span.record("wall_time", start_time.elapsed().as_millis() as i64);
 
                 metrics::CLOUDBREAK_API_REQUEST_DURATION_MS
                     .with_label_values(&["http_connection", "0"])

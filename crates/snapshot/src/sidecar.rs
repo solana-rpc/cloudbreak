@@ -173,6 +173,25 @@ impl SnapshotPair {
 
 const RETRY_WAIT_SECS: Duration = Duration::from_secs(10);
 
+/// Minimum interval between "no covering snapshot" warnings while polling the tracker.
+const NO_COVERAGE_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Base directory where a snapshot for `slot` is downloaded and unpacked (e.g. `./snapshot_123`).
+pub fn snapshot_base_dir(slot: u64) -> PathBuf {
+    PathBuf::from(format!("./snapshot_{}", slot))
+}
+
+/// Like [`snapshot_base_dir`] but suffixed with a millisecond timestamp (e.g.
+/// `./snapshot_123_1700000000000`). Used by self-healing gap fills so concurrent/sequential
+/// downloads for the same slot never collide on disk.
+pub fn snapshot_base_dir_timestamped(slot: u64) -> PathBuf {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    PathBuf::from(format!("./snapshot_{}_{}", slot, timestamp))
+}
+
 /// Returns what are the correct snapshots to be downloaded based on the received slot and sidecar available snapshots
 /// If target_slot is not provided, it will return the latest available full and incremental snapshot pair
 ///
@@ -186,6 +205,7 @@ pub async fn get_snapshot_data(
     force_returned_incremental: bool,
 ) -> Result<SnapshotPair> {
     let client = reqwest::Client::new();
+    let mut last_no_coverage_log: Option<Instant> = None;
 
     loop {
         let response = client
@@ -213,8 +233,22 @@ pub async fn get_snapshot_data(
             file.write_all(pretty_json.as_bytes()).await?;
         }
 
+        // Highest slot covered by any pair offered by the tracker (incremental slot if present,
+        // full slot otherwise), used to log how far behind the tracker is when nothing covers
+        // the target slot.
+        let mut highest_available_slot: Option<u64> = None;
+
         for snapshot in json_value.as_array().unwrap() {
             let snapshot_pair = SnapshotPair::parse(snapshot)?;
+
+            let pair_covered_slot = snapshot_pair
+                .incremental_snapshot
+                .as_ref()
+                .map(|incremental| incremental.slot)
+                .unwrap_or(snapshot_pair.full_snapshot.slot);
+            highest_available_slot = Some(
+                highest_available_slot.map_or(pair_covered_slot, |slot| slot.max(pair_covered_slot)),
+            );
 
             let is_covered = if let Some(target_slot) = target_slot {
                 snapshot_pair.check_target_slot(target_slot)?
@@ -234,6 +268,19 @@ pub async fn get_snapshot_data(
             }
         }
 
+        let should_log = last_no_coverage_log
+            .is_none_or(|last| last.elapsed() >= NO_COVERAGE_LOG_INTERVAL);
+        if should_log {
+            tracing::warn!(
+                target: "get_snapshot_data",
+                "No covering snapshot available from tracker yet - highest available slot: {:?} - target slot: {:?} - retrying every {}s",
+                highest_available_slot,
+                target_slot,
+                RETRY_WAIT_SECS.as_secs()
+            );
+            last_no_coverage_log = Some(Instant::now());
+        }
+
         sleep(RETRY_WAIT_SECS).await;
     }
 }
@@ -251,6 +298,7 @@ pub async fn download_snapshot_file(
     sidecar_endpoint: &str,
     snapshot_data: SnapshotData,
     snapshot_type: SnapshotType,
+    base_dir: &Path,
 ) -> Result<()> {
     let url = if let Some(download_url) = snapshot_data.download_url {
         download_url
@@ -282,13 +330,10 @@ pub async fn download_snapshot_file(
         sidecar_endpoint,
     );
 
-    let file_path = format!(
-        "./snapshot_{}/{}",
-        snapshot_data.slot, snapshot_data.file_name
-    );
+    let file_path = base_dir.join(&snapshot_data.file_name);
 
     // Create the directory if it doesn't exist
-    if let Some(parent) = Path::new(&file_path).parent() {
+    if let Some(parent) = file_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
 
@@ -336,12 +381,13 @@ pub struct UnpackedSnapshot {
 
 pub fn unpack_compressed_snapshot<P: Into<PathBuf>>(
     path: P,
+    base_dir: &Path,
     slot: u64,
 ) -> Result<UnpackedSnapshot> {
     let start_time = Instant::now();
     let path_buf: PathBuf = path.into();
 
-    let temp_dir = PathBuf::from(format!("./snapshot_{}/uncompressed_snapshot", slot));
+    let temp_dir = base_dir.join("uncompressed_snapshot");
 
     let file = std::fs::File::open(path_buf)?;
 

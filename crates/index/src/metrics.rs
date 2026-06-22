@@ -3,33 +3,13 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-use std::{
-    collections::HashMap,
-    convert::Infallible,
-    net::SocketAddr,
-    sync::{Arc, Mutex, Once, OnceLock},
-};
+use std::sync::{Once, OnceLock};
 
-use http_body_util::Full;
-use hyper::{
-    Request, Response,
-    body::{Bytes, Incoming},
-    service::service_fn,
-};
-use hyper_util::{rt::TokioIo, server::conn::auto};
-
+use cloudbreak_core::IndexConfig;
 use prometheus::{
     Counter, Histogram, HistogramOpts, HistogramVec, IntGauge, IntGaugeVec, Opts, Registry,
-    TextEncoder,
 };
-use tokio::net::TcpListener;
-use tracing::{error, info};
-use cloudbreak_core::{IndexConfig, modules::account_owner_map::AccountOwnerMap};
-
-use crate::{
-    indexer::AccountsReceivedPerBlock,
-    modules::self_healing::{MissingSlot, SlotGap},
-};
+use tracing::error;
 
 pub static DB_ERRORS_THRESHOLD: OnceLock<f64> = OnceLock::new();
 
@@ -395,40 +375,16 @@ pub fn record_closed_accounts_per_slot(count: usize) {
     CLOSED_ACCOUNTS_PER_SLOT_HISTOGRAM.observe(count as f64);
 }
 
-fn metrics_handler() -> Result<Response<Full<Bytes>>, Infallible> {
-    let metrics = TextEncoder::new()
-        .encode_to_string(&METRICS_REGISTRY.gather())
-        .unwrap_or_else(|error| {
-            error!("could not encode custom metrics: {error}");
-            String::new()
-        });
-
-    Ok(Response::builder()
-        .header("content-type", "text/plain")
-        .body(Full::new(Bytes::from(metrics)))
-        .unwrap())
+/// Initializes metrics-related global state from config (currently the DB error threshold).
+pub fn setup(config: &IndexConfig) {
+    DB_ERRORS_THRESHOLD
+        .set(config.database.max_db_errors_threshold.unwrap_or(100.0))
+        .ok();
 }
 
-async fn handle_metrics_request(
-    req: Request<Incoming>,
-) -> Result<Response<Full<Bytes>>, Infallible> {
-    match req.uri().path() {
-        "/metrics" => metrics_handler(),
-        "/debug/updated_accounts_map" => debug_updated_accounts_map_handler(),
-        "/debug/gaps_list" => debug_gaps_list_handler(),
-        "/debug/accounts_owner_map" => debug_accounts_owner_map_handler(),
-        _ => Ok(not_found_handler()),
-    }
-}
-
-fn not_found_handler() -> Response<Full<Bytes>> {
-    Response::builder()
-        .status(404)
-        .body(Full::new(Bytes::from("Not Found")))
-        .unwrap()
-}
-
-pub fn run_metrics_server(address: SocketAddr) -> anyhow::Result<()> {
+/// Registers all Prometheus collectors with [`METRICS_REGISTRY`]. Idempotent: safe to call more
+/// than once (only the first call registers).
+pub fn register_collectors() {
     static REGISTER: Once = Once::new();
 
     REGISTER.call_once(|| {
@@ -459,122 +415,5 @@ pub fn run_metrics_server(address: SocketAddr) -> anyhow::Result<()> {
         register!(GRPC_BUFFER_CHANNEL_SIZE_SENDER);
         register!(FINALIZE_SLOT_DELETED_ACCOUNTS);
     });
-
-    tokio::spawn(async move {
-        let _guard = TokioTaskCounterGuard::new("metrics_server");
-
-        let listener = match TcpListener::bind(address).await {
-            Ok(l) => {
-                info!("Prometheus server started at http://{address}/metrics");
-                l
-            }
-            Err(e) => {
-                error!("Failed to bind Prometheus server: {e:?}");
-                return;
-            }
-        };
-
-        loop {
-            let (stream, _) = match listener.accept().await {
-                Ok(pair) => pair,
-                Err(e) => {
-                    error!("Prometheus accept failed: {e:?}");
-                    continue;
-                }
-            };
-
-            let io = TokioIo::new(stream);
-            let service = service_fn(move |req: Request<Incoming>| handle_metrics_request(req));
-
-            tokio::spawn(async move {
-                let _guard = TokioTaskCounterGuard::new("metrics_server");
-
-                let builder = auto::Builder::new(hyper_util::rt::TokioExecutor::new());
-                let conn = builder.serve_connection(io, service);
-                if let Err(e) = conn.await {
-                    error!("Prometheus connection failed: {e:?}");
-                }
-            });
-        }
-    });
-
-    Ok(())
 }
 
-pub fn setup_metrics(config: &IndexConfig) -> anyhow::Result<()> {
-    DB_ERRORS_THRESHOLD
-        .set(config.database.max_db_errors_threshold.unwrap_or(100.0))
-        .ok();
-
-    run_metrics_server(config.get_prom_metrics_collector_endpoint())
-}
-
-pub static UPDATED_ACCOUNTS_MAP: OnceLock<Arc<Mutex<HashMap<u64, AccountsReceivedPerBlock>>>> =
-    OnceLock::new();
-pub static GAPS_TO_CONFIRM: OnceLock<Arc<Mutex<Vec<SlotGap>>>> = OnceLock::new();
-pub static GAPS_LIST: OnceLock<Arc<Mutex<Vec<MissingSlot>>>> = OnceLock::new();
-
-fn debug_updated_accounts_map_handler() -> Result<Response<Full<Bytes>>, Infallible> {
-    let body = match UPDATED_ACCOUNTS_MAP.get() {
-        Some(map) => {
-            let map = map.lock().expect("Failed to lock");
-            let slots = map
-                .keys()
-                .map(|slot| slot.to_string())
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            format!("updated_accounts_map ({} slots):\n\n{}", map.len(), slots)
-        }
-        None => "Map not initialized".to_string(),
-    };
-
-    Ok(Response::builder()
-        .header("content-type", "text/plain")
-        .body(Full::new(Bytes::from(body)))
-        .unwrap())
-}
-
-fn debug_gaps_list_handler() -> Result<Response<Full<Bytes>>, Infallible> {
-    let body = match (GAPS_LIST.get(), GAPS_TO_CONFIRM.get()) {
-        (Some(gaps), Some(gaps_to_confirm)) => {
-            let gaps = gaps.lock().expect("Failed to lock");
-            let gaps_to_confirm = gaps_to_confirm.lock().expect("Failed to lock");
-
-            let gaps_to_confirm_lines = gaps_to_confirm
-                .iter()
-                .map(|g| format!("start_slot: {} - end_slot: {}", g.start_slot, g.end_slot))
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            let gaps_lines = gaps
-                .iter()
-                .map(|g| format!("slot {} (confirmed: {})", g.slot, g.is_confirmed))
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            format!(
-                "gaps_list ({} slots):\n\n{}\n\ngaps_to_confirm ({} slots):\n\n{}",
-                gaps.len(),
-                gaps_lines,
-                gaps_to_confirm.len(),
-                gaps_to_confirm_lines
-            )
-        }
-        _ => "Not initialized".to_string(),
-    };
-
-    Ok(Response::builder()
-        .header("content-type", "text/plain")
-        .body(Full::new(Bytes::from(body)))
-        .unwrap())
-}
-
-fn debug_accounts_owner_map_handler() -> Result<Response<Full<Bytes>>, Infallible> {
-    let body = AccountOwnerMap::debug_accounts_owner_map();
-
-    Ok(Response::builder()
-        .header("content-type", "text/plain")
-        .body(Full::new(Bytes::from(body)))
-        .unwrap())
-}

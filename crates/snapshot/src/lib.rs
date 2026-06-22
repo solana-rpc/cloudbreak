@@ -125,11 +125,17 @@ fn download_and_process_snapshot(
     let db_clone = database.clone();
 
     tokio::spawn(async move {
-        download_snapshot_file(&sidecar_endpoint, snapshot_data.clone(), snapshot_type)
-            .await
-            .inspect_err(|e| {
-                tracing::error!("Failed to download snapshot: {:?} ({:?})", e, snapshot_type);
-            })?;
+        let base_dir = sidecar::snapshot_base_dir(snapshot_data.slot);
+        download_snapshot_file(
+            &sidecar_endpoint,
+            snapshot_data.clone(),
+            snapshot_type,
+            &base_dir,
+        )
+        .await
+        .inspect_err(|e| {
+            tracing::error!("Failed to download snapshot: {:?} ({:?})", e, snapshot_type);
+        })?;
 
         process_downloaded_snapshot(&db_clone, snapshot_data, config, accounts_owner_map).await?;
 
@@ -147,14 +153,12 @@ async fn process_downloaded_snapshot(
     let start_time = Instant::now();
     let total_accounts_files_opening_time_micros = Arc::new(Mutex::new(0));
 
-    let path = PathBuf::from(format!(
-        "./snapshot_{}/{}",
-        snapshot_data.slot, snapshot_data.file_name
-    ));
+    let base_dir = sidecar::snapshot_base_dir(snapshot_data.slot);
+    let path = base_dir.join(&snapshot_data.file_name);
     let sidecar::UnpackedSnapshot {
         account_files: solana_snapshot,
         stake_data,
-    } = sidecar::unpack_compressed_snapshot(path, snapshot_data.slot)?;
+    } = sidecar::unpack_compressed_snapshot(path, &base_dir, snapshot_data.slot)?;
 
     if let Err(e) = db_queries::persist_epoch_stakes(database, &stake_data).await {
         tracing::error!("Failed to persist epoch stakes from snapshot: {:?}", e);
@@ -420,20 +424,18 @@ fn insert_into_temp_snapshot_account_versions_handler(
 pub async fn process_downloaded_snapshot_with_gap_filling(
     snapshot_slot: u64,
     incremental_snapshot_file_name: String,
+    base_dir: PathBuf,
     config: SnapshotConfig,
     gaps_list: Vec<u64>,
     block_sender: Sender<SubscribeUpdateBlock>,
 ) -> Result<()> {
     let start_time = Instant::now();
 
-    let path = PathBuf::from(format!(
-        "./snapshot_{}/{}",
-        snapshot_slot, incremental_snapshot_file_name
-    ));
+    let path = base_dir.join(&incremental_snapshot_file_name);
     let sidecar::UnpackedSnapshot {
         account_files: solana_snapshot,
         stake_data: _,
-    } = sidecar::unpack_compressed_snapshot(path, snapshot_slot)?;
+    } = sidecar::unpack_compressed_snapshot(path, &base_dir, snapshot_slot)?;
     let mut account_file_workers: JoinSet<Result<()>> = JoinSet::new();
     let accounts_file_concurency = config.accounts_file_concurency.unwrap_or(32);
     let programs_include = config

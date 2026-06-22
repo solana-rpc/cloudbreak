@@ -13,7 +13,6 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::mpsc::Sender;
 use yellowstone_grpc_proto::geyser::{SlotStatus, SubscribeUpdate, subscribe_update::UpdateOneof};
 use cloudbreak_core::{HashCheckerConfig, IndexConfig, SnapshotConfigOnIndexer};
 use cloudbreak_snapshot::lt_hash::compute_filtered_snapshot_lt_hash;
@@ -22,7 +21,6 @@ use cloudbreak_snapshot::sidecar::{
 };
 
 use crate::indexer::IndexerState;
-use crate::modules::finalize_slot::FinalizeSlotMessage;
 use crate::modules::lt_hash::compute_db_lt_hash;
 
 const SLOT_MS: u64 = 400;
@@ -171,15 +169,20 @@ async fn run_orchestrator(state: HashCheckerState) -> Result<()> {
         .covered_slot
         .store(incremental_snapshot_data.slot, Ordering::SeqCst);
 
+    let full_base_dir = sidecar::snapshot_base_dir(snapshot_pair.full_snapshot.slot);
+    let inc_base_dir = sidecar::snapshot_base_dir(incremental_snapshot_data.slot);
+
     let full = download_snapshot_file(
         &snapshot_pair.downloading_endpoint,
         snapshot_pair.full_snapshot.clone(),
         SnapshotType::Full,
+        &full_base_dir,
     );
     let inc = download_snapshot_file(
         &snapshot_pair.downloading_endpoint,
         incremental_snapshot_data.clone(),
         SnapshotType::Incremental,
+        &inc_base_dir,
     );
 
     match tokio::join!(full, inc) {
@@ -187,21 +190,22 @@ async fn run_orchestrator(state: HashCheckerState) -> Result<()> {
         _ => return Err(anyhow::anyhow!("Failed to download snapshots")),
     };
 
-    let full_path = PathBuf::from(format!(
-        "./snapshot_{}/{}",
-        snapshot_pair.full_snapshot.slot, snapshot_pair.full_snapshot.file_name
-    ));
-    let inc_path = PathBuf::from(format!(
-        "./snapshot_{}/{}",
-        incremental_snapshot_data.slot, incremental_snapshot_data.file_name
-    ));
+    let full_path = full_base_dir.join(&snapshot_pair.full_snapshot.file_name);
+    let inc_path = inc_base_dir.join(&incremental_snapshot_data.file_name);
 
-    let mut snapshot_files =
-        sidecar::unpack_compressed_snapshot(full_path, snapshot_pair.full_snapshot.slot)?
-            .account_files;
+    let mut snapshot_files = sidecar::unpack_compressed_snapshot(
+        full_path,
+        &full_base_dir,
+        snapshot_pair.full_snapshot.slot,
+    )?
+    .account_files;
     snapshot_files.extend(
-        sidecar::unpack_compressed_snapshot(inc_path, incremental_snapshot_data.slot)?
-            .account_files,
+        sidecar::unpack_compressed_snapshot(
+            inc_path,
+            &inc_base_dir,
+            incremental_snapshot_data.slot,
+        )?
+        .account_files,
     );
 
     let slot = incremental_snapshot_data.slot;
@@ -226,7 +230,6 @@ pub async fn finalize_and_compare(
     db: DatabaseConnection,
     config: IndexConfig,
     indexer_state: IndexerState,
-    finalize_slot_tx: Sender<FinalizeSlotMessage>,
 ) -> Result<bool> {
     let covered = state.covered_slot.load(Ordering::SeqCst);
     if covered == 0 {
@@ -256,8 +259,7 @@ pub async fn finalize_and_compare(
         if over {
             continue;
         }
-        crate::indexer::process_update(update, &indexer_state, &finalize_slot_tx, &db, &config)
-            .await;
+        crate::indexer::process_update(update, &indexer_state, &db, &config).await;
     }
 
     loop {

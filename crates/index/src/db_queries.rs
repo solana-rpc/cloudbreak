@@ -10,7 +10,8 @@ use std::{
 
 use sea_orm::{
     ActiveValue::{NotSet, Set},
-    Condition, ConnectionTrait, DatabaseConnection, EntityTrait, Statement, Value,
+    ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
+    Statement, Value,
     prelude::Expr,
     sea_query::{Alias, OnConflict},
 };
@@ -350,6 +351,51 @@ pub async fn insert_slot(
             tracing::error!("insert_slot: failed to insert slot {}: {}", slot, e);
             metrics::increment_db_errors();
         }
+    }
+}
+
+/// The latest persisted slot for each commitment level, plus the finalized→confirmed lag.
+///
+/// The `slots` table holds exactly one row per commitment (its primary key), updated to the
+/// highest slot seen, so each value is a single point lookup.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct ChainTips {
+    pub confirmed_slot: Option<u64>,
+    pub finalized_slot: Option<u64>,
+    /// `confirmed_slot - finalized_slot` (how many slots finalized lags behind confirmed).
+    pub finalized_behind_confirmed: Option<u64>,
+}
+
+/// Reads the last confirmed/finalized slots from the `slots` table (best-effort: DB errors and
+/// missing rows surface as `None`).
+///
+/// Both commitments are fetched in a single round-trip (`WHERE commitment IN (confirmed,
+/// finalized)`) and then split out of the returned rows.
+pub async fn get_chain_tips(db: &DatabaseConnection) -> ChainTips {
+    let rows = slots::Entity::find()
+        .filter(slots::Column::Commitment.is_in([
+            CommitmentLevel::Confirmed as i32,
+            CommitmentLevel::Finalized as i32,
+        ]))
+        .all(db)
+        .await
+        .unwrap_or_default();
+
+    let slot_for = |commitment: CommitmentLevel| {
+        rows.iter()
+            .find(|model| model.commitment == commitment as i32)
+            .map(|model| model.slot as u64)
+    };
+    let confirmed_slot = slot_for(CommitmentLevel::Confirmed);
+    let finalized_slot = slot_for(CommitmentLevel::Finalized);
+    let finalized_behind_confirmed = match (confirmed_slot, finalized_slot) {
+        (Some(confirmed), Some(finalized)) => Some(confirmed.saturating_sub(finalized)),
+        _ => None,
+    };
+    ChainTips {
+        confirmed_slot,
+        finalized_slot,
+        finalized_behind_confirmed,
     }
 }
 
