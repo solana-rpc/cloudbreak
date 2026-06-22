@@ -40,6 +40,36 @@ lazy_static::lazy_static! {
     )
     .unwrap();
 
+    /// Per-request GPA cache hit percentage (0-100), labelled by method and
+    /// response size bucket. Reports `0` when the cache is inactive or the
+    /// response has no accounts. Buckets are fine-grained near both ends so
+    /// fully-cached (100) and fully-fresh (0) requests stand out.
+    pub static ref CLOUDBREAK_API_CACHE_HIT_PERCENT: HistogramVec = HistogramVec::new(
+        HistogramOpts::new(
+            "cloudbreak_api_cache_hit_percent",
+            "Per-request GPA cache hit percentage (0-100), labelled by method and response size bucket."
+        )
+        .buckets(vec![
+            0.0, 1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 30.0, 40.0, 50.0,
+            60.0, 70.0, 80.0, 90.0, 95.0, 97.0, 98.0, 99.0, 99.5, 100.0,
+        ]),
+        &["method", "bytes"],
+    )
+    .unwrap();
+
+    /// Response bytes served, labelled by method and `kind`: `total` counts all
+    /// response bytes, `cached` counts the subset served from the GPA cache
+    /// (`0` for paths that don't use the cache). Effective cache utilization is
+    /// `kind="cached" / kind="total"` in Grafana.
+    pub static ref CLOUDBREAK_API_RESPONSE_BYTES_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new(
+            "cloudbreak_api_response_bytes_total",
+            "Response bytes served, labelled by method and kind (total/cached)."
+        ),
+        &["method", "kind"],
+    )
+    .unwrap();
+
     /// Count of requests by subscription ID
     pub static ref CLOUDBREAK_API_REQUESTS_BY_SUBSCRIPTION_ID: IntCounterVec = IntCounterVec::new(
         Opts::new(
@@ -159,6 +189,8 @@ pub fn setup_metrics(config: &ApiConfig) -> anyhow::Result<()> {
         }
         register!(CLOUDBREAK_API_REQUESTS_TOTAL);
         register!(CLOUDBREAK_API_REQUEST_DURATION_MS);
+        register!(CLOUDBREAK_API_CACHE_HIT_PERCENT);
+        register!(CLOUDBREAK_API_RESPONSE_BYTES_TOTAL);
         register!(CLOUDBREAK_API_DATA_FETCHED_BY_SUBSCRIPTION_ID);
         register!(CLOUDBREAK_API_REQUESTS_BY_SUBSCRIPTION_ID);
         register!(CLOUDBREAK_API_INFLIGHT_REQUESTS);
@@ -209,6 +241,8 @@ impl GpaMetricsData {
         json_enconde_time: f64,
         total_time: f64,
         json_bytes: u64,
+        cache_bytes: u64,
+        cache_hit_percent: f64,
         subscription_id: String,
     ) {
         let bytes_bucket = bytes_bucket(json_bytes);
@@ -233,6 +267,18 @@ impl GpaMetricsData {
         CLOUDBREAK_API_REQUEST_DURATION_MS
             .with_label_values(&[label.as_str(), bytes_bucket])
             .observe(total_time);
+
+        CLOUDBREAK_API_CACHE_HIT_PERCENT
+            .with_label_values(&[label.as_str(), bytes_bucket])
+            .observe(cache_hit_percent);
+
+        CLOUDBREAK_API_RESPONSE_BYTES_TOTAL
+            .with_label_values(&[label.as_str(), "total"])
+            .inc_by(json_bytes);
+
+        CLOUDBREAK_API_RESPONSE_BYTES_TOTAL
+            .with_label_values(&[label.as_str(), "cached"])
+            .inc_by(cache_bytes);
 
         CLOUDBREAK_API_REQUESTS_BY_SUBSCRIPTION_ID
             .with_label_values(&[&subscription_id])

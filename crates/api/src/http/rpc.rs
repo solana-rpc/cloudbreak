@@ -448,6 +448,8 @@ async fn process_single_request(
                     json_start_time.elapsed().as_millis() as f64,
                     start_time.elapsed().as_millis() as f64,
                     response_size,
+                    0,
+                    0.0,
                     subscription_id.to_string(),
                 );
             } else {
@@ -492,6 +494,8 @@ async fn process_single_request(
                     json_start_time.elapsed().as_millis() as f64,
                     start_time.elapsed().as_millis() as f64,
                     response_size,
+                    0,
+                    0.0,
                     subscription_id.to_string(),
                 );
             } else {

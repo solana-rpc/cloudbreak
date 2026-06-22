@@ -83,6 +83,8 @@ pub async fn gpa_streaming_response_body(
 
         let mut json_encode_ms = Duration::from_millis(0);
         let mut json_bytes = 0u64;
+        let mut total_cache_hits = 0u64;
+        let mut total_cache_bytes = 0u64;
         let mut accounts_count = first_batch.len() as u64;
         json_bytes += streaming_response_body_wrapper.start.len() as u64;
 
@@ -155,12 +157,14 @@ pub async fn gpa_streaming_response_body(
                     let frozen = buf.split().freeze();
                     json_bytes += frozen.len() as u64;
 
-                    drain_pending_into_cache(
+                    let drained = drain_pending_into_cache(
                         &frozen,
                         &mut pending_fresh,
                         &mut pending_cached,
                         &mut gpa_processor,
                     );
+                    total_cache_hits += drained.cache_hits;
+                    total_cache_bytes += drained.cache_bytes;
 
                     if buf.capacity() < STREAM_BUFFER_PREALLOC {
                         buf.reserve(STREAM_BUFFER_PREALLOC - buf.capacity());
@@ -175,23 +179,36 @@ pub async fn gpa_streaming_response_body(
             let frozen = buf.split().freeze();
             json_bytes += frozen.len() as u64;
 
-            drain_pending_into_cache(
+            let drained = drain_pending_into_cache(
                 &frozen,
                 &mut pending_fresh,
                 &mut pending_cached,
                 &mut gpa_processor,
             );
+            total_cache_hits += drained.cache_hits;
+            total_cache_bytes += drained.cache_bytes;
 
             yield Ok(Frame::data(frozen));
         }
 
         json_bytes += streaming_response_body_wrapper.end.len() as u64;
 
+        // Per-account cache hit ratio for this request, as a percentage in
+        // [0, 100]. Reports 0 when there are no accounts (or the cache is
+        // inactive), matching the `/debug` endpoint's `cache_hit_percent`.
+        let cache_hit_percent = if accounts_count == 0 {
+            0.0
+        } else {
+            (total_cache_hits as f64) / (accounts_count as f64) * 100.0
+        };
+
         if let Some(metrics_data) = metrics_data {
             metrics_data.record_metrics(
                 json_encode_ms.as_millis() as f64,
                 gpa_global_start_time.elapsed().as_millis() as f64,
                 json_bytes,
+                total_cache_bytes,
+                cache_hit_percent,
                 subscription_id,
             );
         }
@@ -263,17 +280,21 @@ fn process_first_gpa_batch(
 /// chunk and hand the merged `(pubkey, bytes)` set to the processor's
 /// accumulator. The `Range`s only stay valid until the next `split()`, so
 /// this must be called before reusing `buf`.
+///
+/// Returns the cache hits and cached bytes drained in this call so the caller
+/// can accumulate request-level totals.
 fn drain_pending_into_cache(
     frozen: &Bytes,
     pending_fresh: &mut Vec<(Pubkey, Range<usize>)>,
     pending_cached: &mut Vec<(Pubkey, Bytes)>,
     gpa_processor: &mut crate::modules::cache::GpaProcessor,
-) {
+) -> DrainStats {
     if pending_fresh.is_empty() && pending_cached.is_empty() {
-        return;
+        return DrainStats::default();
     }
 
     let cache_hits = pending_cached.len() as u64;
+    let cache_bytes: u64 = pending_cached.iter().map(|(_, b)| b.len() as u64).sum();
 
     let mut new_pairs: Vec<(Pubkey, Bytes)> =
         Vec::with_capacity(pending_fresh.len() + pending_cached.len());
@@ -286,6 +307,18 @@ fn drain_pending_into_cache(
     }
 
     gpa_processor.update_new_accounts_for_query(new_pairs, cache_hits);
+
+    DrainStats {
+        cache_hits,
+        cache_bytes,
+    }
+}
+
+/// Per-drain cache accounting, accumulated into request-level totals.
+#[derive(Default)]
+struct DrainStats {
+    cache_hits: u64,
+    cache_bytes: u64,
 }
 
 /// Contains the start and end of the JSON array (or context-wrapped value) and the id
