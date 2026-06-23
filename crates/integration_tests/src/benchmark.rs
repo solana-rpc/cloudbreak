@@ -53,9 +53,7 @@ pub async fn run(args: &BenchmarkArgs) -> Result<()> {
     // Install the tracing subscriber with TOML-derived per-target overrides
     // appended after `RUST_LOG`. This must happen before any tracing event
     // is emitted by the benchmark setup below.
-    crate::logging::init_tracing(crate::logging::directives_for_print_config(
-        &print_config,
-    ));
+    crate::logging::init_tracing(crate::logging::directives_for_print_config(&print_config));
 
     let BenchmarkConfig {
         target_rps,
@@ -68,7 +66,7 @@ pub async fn run(args: &BenchmarkArgs) -> Result<()> {
     let requests_rx = sources::load_requests_from_source(&source, request_type).await?;
 
     let client = reqwest::Client::builder()
-        .pool_max_idle_per_host(0)
+        // .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(timeout_secs))
         .build()?;
 
@@ -233,20 +231,13 @@ async fn run_comparison(
     retry_with_context: bool,
     db_probe_ctx: Option<&DbProbeCtx>,
 ) -> Result<ComparisonOutcome> {
-    let mut iterations: Option<Vec<response_comparison::IterationCapture>> =
-        comparison_config
-            .save_compensation_iterations
-            .then(Vec::new);
+    let mut iterations: Option<Vec<response_comparison::IterationCapture>> = comparison_config
+        .save_compensation_iterations
+        .then(Vec::new);
 
     let initial_fired_at = SystemTime::now();
-    let (r1, r2, initial_probe) = response_comparison::join_pair_with_probe(
-        client,
-        rpc1,
-        rpc2,
-        request,
-        db_probe_ctx,
-    )
-    .await;
+    let (r1, r2, initial_probe) =
+        response_comparison::join_pair_with_probe(client, rpc1, rpc2, request, db_probe_ctx).await;
     let (json1, duration1) = r1?;
     let (json2, duration2) = r2?;
 
@@ -569,7 +560,11 @@ async fn process_request(
 
     if let Err(e) = results_tx.send(BenchResult {
         duration: verdict_outcome.response_comparison.duration2,
-        size: verdict_outcome.response_comparison.response2.to_string().len(),
+        size: verdict_outcome
+            .response_comparison
+            .response2
+            .to_string()
+            .len(),
         encoding: encoding.clone(),
         rpc_name: rpc2.name.clone(),
         correct_response: Some(final_matched),
