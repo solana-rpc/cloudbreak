@@ -86,6 +86,13 @@ impl GpaProcessor {
         }
     }
 
+    pub fn get_type(&self) -> &str {
+        match self {
+            Self::Standard => "standard",
+            Self::Cached { .. } => "cached",
+        }
+    }
+
     /// Builds the processor for a single request.
     ///
     /// Caching is **bypassed** (a `Standard` processor is returned) whenever the
@@ -278,6 +285,7 @@ impl GpaProcessor {
 
         // If query is smaller than the min_bytes_per_query, don't cache it
         if query_bytes < cache_guard.config.min_bytes_per_query as u64 {
+            finalize_query_span.record("wall_time", start_time.elapsed().as_millis() as i64);
             return;
         }
 
@@ -286,6 +294,7 @@ impl GpaProcessor {
             && bytes_freed < query_bytes
         {
             tracing::error!(target: "gpa_cache", "Failed to cleanup old queries, not enough bytes freed {}", query_bytes - bytes_freed);
+            finalize_query_span.record("wall_time", start_time.elapsed().as_millis() as i64);
             return;
         }
 

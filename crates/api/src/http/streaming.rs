@@ -219,7 +219,9 @@ pub async fn gpa_streaming_response_body(
         json_span.record("total_wall_time", gpa_global_start_time.elapsed().as_millis() as i64);
 
         // Commit the accumulated `(pubkey, bytes)` pairs as the new cached query
+        let finalize_query_start_time = Instant::now();
         gpa_processor.finalize_query();
+        metrics::CLOUDBREAK_API_REQUEST_DURATION_MS.with_label_values(&["cache_finalize_query", gpa_processor.get_type()]).observe(finalize_query_start_time.elapsed().as_millis() as f64);
 
         // Close the JSON array
         yield Ok(Frame::data(Bytes::from(streaming_response_body_wrapper.end)));
