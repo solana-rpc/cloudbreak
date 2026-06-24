@@ -106,7 +106,7 @@ impl HttpServer {
     }
 }
 
-#[tracing::instrument(name = "http_request", skip_all, fields(json_bytes = tracing::field::Empty))]
+#[tracing::instrument(name = "http_request", parent = None, skip_all, fields(json_bytes = tracing::field::Empty))]
 async fn handle_request(
     req: Request<Incoming>,
     state: Arc<CloudbreakRpcState>,
