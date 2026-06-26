@@ -4,12 +4,12 @@
  */
 
 use bytes::Bytes;
+use cloudbreak_core::modules::rpc_filter_type::RpcProgramAccountsConfig;
 use http_body_util::combinators::UnsyncBoxBody;
 use hyper::body::Incoming;
 use hyper::{Request, StatusCode};
 use serde::Serialize;
 use solana_commitment_config::CommitmentConfig;
-use cloudbreak_core::modules::rpc_filter_type::RpcProgramAccountsConfig;
 use solana_rpc_client_api::config::{RpcAccountInfoConfig, RpcContextConfig};
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -408,6 +408,45 @@ async fn process_single_request(
             metrics::CLOUDBREAK_API_REQUEST_DURATION_MS
                 .with_label_values(&[
                     "getTokenAccountBalance",
+                    metrics::bytes_bucket(json_response.len() as u64),
+                ])
+                .observe(start_time.elapsed().as_millis() as f64);
+
+            json_response
+        }
+        "getTokenSupply" => {
+            let start_time = Instant::now();
+
+            let pubkey: String = match extract_param(&rpc_request.params, 0) {
+                Ok(p) => p,
+                Err(e) => return make_error_response(id, -32602, e),
+            };
+
+            let commitment: Option<CommitmentConfig> =
+                extract_param(&rpc_request.params, 1).ok().flatten();
+
+            let result =
+                methods::get_token_supply::get_token_supply(state, pubkey, commitment).await;
+
+            let status_label = if result.is_ok() {
+                "success"
+            } else {
+                tracing::error!(
+                    target: "api_request_errors_count",
+                    "getTokenSupply error: {:?}",
+                    result.as_ref().unwrap_err()
+                );
+                "error"
+            };
+            metrics::CLOUDBREAK_API_REQUESTS_TOTAL
+                .with_label_values(&["getTokenSupply", status_label])
+                .inc();
+
+            let json_response = json_serialize_response(id, result).await;
+
+            metrics::CLOUDBREAK_API_REQUEST_DURATION_MS
+                .with_label_values(&[
+                    "getTokenSupply",
                     metrics::bytes_bucket(json_response.len() as u64),
                 ])
                 .observe(start_time.elapsed().as_millis() as f64);
