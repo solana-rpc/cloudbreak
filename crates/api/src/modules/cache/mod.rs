@@ -26,6 +26,7 @@ use tokio::time::Instant;
 use crate::error::RpcError;
 use crate::methods::program;
 use crate::methods::program::GpaDbQueryInput;
+use crate::metrics;
 
 #[derive(Debug, Clone)]
 pub struct GpaCache {
@@ -247,6 +248,7 @@ impl GpaProcessor {
             query_bytes = tracing::field::Empty,
             query_accounts = tracing::field::Empty,
             wall_time = tracing::field::Empty,
+            locked_micros = tracing::field::Empty,
         );
 
         let Some(normalized_query) = normalized_query.take() else {
@@ -281,6 +283,7 @@ impl GpaProcessor {
         finalize_query_span.record("cache_hits", *cache_hits as i64);
         finalize_query_span.record("query_accounts", new_accounts_for_query_len as i64);
 
+        let start_locked_time = Instant::now();
         let mut cache_guard = cache.write().expect("can't lock gpa cache rwlock");
 
         // If query is smaller than the min_bytes_per_query, don't cache it
@@ -324,8 +327,15 @@ impl GpaProcessor {
         cache_guard.insert_query_for_slot(normalized_query.clone(), *new_slot, older_query);
 
         cache_guard.update_size_metrics();
+        metrics::CLOUDBREAK_API_REQUEST_DURATION_MS
+            .with_label_values(&["finalize_query_locked", "cached"])
+            .observe(start_locked_time.elapsed().as_micros() as f64);
 
         finalize_query_span.record("wall_time", start_time.elapsed().as_millis() as i64);
+        finalize_query_span.record(
+            "locked_micros",
+            start_locked_time.elapsed().as_micros() as i64,
+        );
     }
 }
 

@@ -11,6 +11,7 @@ use std::{
     convert::Infallible,
     sync::{Arc, Mutex, Once},
 };
+use sea_orm::DatabaseConnection;
 use tracing::error;
 use cloudbreak_core::ApiConfig;
 
@@ -102,6 +103,16 @@ lazy_static::lazy_static! {
         &["batch_size"]
     ).unwrap();
 
+    /// Database connection pool state, sampled at scrape time and labelled by
+    /// `origin`: `max` (configured ceiling), `idle` (connections idle and
+    /// immediately available), and `total` (established connections, i.e.
+    /// idle + in-use). In-use is `total - idle` and headroom before queries
+    /// start waiting is `max - (total - idle)`, both computable in Grafana.
+    pub static ref CLOUDBREAK_API_DB_POOL_CONNECTIONS: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("cloudbreak_api_db_pool_connections", "Database connection pool state, labelled by origin (max/idle/total)"),
+        &["origin"],
+    ).unwrap();
+
     /// Current size of the GPA cache in bytes.
     pub static ref CLOUDBREAK_GPA_CACHE_SIZE_BYTES: IntGauge = IntGauge::new(
         "cloudbreak_gpa_cache_size_bytes",
@@ -162,7 +173,25 @@ impl Drop for InFlightRequestGuard {
     }
 }
 
-pub fn metrics_handler() -> Result<HttpHandlerResponse, Infallible> {
+/// Samples the SQLx connection pool and updates the `cloudbreak_api_db_pool_connections`
+/// gauge. Called at scrape time so the values are always fresh for Prometheus.
+fn refresh_db_pool_metrics(database: &DatabaseConnection) {
+    let pool = database.get_postgres_connection_pool();
+
+    CLOUDBREAK_API_DB_POOL_CONNECTIONS
+        .with_label_values(&["max"])
+        .set(pool.options().get_max_connections() as i64);
+    CLOUDBREAK_API_DB_POOL_CONNECTIONS
+        .with_label_values(&["idle"])
+        .set(pool.num_idle() as i64);
+    CLOUDBREAK_API_DB_POOL_CONNECTIONS
+        .with_label_values(&["total"])
+        .set(pool.size() as i64);
+}
+
+pub fn metrics_handler(database: &DatabaseConnection) -> Result<HttpHandlerResponse, Infallible> {
+    refresh_db_pool_metrics(database);
+
     let metrics = TextEncoder::new()
         .encode_to_string(&METRICS_REGISTRY.gather())
         .unwrap_or_else(|error| {
@@ -195,6 +224,7 @@ pub fn setup_metrics(config: &ApiConfig) -> anyhow::Result<()> {
         register!(CLOUDBREAK_API_REQUESTS_BY_SUBSCRIPTION_ID);
         register!(CLOUDBREAK_API_INFLIGHT_REQUESTS);
         register!(CLOUDBREAK_API_BATCH_REQUESTS);
+        register!(CLOUDBREAK_API_DB_POOL_CONNECTIONS);
         register!(CLOUDBREAK_GPA_CACHE_SIZE_BYTES);
         register!(CLOUDBREAK_GPA_CACHE_MAX_BYTES);
         register!(CLOUDBREAK_GPA_CACHE_EVICTIONS_TOTAL);
