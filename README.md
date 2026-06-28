@@ -20,18 +20,13 @@ The API server exposes the following JSON-RPC methods:
 | `getHealth`                  | Returns the health status of the service.                                                                                                                  |
 | `getVersion`                 | Returns the cluster version, Agave-compatible (`{"solana-core": "<string>"}`). See note below for the composite-string format Cloudbreak uses.              |
 | `getGenesisHash`             | Returns the cluster genesis hash as a base58 string.                                                                                                       |
+| `getVoteAccounts`            | Returns the cluster's `current` and `delinquent` vote accounts with per-voter activated stake, commission, last vote, and recent epoch credits. Optional; only available when the Vote and Stake programs are indexed. See [Vote Accounts](#vote-accounts-getvoteaccounts). |
 
 Only **confirmed** and **finalized** commitment levels are fully supported. By default, requests with `processed` commitment return an error. This can be overridden via the `processed-commitment` configuration option (see [API Configuration](#api-server-cloudbreakapitoml)).
 
 > **Note on `getVersion`.** The `solana-core` field returned by Cloudbreak is a *composite* string of the form `"<upstream-solana-core>-cloudbreak<cloudbreak-version>"` (e.g. `"2.0.21-cloudbreak0.1.0"`). The upstream half is the `solana-core` version reported by the gRPC source the indexer is subscribed to (persisted to the `environment_info` table on indexer startup); the suffix is Cloudbreak's own crate version. This lets clients see *both* what cluster they're effectively talking to and which Cloudbreak build is serving them. If the indexer has never written an upstream version, the prefix falls back to `"unknown"`. The response is cached in-process for 10 minutes.
 
 ## Roadmap
-
-### Planned RPC Methods
-
-The following methods are planned for future releases:
-
-- `getVoteAccounts`
 
 ### Processed Commitment Level
 
@@ -77,7 +72,7 @@ The **cluster tracker** is a [Blockdaemon `solcluster tracker`](https://github.c
 | Crate                       | Package                               | Description                                                                                                                                                                                                                                                                                                                                                |
 | --------------------------- | ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `crates/command/`           | `cloudbreak`               | Main binary. Dispatches to `api`, `index`, `snapshot`, and `query-tracker` subcommands. Initializes OpenTelemetry tracing. Uses jemalloc as the global allocator on non-MSVC targets.                                                                                                                                                                      |
-| `crates/api/`               | `cloudbreak-api`           | HTTP JSON-RPC server (Hyper). Serves `getProgramAccounts`, `getTokenAccountsByOwner`, `getTokenAccountsByDelegate`, `getTokenAccountsByMint`, `getAccountInfo`, `getMultipleAccounts`, `getBalance`, `getTokenAccountBalance`, `getSlot`, `getHealth`, `getVersion`, and `getGenesisHash`. Streams `getProgramAccounts` and `getTokenAccountsByMint` responses as chunked JSON-RPC body frames, applies per-request `statement_timeout` and a total request timeout, supports batch requests with bounded concurrency, optionally caches results in memory (`[gpa-cache]`), and reports query usage to the query tracker.                                                                   |
+| `crates/api/`               | `cloudbreak-api`           | HTTP JSON-RPC server (Hyper). Serves `getProgramAccounts`, `getTokenAccountsByOwner`, `getTokenAccountsByDelegate`, `getTokenAccountsByMint`, `getAccountInfo`, `getMultipleAccounts`, `getBalance`, `getTokenAccountBalance`, `getSlot`, `getHealth`, `getVersion`, `getGenesisHash`, and (when the Vote and Stake programs are indexed) `getVoteAccounts`. Streams `getProgramAccounts` and `getTokenAccountsByMint` responses as chunked JSON-RPC body frames, applies per-request `statement_timeout` and a total request timeout, supports batch requests with bounded concurrency, optionally caches results in memory (`[gpa-cache]`), and reports query usage to the query tracker.                                                                   |
 | `crates/index/`             | `cloudbreak-index`         | Live indexer. Subscribes to Yellowstone gRPC, applies program filters, writes account/slot state to Postgres. Includes finalize-slot pipeline, self-healing for slot gaps. Uses the `snapshot` crate to optionally load a full snapshot on startup for fast bootstrapping.                                                                                 |
 | `crates/snapshot/`          | `cloudbreak-snapshot`      | Batch loads Solana full and incremental snapshots. Queries a cluster tracker (`/v1/snapshots`) to find a covering snapshot pair, downloads the archives from the source reported by the tracker, unpacks them, reads Solana `AccountsFile` entries, bulk-upserts into Postgres, handles deduplication, optional partition clustering, and index creation. |
 | `crates/query-tracker/`     | `cloudbreak-query-tracker` | JSON-RPC sidecar service (jsonrpsee). Counts `getProgramAccounts`-shaped queries, maintains a priority queue, and optionally drives automatic `CREATE INDEX` on Postgres based on query frequency. Includes periodic query count resets.                                                                                                                   |
@@ -625,6 +620,18 @@ These two are independent but related: the indexer `[programs]` determines what 
 > **Note (storage layout):** If you want certain programs to get dedicated LIST partitions in the `accounts` / `snapshot_accounts` tables (a schema-level storage optimization, separate from the indexing filter above), configure `[pg-owner-partitions].programs-for-list-partition` in the migration TOML. This must be set before running migrations; changing it later requires re-running migrations (e.g. `fresh`). See [`crates/migration/README.md`](crates/migration/README.md).
 
 ## Optional Modules
+
+### Vote Accounts (`getVoteAccounts`)
+
+`getVoteAccounts` is optional and only served when the indexer's `[programs]` filter includes both the Vote (`Vote111111111111111111111111111111111111111`) and Stake (`Stake11111111111111111111111111111111111111`) programs. Cloudbreak checks this at startup; if either is missing, the method returns a `getVoteAccounts is not supported on this node` error and the supporting background tasks are not started.
+
+The response combines two sources. The per-account fields (commission, last vote, root slot, recent epoch credits, node pubkey) are read from the indexed Vote accounts. The per-voter activated stake and epoch-set membership (`epochVoteAccount`) come from a separate `epoch_stakes` table, since effective stake cannot be derived from a single account.
+
+The `epoch_stakes` table is seeded from snapshot metadata. When the indexer loads a snapshot, it extracts each voter's activated stake and epoch-set membership from the snapshot's bank stakes and versioned epoch-stakes data and upserts them into the table. The API loads the latest epoch's rows into an in-memory cache on startup and polls the table every 30 s, refreshing when the epoch advances or the in-epoch stake total changes. Before the indexer has completed a snapshot pass with stake data the cache is empty, and `getVoteAccounts` returns a node-unhealthy error rather than partial results.
+
+A snapshot captures stake at a single point in time, but activated stake drifts within an epoch as stake warms up or cools down and as rewards are distributed at the epoch boundary. To track this, the indexer runs a background recomputer that recalculates each voter's effective stake for the current epoch from the indexed Stake accounts (using the same warmup/cooldown rules as the runtime), upserts the result into `epoch_stakes`, and keeps only the two most recent epochs.
+
+The recomputer detects drift by comparing the total activated stake across runs. It recomputes every 60 s and treats an epoch as converged once the total is unchanged for three consecutive polls and the indexed `EpochRewards` sysvar reports that reward distribution has finished. If that sysvar is not indexed, it converges on stability alone after roughly 30 minutes. After converging it keeps recomputing on a slower 600 s heartbeat, returning to the 60 s cadence if a late reward write or a healed ingestion gap moves the total again.
 
 ### Snapshot on Indexer Startup
 
