@@ -13,7 +13,7 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 lazy_static::lazy_static! {
-    static ref PROGRAM_ACCOUNTS_QUERY_COUNTS: Mutex<HashMap<String, u32>> = Mutex::new(HashMap::new());
+    static ref PROGRAM_ACCOUNTS_QUERY_COUNTS: Mutex<HashMap<String, QueryCount>> = Mutex::new(HashMap::new());
     static ref PRIORITY_QUEUE: Mutex<BinaryHeap<PrioritizedQuery>> = Mutex::new(BinaryHeap::new());
     static ref QUEUE_CONDVAR: Condvar = Condvar::new();
 }
@@ -23,9 +23,17 @@ const MAX_PRIORITY_QUEUE_SIZE: usize = 1000;
 const MAX_TRACKED_QUERIES: usize = 10_000;
 
 static INDEX_GENERATION_THRESHOLD: OnceLock<u32> = OnceLock::new();
+static COST_ELIGIBILITY_THRESHOLD_US: OnceLock<Option<u64>> = OnceLock::new();
+static COST_WEIGHTING: OnceLock<bool> = OnceLock::new();
+
+pub struct QueryCount {
+    pub count: u32,
+    pub total_cost_us: u64,
+}
 
 #[derive(Clone, Debug)]
 pub struct PrioritizedQuery {
+    pub score: u64,
     pub count: u32,
     pub key: String,
     pub program: Pubkey,
@@ -34,7 +42,7 @@ pub struct PrioritizedQuery {
 
 impl PartialEq for PrioritizedQuery {
     fn eq(&self, other: &Self) -> bool {
-        self.count == other.count && self.key == other.key
+        self.score == other.score && self.key == other.key
     }
 }
 
@@ -48,15 +56,33 @@ impl PartialOrd for PrioritizedQuery {
 
 impl Ord for PrioritizedQuery {
     fn cmp(&self, other: &Self) -> Ordering {
-        match self.count.cmp(&other.count) {
+        match self.score.cmp(&other.score) {
             Ordering::Equal => self.key.cmp(&other.key),
             other => other,
         }
     }
 }
 
-pub fn init_query_tracker(threshold: u32) {
+pub fn init_query_tracker(
+    threshold: u32,
+    cost_eligibility_threshold_us: Option<u64>,
+    cost_weighting: bool,
+) {
+    // A cost eligibility threshold only influences which queries are *admitted* to the index
+    // queue; `cost-weighting` is what makes the queue *rank* by cost. With weighting off, a
+    // query admitted via the cost gate is still scored by raw request count, so it lands at the
+    // bottom of the queue and is the first to be evicted — the cost gate is effectively inert.
+    // Warn so the operator pairs the two settings.
+    if cost_eligibility_threshold_us.is_some() && !cost_weighting {
+        warn!(
+            "`cost-eligibility-threshold-us` is set but `cost-weighting` is disabled; \
+             cost-admitted queries are ranked by request count and will be starved/evicted. \
+             Enable `cost-weighting` for the cost gate to have any effect."
+        );
+    }
     let _ = INDEX_GENERATION_THRESHOLD.set(threshold);
+    let _ = COST_ELIGIBILITY_THRESHOLD_US.set(cost_eligibility_threshold_us);
+    let _ = COST_WEIGHTING.set(cost_weighting);
 }
 
 #[derive(Serialize)]
@@ -75,6 +101,7 @@ pub fn track_program_accounts_query(
     program: Pubkey,
     config: Option<&RpcProgramAccountsConfig>,
     increment: u32,
+    observed_cost_us: u64,
 ) {
     let key_struct = QueryKey {
         program: &program.to_string(),
@@ -90,22 +117,38 @@ pub fn track_program_accounts_query(
     };
 
     let threshold = INDEX_GENERATION_THRESHOLD.get().copied().unwrap_or(10);
+    let cost_eligibility_threshold_us =
+        COST_ELIGIBILITY_THRESHOLD_US.get().copied().unwrap_or(None);
+    let cost_weighting = COST_WEIGHTING.get().copied().unwrap_or(false);
 
     match PROGRAM_ACCOUNTS_QUERY_COUNTS.lock() {
-        Ok(mut counts) => {
-            if counts.len() >= MAX_TRACKED_QUERIES && !counts.contains_key(&key) {
+        Ok(mut query_count) => {
+            if query_count.len() >= MAX_TRACKED_QUERIES && !query_count.contains_key(&key) {
                 warn!(
                     "Query tracker has reached maximum capacity ({} unique queries). Clearing old entries.",
                     MAX_TRACKED_QUERIES
                 );
-                counts.clear();
+                query_count.clear();
             }
 
-            let key_for_queue = key.clone();
-            let count = counts.entry(key).or_insert(0);
-            *count += increment;
+            let QueryCount {
+                count,
+                total_cost_us,
+            } = query_count.entry(key.clone()).or_insert(QueryCount {
+                count: 0,
+                total_cost_us: 0,
+            });
 
-            if *count >= threshold {
+            let key_for_queue = key.clone();
+            *count += increment;
+            *total_cost_us += observed_cost_us;
+
+            if cost_eligible(
+                *count,
+                threshold,
+                *total_cost_us,
+                cost_eligibility_threshold_us,
+            ) {
                 match PRIORITY_QUEUE.lock() {
                     Ok(mut queue) => {
                         if queue.len() >= MAX_PRIORITY_QUEUE_SIZE {
@@ -131,6 +174,8 @@ pub fn track_program_accounts_query(
                         for item in temp_vec.iter_mut() {
                             if item.key == key_for_queue {
                                 item.count = *count;
+
+                                item.score = compute_score(*count, *total_cost_us, cost_weighting);
                                 found = true;
                                 tracing::debug!(
                                     target: "query_tracker_tracker",
@@ -141,8 +186,9 @@ pub fn track_program_accounts_query(
                             }
                         }
 
-                        if !found && *count == threshold {
+                        if !found {
                             temp_vec.push(PrioritizedQuery {
+                                score: compute_score(*count, *total_cost_us, cost_weighting),
                                 count: *count,
                                 key: key_for_queue,
                                 program,
@@ -172,6 +218,31 @@ pub fn track_program_accounts_query(
             warn!("Failed to acquire query tracker lock: {}", e);
         }
     }
+}
+
+fn compute_score(count: u32, total_cost_us: u64, cost_weighting: bool) -> u64 {
+    if cost_weighting {
+        total_cost_us
+    } else {
+        count as u64
+    }
+}
+
+/// Whether a tracked query qualifies for the index priority queue.
+///
+/// Two independent gates, admitted on EITHER:
+/// - `count >= index_threshold` — seen often enough to be worth indexing, OR
+/// - `total_cost_us >= cost_threshold` — rare but cumulatively expensive.
+///
+/// With `cost_threshold_us = None` the cost gate is disabled and eligibility is purely
+/// count-based, reproducing the original behavior.
+fn cost_eligible(
+    count: u32,
+    index_threshold: u32,
+    total_cost_us: u64,
+    cost_threshold_us: Option<u64>,
+) -> bool {
+    count >= index_threshold || cost_threshold_us.is_some_and(|t| total_cost_us >= t)
 }
 
 fn parse_gpa_config(
@@ -477,5 +548,35 @@ mod tests {
 
         let parsed = parse_gpa_config("SomeProgram11111111111111111111111111111", Some(&config));
         assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn score_defaults_to_count_when_cost_weighting_off() {
+        assert_eq!(compute_score(7, 9_999_999, false), 7);
+    }
+
+    #[test]
+    fn score_uses_total_cost_when_cost_weighting_on() {
+        assert_eq!(compute_score(7, 9_999_999, true), 9_999_999);
+    }
+
+    #[test]
+    fn cost_eligible_is_count_only_when_no_cost_threshold() {
+        // Back-compat: with the cost gate disabled (None), eligibility is purely count-based,
+        // and a huge accumulated cost must NOT admit a query that is below the count threshold.
+        assert!(cost_eligible(10, 10, 0, None)); // exactly at threshold
+        assert!(cost_eligible(50, 10, 0, None)); // above threshold
+        assert!(!cost_eligible(9, 10, u64::MAX, None)); // below count; cost ignored entirely
+    }
+
+    #[test]
+    fn cost_eligible_admits_rare_but_expensive_query() {
+        // Below the count threshold, but accumulated cost crosses the cost gate.
+        assert!(cost_eligible(3, 10, 5_000_000, Some(1_000_000)));
+    }
+
+    #[test]
+    fn cost_eligible_rejects_when_below_both_gates() {
+        assert!(!cost_eligible(3, 10, 500, Some(1_000_000)));
     }
 }

@@ -20,6 +20,8 @@ pub struct QueryBatchEntry {
     pub program: String,
     pub config: Option<RpcProgramAccountsConfig>,
     pub count: u32,
+    #[serde(default)]
+    pub total_cost_us: u64,
 }
 
 #[rpc(server, client)]

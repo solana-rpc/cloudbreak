@@ -24,6 +24,7 @@ struct BufferedQuery {
     program: Pubkey,
     config: Option<RpcProgramAccountsConfig>,
     count: u32,
+    total_cost_us: u64,
 }
 
 #[derive(Serialize)]
@@ -31,6 +32,7 @@ struct QueryBatchEntry {
     program: String,
     config: Option<RpcProgramAccountsConfig>,
     count: u32,
+    total_cost_us: u64,
 }
 
 #[derive(Serialize)]
@@ -72,7 +74,7 @@ impl QueryTrackerClient {
 
     /// Buffer a query locally for later batch submission. This is a cheap
     /// in-memory operation with no network calls.
-    pub fn buffer_query(&self, program: Pubkey, config: Option<RpcProgramAccountsConfig>) {
+    pub fn buffer_query(&self, program: Pubkey, config: Option<RpcProgramAccountsConfig>, observed_cost_us: u64) {
         let key = serialize_query_key(&program, config.as_ref());
 
         match self.buffer.lock() {
@@ -81,8 +83,10 @@ impl QueryTrackerClient {
                     program,
                     config,
                     count: 0,
+                    total_cost_us: 0,
                 });
                 entry.count += 1;
+                entry.total_cost_us += observed_cost_us;
             }
             Err(e) => {
                 warn!("Failed to acquire query buffer lock: {}", e);
@@ -128,6 +132,7 @@ impl QueryTrackerClient {
                         program: bq.program.to_string(),
                         config: bq.config,
                         count: bq.count,
+                        total_cost_us: bq.total_cost_us,
                     })
                     .collect();
 
