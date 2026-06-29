@@ -414,6 +414,46 @@ async fn process_single_request(
 
             json_response
         }
+        "getTokenLargestAccounts" => {
+            let start_time = Instant::now();
+
+            let pubkey: String = match extract_param(&rpc_request.params, 0) {
+                Ok(p) => p,
+                Err(e) => return make_error_response(id, -32602, e),
+            };
+            let commitment: Option<CommitmentConfig> =
+                extract_param(&rpc_request.params, 1).ok().flatten();
+
+            let result = methods::get_token_largest_accounts::get_token_largest_accounts(
+                state, pubkey, commitment,
+            )
+            .await;
+
+            let status_label = if result.is_ok() {
+                "success"
+            } else {
+                tracing::error!(
+                    target: "api_request_errors_count",
+                    "getTokenLargestAccounts error: {:?}",
+                    result.as_ref().unwrap_err()
+                );
+                "error"
+            };
+            metrics::CLOUDBREAK_API_REQUESTS_TOTAL
+                .with_label_values(&["getTokenLargestAccounts", status_label])
+                .inc();
+
+            let json_response = json_serialize_response(id, result).await;
+
+            metrics::CLOUDBREAK_API_REQUEST_DURATION_MS
+                .with_label_values(&[
+                    "getTokenLargestAccounts",
+                    metrics::bytes_bucket(json_response.len() as u64),
+                ])
+                .observe(start_time.elapsed().as_millis() as f64);
+
+            json_response
+        }
         "getTokenAccountsByOwner" => {
             let owner: String = match extract_param(&rpc_request.params, 0) {
                 Ok(o) => o,
