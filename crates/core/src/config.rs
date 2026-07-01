@@ -145,7 +145,8 @@ impl EnvironmentInfo {
         db.execute(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             "INSERT INTO environment_info (id, mode, programs) VALUES (1, $1, $2) \
-             ON CONFLICT (id) DO UPDATE SET mode = EXCLUDED.mode, programs = EXCLUDED.programs",
+             ON CONFLICT (id) DO UPDATE SET mode = EXCLUDED.mode, programs = EXCLUDED.programs
+             WHERE environment_info.mode IS DISTINCT FROM EXCLUDED.mode OR environment_info.programs IS DISTINCT FROM EXCLUDED.programs",
             [mode.into(), programs_csv.into()],
         ))
         .await?;
@@ -190,7 +191,8 @@ impl EnvironmentInfo {
         db.execute(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             "INSERT INTO environment_info (id, solana_version) VALUES (1, $1) \
-             ON CONFLICT (id) DO UPDATE SET solana_version = EXCLUDED.solana_version",
+             ON CONFLICT (id) DO UPDATE SET solana_version = EXCLUDED.solana_version
+             WHERE environment_info.solana_version IS DISTINCT FROM EXCLUDED.solana_version",
             [version.into()],
         ))
         .await?;
