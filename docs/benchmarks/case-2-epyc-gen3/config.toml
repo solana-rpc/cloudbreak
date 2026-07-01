@@ -1,0 +1,14 @@
+# Case 2 — Cloudbreak load, EPYC Gen3 (single API task)
+
+[rpc1]
+url = "<cloudbreak-api-task-endpoint>"   # no [rpc2] / [comparison] — single-endpoint load
+
+[benchmark]
+target_rps = 100.0
+max_in_flight = 120
+duration_secs = 1800
+timeout_secs = 180
+
+[source]
+type = "victoria_logs"
+# url = "<victoria-logs-endpoint>"

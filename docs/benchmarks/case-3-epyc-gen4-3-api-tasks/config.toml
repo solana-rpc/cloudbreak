@@ -1,0 +1,17 @@
+# Case 3 — Cloudbreak load, EPYC Gen4 (3 API tasks -> 1 shared DB)
+#
+# Each of the 3 API tasks was driven by its own load stream (this config, one per
+# task); all three tasks query the same Postgres. URLs redacted.
+
+[rpc1]
+url = "<cloudbreak-api-task-endpoint>"   # no [rpc2] / [comparison] — single-endpoint load
+
+[benchmark]
+target_rps = 150.0
+max_in_flight = 180
+duration_secs = 1000
+timeout_secs = 180
+
+[source]
+type = "victoria_logs"
+# url = "<victoria-logs-endpoint>"
