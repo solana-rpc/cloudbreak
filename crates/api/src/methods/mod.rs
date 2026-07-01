@@ -3,10 +3,10 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-use solana_commitment_config::CommitmentLevel;
-use solana_pubkey::Pubkey;
 use cloudbreak_core::ProcessedCommitmentBehavior;
 use cloudbreak_core::modules::rpc_filter_type::RpcFilterType;
+use solana_commitment_config::CommitmentLevel;
+use solana_pubkey::Pubkey;
 
 use crate::error::RpcError;
 
@@ -15,6 +15,7 @@ pub mod get_account_info;
 pub mod get_balance;
 pub mod get_multiple_accounts;
 pub mod get_token_account_balance;
+pub mod get_token_supply;
 pub mod mint;
 pub mod mint_accounts;
 pub mod program;
