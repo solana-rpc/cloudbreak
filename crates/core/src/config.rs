@@ -617,6 +617,16 @@ impl SlotSyncronizerConfig {
 #[derive(Deserialize, Debug, Clone)]
 pub struct QueryTrackerConfig {
     #[serde(
+        rename = "cost-eligibility-threshold-us",
+        default = "QueryTrackerConfig::default_cost_eligibility_threshold_us"
+    )]
+    pub cost_eligibility_threshold_us: Option<u64>,
+    #[serde(
+        rename = "cost-weighting",
+        default = "QueryTrackerConfig::default_cost_weighting"
+    )]
+    pub cost_weighting: bool,
+    #[serde(
         rename = "create-database-indexes",
         default = "QueryTrackerConfig::default_create_database_indexes"
     )]
@@ -714,6 +724,14 @@ impl QueryTrackerConfig {
         Duration::from_secs(3600 * 24)
     }
 
+    const fn default_cost_eligibility_threshold_us() -> Option<u64> {
+        None
+    }
+
+    const fn default_cost_weighting() -> bool {
+        false
+    }
+
     const fn default_create_database_indexes() -> bool {
         false
     }
@@ -756,6 +774,8 @@ impl Default for QueryTrackerConfig {
             index_eviction_interval: Self::default_index_eviction_interval(),
             index_eviction_enabled: Self::default_index_eviction_enabled(),
             index_min_idle: Self::default_index_min_idle(),
+            cost_eligibility_threshold_us: Self::default_cost_eligibility_threshold_us(),
+            cost_weighting: Self::default_cost_weighting(),
             index_generation_threshold: Self::default_index_generation_threshold(),
             index_creation_delay: Self::default_index_creation_delay(),
             query_counts_reset_interval: Self::default_query_counts_reset_interval(),

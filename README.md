@@ -812,6 +812,16 @@ cargo run --bin integration_tests -- benchmark gtabd
 
 See [`crates/integration_tests/README.md`](crates/integration_tests/README.md) for the full documentation including configuration reference, comparison semantics, slot compensation, logging targets, and output format.
 
+## Benchmarks & Load Testing
+
+Published benchmark and load-testing results live in [`docs/benchmarks/`](docs/benchmarks/README.md). All runs replay real production traffic captured from VictoriaLogs archives, measured end-to-end within the same datacenter. Current cases:
+
+- **Case 1** — low-RPS correctness + latency comparison against a reference Agave endpoint.
+- **Case 2** — sustained single-node load on an AMD EPYC Gen3 node (1 API task).
+- **Case 3** — scale-out load on an AMD EPYC Gen4 node (3 API tasks → 1 shared Postgres).
+
+See [`docs/benchmarks/README.md`](docs/benchmarks/README.md) for the full write-up, latency tables, and throughput charts.
+
 ## Development
 
 ### Building

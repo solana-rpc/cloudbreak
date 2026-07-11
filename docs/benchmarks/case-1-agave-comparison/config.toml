@@ -1,0 +1,28 @@
+# Case 1 — Low-RPS comparison: Cloudbreak (rpc1) vs Agave (rpc2)
+
+[rpc1]
+url = "<cloudbreak-endpoint>"
+name = "Cloudbreak"
+
+[rpc2]
+url = "<agave-endpoint>"
+name = "Agave"
+
+[benchmark]
+target_rps = 2.0
+max_in_flight = 200
+duration_secs = 1800
+timeout_secs = 180
+
+[source]
+type = "victoria_logs"
+
+[comparison]
+enable_slot_compensation = true
+slot_compensation_max_retries = 50
+slot_compensation_interval_ms = 100
+ratio = 1.0
+
+[retry_in_place]
+enabled        = true
+save_rescued   = false
