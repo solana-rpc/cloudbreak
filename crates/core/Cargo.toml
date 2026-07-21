@@ -35,4 +35,4 @@ rust_decimal = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
-serde_json = "1.0.143"
+serde_json = { workspace = true }

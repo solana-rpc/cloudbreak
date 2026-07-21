@@ -25,22 +25,22 @@ clap = { workspace = true }
 env_logger = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { version = "0.3.19", features = ["fmt", "env-filter"] }
+tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 solana-lattice-hash = { workspace = true }
 solana-accounts-db = { workspace = true }
 solana-pubkey = { workspace = true }
 blake3 = { workspace = true }
 hex = { workspace = true }
-opentelemetry-otlp = { version = "0.31.0", features = ["grpc-tonic"] }
+opentelemetry-otlp = { workspace = true, features = ["grpc-tonic"] }
 tracing-opentelemetry = { workspace = true }
-opentelemetry_sdk = { version = "0.31.0", features = ["trace", "rt-tokio"] }
+opentelemetry_sdk = { workspace = true, features = ["trace", "rt-tokio"] }
 opentelemetry = { workspace = true, features = ["trace"] }
 serde = { workspace = true }
 toml = { workspace = true }
-zstd = "0.13"
-tar = "0.4"
+zstd = { workspace = true }
+tar = { workspace = true }
 sea-orm = { workspace = true }
 
 # jemalloc for better memory management
-tikv-jemallocator = "0.6.1"
+tikv-jemallocator = { workspace = true }

@@ -18,7 +18,7 @@ authors = [
 [dependencies]
 sea-orm = { workspace = true }
 anyhow = { workspace = true }
-num-traits = "0.2.19"
+num-traits = { workspace = true }
 thiserror = { workspace = true }
 solana-account = { workspace = true }
 solana-pubkey = { workspace = true }
