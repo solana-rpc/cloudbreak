@@ -60,5 +60,5 @@ ORDER BY (
     + get_byte(data,69)::numeric * 1099511627776
     + get_byte(data,70)::numeric * 281474976710656
     + get_byte(data,71)::numeric * 72057594037927936
-) DESC, pubkey
+) DESC, pubkey DESC
 LIMIT 20;
