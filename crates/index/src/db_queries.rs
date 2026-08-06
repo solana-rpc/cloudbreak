@@ -9,11 +9,11 @@ use std::{
 };
 
 use cloudbreak_core::{IndexConfig, modules::account_owner_map::AccountOwnerMap};
-use cloudbreak_entity::{accounts, service_health, slots};
+use cloudbreak_entity::{accounts, slots};
 use sea_orm::{
-    ActiveValue::{NotSet, Set},
+    ActiveValue::Set,
     ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait,
-    QueryFilter, Statement, TransactionTrait, Value,
+    QueryFilter, Statement, Value,
     prelude::Expr,
     sea_query::{Alias, OnConflict},
 };
@@ -33,43 +33,9 @@ use crate::metrics;
 /// The authoritative `service_health` row and the denormalised `slots.health` flag are written
 /// in a single transaction so they can never diverge.
 pub async fn update_service_health(db: &DatabaseConnection, healthy: bool) {
-    let result = timeout(Duration::from_secs(30), async {
-        let txn = db.begin().await?;
-
-        service_health::Entity::insert(service_health::ActiveModel {
-            id: Set(1), //It will always write to the one default record
-            healthy: Set(healthy),
-            last_updated_at: NotSet,
-        })
-        .on_conflict(
-            OnConflict::columns([service_health::Column::Id])
-                .update_columns([
-                    service_health::Column::Healthy,
-                    service_health::Column::LastUpdatedAt,
-                ])
-                .to_owned(),
-        )
-        .exec_without_returning(&txn)
-        .await?;
-
-        // Denormalise the same health state onto every `slots` row so the API can read
-        // the latest slot and the health flag in a single lookup.
-        slots::Entity::update_many()
-            .col_expr(slots::Column::Health, Expr::value(healthy))
-            .exec(&txn)
-            .await?;
-
-        txn.commit().await?;
-
-        Ok::<(), sea_orm::DbErr>(())
-    })
-    .await
-    .unwrap_or_else(|elapsed| {
-        tracing::error!("update_service_health timeout ERROR: {}", elapsed);
-        Err(sea_orm::DbErr::RecordNotInserted)
-    });
-
-    match result {
+    // The atomic upsert now lives in `core` so every service shares it; keep the
+    // indexer's fire-and-forget logging and db-error metric here.
+    match cloudbreak_core::modules::service_health::update_service_health(db, healthy).await {
         Ok(()) => {
             tracing::debug!(
                 "update_service_health: updated service + slots health to {}",

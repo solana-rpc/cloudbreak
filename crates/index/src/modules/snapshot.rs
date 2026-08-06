@@ -3,10 +3,8 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+use cloudbreak_core::{IndexConfig, SnapshotConfig, modules::account_owner_map::AccountOwnerMap};
 use std::sync::{Arc, Mutex};
-use cloudbreak_core::{
-    IndexConfig, SnapshotConfig, modules::account_owner_map::AccountOwnerMap,
-};
 
 use crate::metrics;
 use crate::modules::finalize_slot::UpdatedAccountsDuringStartup;

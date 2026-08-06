@@ -48,6 +48,7 @@ use crate::modules::{CAP_TABLE, INDEX_TABLES, indexer_backpressure};
 use crate::stats::discrepancy::{self, DiscrepancyState};
 use crate::stats::metrics;
 use cloudbreak_core::modules::index_identity::IndexIdentity;
+use cloudbreak_core::modules::service_health;
 use cloudbreak_core::{IndexRegressionGuard, QueryTrackerConfig};
 use sea_orm::{ConnectionTrait, DbErr, Statement, TransactionTrait};
 use std::collections::HashMap;
@@ -175,8 +176,22 @@ async fn run_pass(store: &Store, config: &QueryTrackerConfig) -> Result<(), DbEr
     let mut evicted = 0usize;
     let mut reclaimed: i64 = 0;
 
+    // Optionally drain traffic off the node for the duration of the trim: mark it
+    // unhealthy before the loop and healthy again after, so a load balancer reading
+    // the shared health flag routes around the DROP INDEX lock spikes.
+    if config.mark_unhealthy_for_eviction
+        && let Err(e) = service_health::update_service_health(store.db(), false).await
+    {
+        error!(
+            target: "query_tracker_eviction",
+            "failed to mark node unhealthy before eviction trim: {e:?}; continuing anyway"
+        );
+    }
+
     // Unconditional trim: drop the least-valuable eligible pairs until back at
     // the target (entry into the buffer was already value-gated at creation).
+    // Timed end-to-end (wall clock, incl. backpressure waits and drop retries).
+    let loop_start = Instant::now();
     for scored in &candidates {
         let row = &scored.row;
         if count <= target {
@@ -223,13 +238,22 @@ async fn run_pass(store: &Store, config: &QueryTrackerConfig) -> Result<(), DbEr
         }
     }
 
-    if evicted > 0 {
-        info!(
+    let elapsed_ms = loop_start.elapsed().as_millis();
+
+    if config.mark_unhealthy_for_eviction
+        && let Err(e) = service_health::update_service_health(store.db(), true).await
+    {
+        error!(
             target: "query_tracker_eviction",
-            "evicted {evicted} idle index pair(s) to return to fill target ({target}/{max}), \
-             reclaiming ~{reclaimed} bytes"
+            "failed to restore node healthy after eviction trim: {e:?}"
         );
     }
+
+    info!(
+        target: "query_tracker_eviction",
+        "eviction trim loop finished in {elapsed_ms}ms: evicted {evicted} idle index pair(s) \
+         to return to fill target ({target}/{max}), reclaiming ~{reclaimed} bytes"
+    );
     Ok(())
 }
 

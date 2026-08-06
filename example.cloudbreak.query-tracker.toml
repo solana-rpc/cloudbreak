@@ -53,6 +53,11 @@ max-auto-indexes = 100
 
 # --- eviction (usage-based; off by default) ---
 index-eviction-enabled = false
+# Drain traffic off the node while the trim holds DROP INDEX locks: mark the
+# shared service_health/slots.health flag unhealthy before the trim loop and
+# healthy after. Only enable where this service is the authority for node health
+# (it writes the same row the indexer uses and can otherwise clobber it).
+mark-unhealthy-for-eviction = false
 index-eviction-interval = "1h"
 index-min-age-grace = "1h"
 index-min-idle = "24h"

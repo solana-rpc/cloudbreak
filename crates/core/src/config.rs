@@ -894,6 +894,21 @@ pub struct QueryTrackerConfig {
         default = "QueryTrackerConfig::default_index_eviction_enabled"
     )]
     pub index_eviction_enabled: bool,
+    /// When `true`, the eviction pass marks the whole node **unhealthy** (via the
+    /// shared `service_health` / `slots.health` flag) for the duration of the idle
+    /// trim loop, then healthy again once it finishes — so a load balancer reading
+    /// that flag drains traffic away from the node while `DROP INDEX` holds heavy
+    /// `ACCESS EXCLUSIVE` locks.
+    ///
+    /// Off by default. It writes the *same shared* health row the indexer uses, so
+    /// only enable it where the query tracker is the authority that may flip node
+    /// health: if another process on the node also toggles it, the two can clobber
+    /// each other (e.g. this restores healthy while the indexer wanted unhealthy).
+    #[serde(
+        rename = "mark-unhealthy-for-eviction",
+        default = "QueryTrackerConfig::default_mark_unhealthy_for_eviction"
+    )]
+    pub mark_unhealthy_for_eviction: bool,
     /// How often the eviction pass runs. Keep comfortably larger than the
     /// creation rate to avoid drop/rebuild churn. Default: 1h.
     #[serde(
@@ -1064,6 +1079,10 @@ impl QueryTrackerConfig {
         false
     }
 
+    const fn default_mark_unhealthy_for_eviction() -> bool {
+        false
+    }
+
     fn default_index_min_idle() -> Duration {
         Duration::from_secs(3600 * 24)
     }
@@ -1160,6 +1179,7 @@ impl Default for QueryTrackerConfig {
             indexer_metrics_threshold: Self::default_indexer_metrics_threshold(),
             max_auto_indexes: None,
             index_eviction_enabled: Self::default_index_eviction_enabled(),
+            mark_unhealthy_for_eviction: Self::default_mark_unhealthy_for_eviction(),
             index_eviction_interval: Self::default_index_eviction_interval(),
             index_min_age_grace: Self::default_index_min_age_grace(),
             index_min_idle: Self::default_index_min_idle(),
@@ -1438,6 +1458,10 @@ mod tests {
     fn query_tracker_eviction_defaults_are_safe() {
         let c = QueryTrackerConfig::default();
         assert!(!c.index_eviction_enabled, "eviction must be off by default");
+        assert!(
+            !c.mark_unhealthy_for_eviction,
+            "mark-unhealthy-for-eviction must be off by default"
+        );
         assert_eq!(c.index_min_idle, Duration::from_secs(86400));
         assert_eq!(c.index_min_age_grace, Duration::from_secs(3600));
         assert_eq!(c.index_eviction_interval, Duration::from_secs(3600));
