@@ -156,7 +156,11 @@ pub fn docs() -> Value {
     jval!({
         "score": "shown in thousands (raw score ÷ 1000, e.g. \"37.2K\"); the raw score derives \
              from per-request costs in microseconds, so dividing by 1000 makes it proportional to \
-             the millisecond (ms) figures shown alongside",
+             the millisecond (ms) figures shown alongside. For the `weighted` mode the value in \
+             parentheses breaks it into the three factors it multiplies together — \
+             avg (mean cost per request, in ms) × gain (latency multiplier, 1 = neutral) × \
+             counts (windowed demand/supply/failure volume multiplier, shown in K like the score)",
+        "score_units": "underlying units: the raw score is in microseconds and counts is a raw count",
         "latency": "avg_cost_*_ms and with_without_idx_ratio are the raw measured values; \
              without-index-compensation-factor is applied only inside the weighted score's gain \
              term and the latency regression guard, never to these displayed numbers",
@@ -167,6 +171,24 @@ pub fn docs() -> Value {
 /// See [`docs`] for why the score is shown ÷ 1000.
 pub fn score_k(score: f64) -> String {
     format!("{:.1}K", score / 1000.0)
+}
+
+/// Render the `score` field: the score in thousands ([`score_k`]) plus, for the
+/// `weighted` mode, the three factors whose product **is** that score — average
+/// cost (ms), the latency `gain` multiplier, and the `counts` volume multiplier
+/// (also in K) — e.g. `"37.2K (avg 12.34ms × gain 1.05 × counts 13.0K)"`. The
+/// single-quantity modes have no such decomposition and render the bare score.
+pub fn score_field(score: f64, components: Option<(f64, f64, f64)>) -> String {
+    match components {
+        Some((avg_us, gain, counts)) => format!(
+            "{} (avg {:.2}ms × gain {:.2} × counts {})",
+            score_k(score),
+            avg_us / 1000.0,
+            gain,
+            score_k(counts),
+        ),
+        None => score_k(score),
+    }
 }
 
 /// Average cost per request in **milliseconds** (2 dp), or `None` when the

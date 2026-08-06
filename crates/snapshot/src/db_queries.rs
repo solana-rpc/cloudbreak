@@ -9,6 +9,8 @@ use std::{
     time::Duration,
 };
 
+use cloudbreak_core::SnapshotPgIndexesConfig;
+use cloudbreak_entity::snapshot_accounts::{self};
 use rust_decimal::Decimal;
 use sea_orm::{
     ActiveValue::Set, ConnectionTrait, DatabaseConnection, EntityTrait, Statement,
@@ -16,8 +18,6 @@ use sea_orm::{
 };
 use tokio::time::Instant;
 use yellowstone_grpc_proto::geyser::SubscribeUpdateAccount;
-use cloudbreak_core::SnapshotPgIndexesConfig;
-use cloudbreak_entity::snapshot_accounts::{self};
 
 use crate::metrics;
 use crate::stake_data::SnapshotStakeData;
@@ -543,7 +543,7 @@ pub async fn persist_epoch_stakes(
 
     txn.commit().await?;
 
-    tracing::info!(
+    tracing::debug!(
         target: "persist_epoch_stakes",
         "persisted {} voters for epoch {} in {:.3}s",
         data.voters.len(),
@@ -553,4 +553,3 @@ pub async fn persist_epoch_stakes(
 
     Ok(())
 }
-

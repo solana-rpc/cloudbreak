@@ -64,6 +64,55 @@ pub struct StoreCounts {
     pub discrepant: i64,
 }
 
+/// A pattern paired with its [`PriorityMode`] score and, for
+/// [`PriorityMode::Weighted`], the three factors whose product **is** that score
+/// (`avg_cost_us`, the latency `gain` multiplier, and the `counts` multiplier;
+/// see [`prioritization::score_component_exprs`]). The factors are `None` for the
+/// single-quantity modes, which do not decompose. The debug endpoints show them
+/// beside the score; creation and eviction read only `score`.
+pub struct ScoredPattern {
+    pub row: PatternRow,
+    pub score: f64,
+    pub components: Option<(f64, f64, f64)>,
+}
+
+/// SQL select-list tail: the score plus, for `Weighted`, its three component
+/// columns. Non-`Weighted` modes select `NULL::float8` for the components so
+/// every row parses through [`row_to_scored`] identically.
+fn score_select(mode: PriorityMode, compensation: f64) -> String {
+    let score = prioritization::score_expr(mode, compensation);
+    match prioritization::score_component_exprs(mode, compensation) {
+        Some((avg, gain, counts)) => format!(
+            "({score})::float8 AS score, ({avg})::float8 AS score_avg, \
+             ({gain})::float8 AS score_gain, ({counts})::float8 AS score_counts"
+        ),
+        None => format!(
+            "({score})::float8 AS score, NULL::float8 AS score_avg, \
+             NULL::float8 AS score_gain, NULL::float8 AS score_counts"
+        ),
+    }
+}
+
+/// Parse a row selected with [`score_select`] into a [`ScoredPattern`]. Components
+/// are `Some` only when all three columns are non-NULL (i.e. `Weighted`).
+fn row_to_scored(r: &QueryResult) -> Result<ScoredPattern, DbErr> {
+    let row = row_to_pattern(r)?;
+    let score = r.try_get::<f64>("", "score")?;
+    let components = match (
+        r.try_get::<Option<f64>>("", "score_avg")?,
+        r.try_get::<Option<f64>>("", "score_gain")?,
+        r.try_get::<Option<f64>>("", "score_counts")?,
+    ) {
+        (Some(avg), Some(gain), Some(counts)) => Some((avg, gain, counts)),
+        _ => None,
+    };
+    Ok(ScoredPattern {
+        row,
+        score,
+        components,
+    })
+}
+
 /// Typed access to the `index_patterns` table.
 #[derive(Clone)]
 pub struct Store {
@@ -185,14 +234,14 @@ impl Store {
         threshold: u32,
         cost_eligibility_us: Option<u64>,
         limit: u64,
-    ) -> Result<Vec<(PatternRow, f64)>, DbErr> {
-        let score = prioritization::score_expr(mode, compensation);
+    ) -> Result<Vec<ScoredPattern>, DbErr> {
+        let select = score_select(mode, compensation);
         let cost_gate = match cost_eligibility_us {
             Some(us) => format!(" AND (total_cost_us::float8 / GREATEST(demand_count, 1)) >= {us}"),
             None => String::new(),
         };
         let sql = format!(
-            "SELECT {PATTERN_COLUMNS}, ({score})::float8 AS score FROM index_patterns \
+            "SELECT {PATTERN_COLUMNS}, {select} FROM index_patterns \
              WHERE status = '{candidate}' AND demand_count >= {threshold}{cost_gate} \
              ORDER BY score DESC LIMIT {limit}",
             candidate = status::CANDIDATE,
@@ -201,9 +250,7 @@ impl Store {
             .db
             .query_all(Statement::from_string(self.db.get_database_backend(), sql))
             .await?;
-        rows.iter()
-            .map(|r| Ok((row_to_pattern(r)?, r.try_get::<f64>("", "score")?)))
-            .collect()
+        rows.iter().map(row_to_scored).collect()
     }
 
     /// Mark a pattern as created and (re)anchor its supply clock to now.
@@ -258,10 +305,10 @@ impl Store {
         &self,
         mode: PriorityMode,
         compensation: f64,
-    ) -> Result<Vec<(PatternRow, f64)>, DbErr> {
-        let score = prioritization::score_expr(mode, compensation);
+    ) -> Result<Vec<ScoredPattern>, DbErr> {
+        let select = score_select(mode, compensation);
         let sql = format!(
-            "SELECT {PATTERN_COLUMNS}, ({score})::float8 AS score FROM index_patterns \
+            "SELECT {PATTERN_COLUMNS}, {select} FROM index_patterns \
              WHERE status = '{}'",
             status::CREATED
         );
@@ -269,9 +316,7 @@ impl Store {
             .db
             .query_all(Statement::from_string(self.db.get_database_backend(), sql))
             .await?;
-        rows.iter()
-            .map(|r| Ok((row_to_pattern(r)?, r.try_get::<f64>("", "score")?)))
-            .collect()
+        rows.iter().map(row_to_scored).collect()
     }
 
     /// Update a pattern's supply columns; bump `last_seen_used` only when the
@@ -342,10 +387,10 @@ impl Store {
         compensation: f64,
         min_idle_secs: i64,
         min_age_secs: i64,
-    ) -> Result<Vec<(PatternRow, f64)>, DbErr> {
-        let score = prioritization::score_expr(mode, compensation);
+    ) -> Result<Vec<ScoredPattern>, DbErr> {
+        let select = score_select(mode, compensation);
         let sql = format!(
-            "SELECT {PATTERN_COLUMNS}, ({score})::float8 AS score FROM index_patterns \
+            "SELECT {PATTERN_COLUMNS}, {select} FROM index_patterns \
              WHERE {gate} \
              ORDER BY score ASC, pattern_id ASC",
             gate = eviction_gate(),
@@ -358,9 +403,7 @@ impl Store {
                 [min_age_secs.into(), min_idle_secs.into()],
             ))
             .await?;
-        rows.iter()
-            .map(|r| Ok((row_to_pattern(r)?, r.try_get::<f64>("", "score")?)))
-            .collect()
+        rows.iter().map(row_to_scored).collect()
     }
 
     /// Score of the eviction candidate at position `offset` in drop-priority

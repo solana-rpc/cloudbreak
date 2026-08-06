@@ -32,7 +32,7 @@
 //! - `GET /debug/discrepancies?max_ratio=0.5&limit=10` (worst starvation only)
 
 use super::{
-    DebugQuery, Dir, bad_request, created_view, db_error, envelope, order_and_limit, score_k,
+    DebugQuery, Dir, bad_request, created_view, db_error, envelope, order_and_limit, score_field,
 };
 use crate::server::{AppState, json};
 use http_body_util::Full;
@@ -68,9 +68,9 @@ pub async fn handle(state: &Arc<AppState>, query: Option<&str>) -> Response<Full
     // ratio bounds.
     let filtered: Vec<_> = rows
         .into_iter()
-        .filter(|(r, _)| r.discrepancy_state.is_some())
-        .filter(|(r, _)| {
-            let ratio = r.discrepancy_ratio.unwrap_or(0.0);
+        .filter(|s| s.row.discrepancy_state.is_some())
+        .filter(|s| {
+            let ratio = s.row.discrepancy_ratio.unwrap_or(0.0);
             q.min_ratio.is_none_or(|min| ratio >= min) && q.max_ratio.is_none_or(|max| ratio <= max)
         })
         .collect();
@@ -78,17 +78,17 @@ pub async fn handle(state: &Arc<AppState>, query: Option<&str>) -> Response<Full
     let dir = q.dir.unwrap_or(Dir::Asc);
     let (total, rows) = order_and_limit(
         filtered,
-        |(r, _)| r.discrepancy_ratio.unwrap_or(0.0),
+        |s| s.row.discrepancy_ratio.unwrap_or(0.0),
         dir,
         q.limit,
     );
     let items: Vec<Value> = rows
         .iter()
-        .map(|(r, score)| {
-            let mut view = created_view(r, &q);
+        .map(|s| {
+            let mut view = created_view(&s.row, &q);
             view.as_object_mut()
                 .expect("created_view built an object")
-                .insert("score".into(), jval!(score_k(*score)));
+                .insert("score".into(), jval!(score_field(s.score, s.components)));
             view
         })
         .collect();

@@ -71,9 +71,10 @@
 
 use super::{
     DebugQuery, Dir, avg_ms, bad_request, bytes_to_mib, compensated_idx_scan, created_view,
-    db_error, envelope, order_and_limit, score_k, with_without_idx_ratio,
+    db_error, envelope, order_and_limit, score_field, with_without_idx_ratio,
 };
-use crate::modules::store::patterns::{PatternRow, explain_state};
+use crate::modules::store::ScoredPattern;
+use crate::modules::store::patterns::explain_state;
 use crate::server::{AppState, json};
 use http_body_util::Full;
 use hyper::body::Bytes;
@@ -81,10 +82,11 @@ use hyper::{Response, StatusCode};
 use serde_json::{Value, json as jval};
 use std::sync::Arc;
 
-/// A created row plus its [`PriorityMode`](cloudbreak_core::PriorityMode) score —
-/// the single shared ranking value (creation builds highest, eviction drops
-/// lowest). Always present now, so `order=score` works for every filter.
-type Row = (PatternRow, f64);
+/// A created row plus its [`PriorityMode`](cloudbreak_core::PriorityMode) score
+/// (and, for `Weighted`, the score's component factors) — the single shared
+/// ranking value (creation builds highest, eviction drops lowest). Always present
+/// now, so `order=score` works for every filter.
+type Row = ScoredPattern;
 
 /// The `?filter=` row-subset selector for `/debug/created`.
 enum CreatedFilter {
@@ -120,7 +122,7 @@ impl CreatedFilter {
             },
             CreatedFilter::All | CreatedFilter::Eviction => return,
         };
-        rows.retain(|(r, _)| keep(r.explain_state.as_deref()));
+        rows.retain(|s| keep(s.row.explain_state.as_deref()));
     }
 }
 
@@ -179,7 +181,7 @@ pub async fn handle(state: &Arc<AppState>, query: Option<&str>) -> Response<Full
     // Optional bounds on the with/without-index latency ratio. A row without both
     // latency buckets has no ratio, so any set bound excludes it.
     if q.min_ratio.is_some() || q.max_ratio.is_some() {
-        rows.retain(|(r, _)| match with_without_idx_ratio(r) {
+        rows.retain(|s| match with_without_idx_ratio(&s.row) {
             Some(ratio) => {
                 q.min_ratio.is_none_or(|min| ratio >= min)
                     && q.max_ratio.is_none_or(|max| ratio <= max)
@@ -193,16 +195,16 @@ pub async fn handle(state: &Arc<AppState>, query: Option<&str>) -> Response<Full
         .as_deref()
         .unwrap_or(if eviction { "score" } else { "created_at" });
     let key: fn(&Row) -> f64 = match order {
-        "created_at" => |x| x.0.created_at_epoch.unwrap_or(0.0),
-        "index_mb" => |x| bytes_to_mib(x.0.index_bytes),
-        "demand_count" => |x| x.0.demand_count as f64,
-        "idx_scan" => |x| compensated_idx_scan(x.0.last_idx_scan) as f64,
+        "created_at" => |x| x.row.created_at_epoch.unwrap_or(0.0),
+        "index_mb" => |x| bytes_to_mib(x.row.index_bytes),
+        "demand_count" => |x| x.row.demand_count as f64,
+        "idx_scan" => |x| compensated_idx_scan(x.row.last_idx_scan) as f64,
         "avg_cost_with_index_ms" => {
-            |x| avg_ms(x.0.cost_with_index_us, x.0.cost_with_index_count).unwrap_or(0.0)
+            |x| avg_ms(x.row.cost_with_index_us, x.row.cost_with_index_count).unwrap_or(0.0)
         }
-        "with_without_idx_ratio" => |x| with_without_idx_ratio(&x.0).unwrap_or(0.0),
-        "variety_estimate" => |x| x.0.variety_estimate as f64,
-        "score" => |x| x.1,
+        "with_without_idx_ratio" => |x| with_without_idx_ratio(&x.row).unwrap_or(0.0),
+        "variety_estimate" => |x| x.row.variety_estimate as f64,
+        "score" => |x| x.score,
         other => {
             return bad_request(format!(
                 "invalid order '{other}' (created: created_at, index_mb, demand_count, idx_scan, \
@@ -221,11 +223,11 @@ pub async fn handle(state: &Arc<AppState>, query: Option<&str>) -> Response<Full
     let (total, rows) = order_and_limit(rows, key, dir, q.limit);
     let items: Vec<Value> = rows
         .iter()
-        .map(|(r, score)| {
-            let mut view = created_view(r, &q);
+        .map(|s| {
+            let mut view = created_view(&s.row, &q);
             view.as_object_mut()
                 .expect("created_view built an object")
-                .insert("score".into(), jval!(score_k(*score)));
+                .insert("score".into(), jval!(score_field(s.score, s.components)));
             view
         })
         .collect();

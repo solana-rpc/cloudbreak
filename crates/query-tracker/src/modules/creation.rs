@@ -201,15 +201,19 @@ pub async fn run(store: Store, config: QueryTrackerConfig) {
 
         // Highest-priority candidate that passes program scoping and parses back
         // to a valid identity, carrying its score for the value guard.
-        let chosen = candidates.into_iter().find_map(|(row, score)| {
-            let identity = match row.identity() {
+        let chosen = candidates.into_iter().find_map(|scored| {
+            let identity = match scored.row.identity() {
                 Ok(i) => i,
                 Err(e) => {
                     error!(target: "query_tracker_creation", "skipping candidate: {e}");
                     return None;
                 }
             };
-            program_allowed(identity.program, &config).then_some((row, identity, score))
+            program_allowed(identity.program, &config).then_some((
+                scored.row,
+                identity,
+                scored.score,
+            ))
         });
 
         let Some((row, identity, score)) = chosen else {

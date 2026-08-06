@@ -48,35 +48,54 @@ pub fn score_expr(mode: PriorityMode, compensation: f64) -> String {
         PriorityMode::Frequency => "demand_count".to_string(),
         PriorityMode::Cost => "total_cost_us".to_string(),
         PriorityMode::CostPerHit => avg_cost_expr(),
-        PriorityMode::Weighted {
-            demand_weight,
-            supply_weight,
-            failure_weight,
-            latency_weight,
-            ..
-        } => {
-            // Per-window quantities, bootstrapped to the running total until the
-            // first roll materializes a real window delta.
-            let demand = "COALESCE(demand_rate, demand_count)";
-            let supply = "COALESCE(supply_rate, last_idx_scan)";
-            let failed = "COALESCE(failed_rate, failed_count)";
-            let spr = SCANS_PER_REQUEST as f64;
-            // `avg_cost` scaled by the latency gain (neutral = 1). The `+ 1`
-            // baseline keeps the volume factor non-zero, so a zero-activity
-            // pattern ranks by `avg_cost * gain` alone (and idle eviction
-            // candidates never all tie at zero).
-            format!(
-                "({avg} * (1 + {lw} * LN({gain}))) * \
-                 (1 + {dw} * {demand} + {sw} * ({supply}::float8 / {spr}) + {fw} * {failed})",
-                avg = avg_cost_expr(),
-                lw = latency_weight,
-                gain = gain_expr(compensation),
-                dw = demand_weight,
-                sw = supply_weight,
-                fw = failure_weight,
-            )
+        PriorityMode::Weighted { .. } => {
+            let (avg, gain, counts) = score_component_exprs(mode, compensation)
+                .expect("Weighted decomposes into its three factors");
+            format!("({avg}) * ({gain}) * ({counts})")
         }
     }
+}
+
+/// The three multiplicative factors of the [`PriorityMode::Weighted`] score, as
+/// SQL expressions: `(avg_cost_us, gain_multiplier, counts_multiplier)`. Their
+/// product is exactly [`score_expr`] for `Weighted`, which is defined in terms of
+/// this function so the two cannot diverge. Returns `None` for the
+/// single-quantity modes (Frequency/Cost/CostPerHit), which do not decompose.
+///
+/// - **avg** — average cost per request in µs ([`avg_cost_expr`]).
+/// - **gain** — `1 + latency_weight · ln(gain_ratio)`, the latency multiplier
+///   (neutral `1` until both with/without-index samples exist; see [`gain_expr`]).
+/// - **counts** — `1 + demand_weight·demand + supply_weight·(supply/2) + failure_weight·failed`,
+///   the windowed-volume multiplier. The `+ 1` baseline keeps it non-zero so a
+///   zero-activity pattern still ranks by `avg · gain` alone (and idle eviction
+///   candidates never all tie at zero).
+pub fn score_component_exprs(
+    mode: PriorityMode,
+    compensation: f64,
+) -> Option<(String, String, String)> {
+    let PriorityMode::Weighted {
+        demand_weight,
+        supply_weight,
+        failure_weight,
+        latency_weight,
+        ..
+    } = mode
+    else {
+        return None;
+    };
+    // Per-window quantities, bootstrapped to the running total until the first
+    // roll materializes a real window delta.
+    let demand = "COALESCE(demand_rate, demand_count)";
+    let supply = "COALESCE(supply_rate, last_idx_scan)";
+    let failed = "COALESCE(failed_rate, failed_count)";
+    let spr = SCANS_PER_REQUEST as f64;
+    let avg = avg_cost_expr();
+    let gain = format!("(1 + {latency_weight} * LN({}))", gain_expr(compensation));
+    let counts = format!(
+        "(1 + {demand_weight} * {demand} + {supply_weight} * ({supply}::float8 / {spr}) \
+         + {failure_weight} * {failed})",
+    );
+    Some((avg, gain, counts))
 }
 
 /// Average cost per request in microseconds; a ratio, so it is identical whether

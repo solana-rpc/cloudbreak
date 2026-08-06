@@ -33,9 +33,10 @@
 //! - `GET /debug/candidates?order=avg_cost_ms&dir=desc&example=true&pattern_id=true`
 
 use super::{
-    DebugQuery, Dir, avg_ms, bad_request, db_error, docs, order_and_limit, score_k,
+    DebugQuery, Dir, avg_ms, bad_request, db_error, docs, order_and_limit, score_field,
     with_without_idx_ratio,
 };
+use crate::modules::store::ScoredPattern;
 use crate::modules::store::patterns::PatternRow;
 use crate::server::{AppState, json};
 use http_body_util::Full;
@@ -71,11 +72,11 @@ pub async fn handle(state: &Arc<AppState>, query: Option<&str>) -> Response<Full
     };
 
     let order = q.order.as_deref().unwrap_or("score");
-    let key: fn(&(PatternRow, f64)) -> f64 = match order {
-        "score" => |x| x.1,
-        "demand_count" => |x| x.0.demand_count as f64,
-        "avg_cost_ms" => |x| avg_ms(x.0.total_cost_us, x.0.demand_count).unwrap_or(0.0),
-        "variety_estimate" => |x| x.0.variety_estimate as f64,
+    let key: fn(&ScoredPattern) -> f64 = match order {
+        "score" => |x| x.score,
+        "demand_count" => |x| x.row.demand_count as f64,
+        "avg_cost_ms" => |x| avg_ms(x.row.total_cost_us, x.row.demand_count).unwrap_or(0.0),
+        "variety_estimate" => |x| x.row.variety_estimate as f64,
         other => {
             return bad_request(format!(
                 "invalid order '{other}' (candidates: score, demand_count, avg_cost_ms, variety_estimate)"
@@ -87,7 +88,7 @@ pub async fn handle(state: &Arc<AppState>, query: Option<&str>) -> Response<Full
     let (total, rows) = order_and_limit(scored, key, dir, q.limit);
     let items: Vec<Value> = rows
         .iter()
-        .map(|(r, score)| candidate_view(r, *score, &q))
+        .map(|s| candidate_view(&s.row, s.score, s.components, &q))
         .collect();
 
     json(
@@ -103,10 +104,15 @@ pub async fn handle(state: &Arc<AppState>, query: Option<&str>) -> Response<Full
     )
 }
 
-fn candidate_view(r: &PatternRow, score: f64, q: &DebugQuery) -> Value {
+fn candidate_view(
+    r: &PatternRow,
+    score: f64,
+    components: Option<(f64, f64, f64)>,
+    q: &DebugQuery,
+) -> Value {
     let mut obj = jval!({
         "index": r.human_name,
-        "score": score_k(score),
+        "score": score_field(score, components),
         "demand_count": r.demand_count,
         "failed_count": r.failed_count,
         "variety_estimate": r.variety_estimate,

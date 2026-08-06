@@ -177,7 +177,8 @@ async fn run_pass(store: &Store, config: &QueryTrackerConfig) -> Result<(), DbEr
 
     // Unconditional trim: drop the least-valuable eligible pairs until back at
     // the target (entry into the buffer was already value-gated at creation).
-    for (row, _evict_score) in &candidates {
+    for scored in &candidates {
+        let row = &scored.row;
         if count <= target {
             break;
         }
@@ -214,7 +215,9 @@ async fn run_pass(store: &Store, config: &QueryTrackerConfig) -> Result<(), DbEr
             Err(e) => {
                 warn!(
                     target: "query_tracker_eviction",
-                    "failed to evict '{}': {e}; will retry next pass", identity.human_name()
+                    "could not evict '{}' — {}",
+                    identity.human_name(),
+                    drop_failure_detail(&e, config.drop_lock_timeout.as_millis())
                 );
             }
         }
@@ -300,8 +303,9 @@ async fn run_regression_guard(store: &Store, config: &QueryTrackerConfig) -> Res
                     }
                     Err(e) => warn!(
                         target: "query_tracker_regression",
-                        "failed to drop regressed index '{}': {e}; will retry next pass",
-                        identity.human_name()
+                        "could not drop regressed index '{}' — {}",
+                        identity.human_name(),
+                        drop_failure_detail(&e, config.drop_lock_timeout.as_millis())
                     ),
                 }
             }
@@ -477,33 +481,50 @@ async fn refresh_aggregate_metrics(store: &Store) {
     }
 }
 
-/// Drop both sides of an index pair, honouring `lock_timeout` and retries.
+/// Failure of a single `DROP INDEX`, carrying enough context for the caller to
+/// emit **one** consolidated log line.
+enum DropError {
+    /// Every attempt hit `lock_timeout`. `attempts` is the total tries made
+    /// (`1 + drop-retries`); the caller reports the configured timeout itself.
+    LockTimeout { index: String, attempts: u32 },
+    /// Any other DB error (or an unsafe identifier) — not retried.
+    Other { index: String, msg: String },
+}
+
+/// Drop both sides of an index pair, honouring `lock_timeout` and retries. On
+/// failure returns the [`DropError`] for the side that failed; logging is left
+/// to the caller so a failed drop is a single line.
 async fn drop_pair(
     store: &Store,
     identity: &IndexIdentity,
     config: &QueryTrackerConfig,
-) -> Result<(), String> {
+) -> Result<(), DropError> {
     for table in INDEX_TABLES {
         drop_one(store, &identity.pg_index_name(table), config).await?;
     }
     Ok(())
 }
 
+/// Attempt `DROP INDEX` with a bounded `lock_timeout`, retrying only on lock
+/// timeout up to `drop-retries`. Silent by design — it classifies the outcome
+/// into [`DropError`] and lets the caller log once.
 async fn drop_one(
     store: &Store,
     index_name: &str,
     config: &QueryTrackerConfig,
-) -> Result<(), String> {
+) -> Result<(), DropError> {
     if !is_safe_index_identifier(index_name) {
-        return Err(format!(
-            "refusing to drop unexpected index name '{index_name}'"
-        ));
+        return Err(DropError::Other {
+            index: index_name.to_string(),
+            msg: "refusing to drop unexpected index name".to_string(),
+        });
     }
     let backend = store.db().get_database_backend();
     let lock_ms = config.drop_lock_timeout.as_millis();
 
-    let mut attempt = 0u32;
+    let mut attempts = 0u32;
     loop {
+        attempts += 1;
         let result: Result<(), DbErr> = async {
             let txn = store.db().begin().await?;
             txn.execute(Statement::from_string(
@@ -526,24 +547,39 @@ async fn drop_one(
                 let msg = e.to_string();
                 let is_lock_timeout = msg.to_lowercase().contains("lock timeout")
                     || msg.to_lowercase().contains("55p03");
-                if is_lock_timeout && attempt < config.drop_retries {
-                    attempt += 1;
-                    warn!(
-                        target: "query_tracker_eviction",
-                        "lock timeout dropping '{index_name}'; retry {attempt}/{}",
-                        config.drop_retries
-                    );
+                // Retry silently while under the retry budget; the final count is
+                // folded into the caller's single line.
+                if is_lock_timeout && attempts <= config.drop_retries {
                     continue;
                 }
-                if is_lock_timeout {
-                    warn!(
-                        target: "query_tracker_eviction",
-                        "gave up dropping '{index_name}' after lock timeout (lock_timeout={lock_ms}ms); \
-                         index left in place for next pass"
-                    );
-                }
-                return Err(msg);
+                return Err(if is_lock_timeout {
+                    DropError::LockTimeout {
+                        index: index_name.to_string(),
+                        attempts,
+                    }
+                } else {
+                    DropError::Other {
+                        index: index_name.to_string(),
+                        msg,
+                    }
+                });
             }
+        }
+    }
+}
+
+/// Tail of the one-line drop-failure log for `e`: which physical index blocked
+/// and why. Shared by the idle-eviction and regression-guard call sites so both
+/// read identically; the verb ("could not evict" / "could not drop regressed
+/// index") and identity are supplied by the caller.
+fn drop_failure_detail(e: &DropError, lock_ms: u128) -> String {
+    match e {
+        DropError::LockTimeout { index, attempts } => format!(
+            "lock timeout dropping index '{index}' after {attempts} attempt(s) \
+             (lock_timeout={lock_ms}ms); left in place, will retry next pass"
+        ),
+        DropError::Other { index, msg } => {
+            format!("dropping index '{index}' failed: {msg}; will retry next pass")
         }
     }
 }
