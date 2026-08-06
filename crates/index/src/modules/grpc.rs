@@ -60,10 +60,16 @@ async fn store_grpc_version(version_json: &str, db: &DatabaseConnection) {
 ///  the `max_grpc_errors` count). It also resets the is_startup flag when the connection is lost.
 ///
 /// Reconnection is governed by a single give-up window: `reconnect_failed_since` records when we
-/// started failing to (re)connect/subscribe and is only cleared once we successfully connect AND
-/// subscribe. Connect/subscribe failures log an error and `continue`; the loop backs off by
-/// `config.grpc.reconnect_backoff` between attempts and panics once the failing window exceeds
-/// `config.grpc.reconnect_give_up`.
+/// started failing and is only cleared once a reconnection is proven *healthy* — i.e. its stream
+/// actually delivers a block. Connect/subscribe failures, and streams that error before delivering
+/// any block (e.g. the server returns "failed to get replay response" for a `from_slot` it no
+/// longer has), all keep the window open: the loop backs off by `config.grpc.reconnect_backoff`
+/// between attempts, drops `from_slot` after `reconnect_from_slot_retain` (resubscribing from the
+/// live tip), and panics once the failing window exceeds `config.grpc.reconnect_give_up`. Clearing
+/// the window only on a delivered block (rather than on subscribe success) is what stops a
+/// subscribe-then-immediately-error stream from hot-looping with no delay. A stream that received
+/// blocks and then ended (error, inactivity timeout, or stream `None`) is treated as a healthy run
+/// and reconnects immediately.
 pub fn subscribe_grpc_with_reconnection(
     config: IndexConfig,
     buffer_channel_tx: Sender<SubscribeUpdate>,
@@ -216,9 +222,6 @@ pub fn subscribe_grpc_with_reconnection(
                 }
             };
 
-            // Connected and subscribed: reset the give-up window.
-            reconnect_failed_since = None;
-
             let buffer_channel_rx_len_clone = buffer_channel_rx_len.clone();
             let mut grpc_current_errors = 0;
 
@@ -232,6 +235,13 @@ pub fn subscribe_grpc_with_reconnection(
                 let mut stream = std::pin::pin!(stream);
 
                 let mut last_block_received_at = Instant::now();
+
+                // Health signals for the outer give-up window: a run only clears the
+                // window if it delivered a block; a stream that *errored* before any
+                // block is a failed attempt (engages backoff). A no-block inactivity
+                // timeout / stream `None` is neither (reconnects immediately, as-is).
+                let mut received_block = false;
+                let mut stream_errored = false;
 
                 let mut buffer_channel_size =
                     buffer_channel_tx_clone.max_capacity() - buffer_channel_tx_clone.capacity();
@@ -255,7 +265,8 @@ pub fn subscribe_grpc_with_reconnection(
                 {
                     if cancel_clone.load(Ordering::SeqCst) {
                         tracing::info!("GRPC subscription cancelled mid-stream");
-                        return;
+                        // Shutting down, not a failed attempt.
+                        return false;
                     }
 
                     metrics::GRPC_TOTAL_UPDATES_RECEIVED.inc();
@@ -281,6 +292,7 @@ pub fn subscribe_grpc_with_reconnection(
                         Ok(update) => {
                             if let Some(UpdateOneof::Block(block)) = &update.update_oneof {
                                 last_block_received_at = Instant::now();
+                                received_block = true;
 
                                 if log_first_message {
                                     tracing::info!(
@@ -297,6 +309,7 @@ pub fn subscribe_grpc_with_reconnection(
                                 .expect("Failed to send update to buffer channel");
                         }
                         Err(e) => {
+                            stream_errored = true;
                             tracing::error!(
                                 "GRPC error: {:?} buffer_channel_size: {} (sender: {}) - grpc_errors_count: {}",
                                 e,
@@ -326,14 +339,28 @@ pub fn subscribe_grpc_with_reconnection(
                         .expect("Failed to lock buffer_channel_rx_len"),
                     buffer_channel_size,
                 );
+
+                // A failed attempt = the stream errored before delivering any block.
+                // A run that saw a block, or ended via inactivity timeout / stream
+                // `None` without erroring, is not penalized (reconnects immediately).
+                stream_errored && !received_block
             });
 
             match handle.await {
-                Ok(_) => {
-                    tracing::debug!("GRPC subscription handle finished");
+                Ok(failed_without_data) => {
+                    if failed_without_data {
+                        // Keep the give-up window open so the next iteration backs off,
+                        // eventually drops `from_slot`, and gives up if it never recovers.
+                        reconnect_failed_since.get_or_insert_with(Instant::now);
+                    } else {
+                        // Healthy run (delivered a block) or a benign timeout/None end:
+                        // clear the window so a transient blip reconnects immediately.
+                        reconnect_failed_since = None;
+                    }
                 }
                 Err(e) => {
                     tracing::error!("GRPC subscription handle panicked: {:?}", e);
+                    reconnect_failed_since.get_or_insert_with(Instant::now);
                 }
             }
 
