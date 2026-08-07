@@ -77,8 +77,8 @@ drop-retries = 1
 
 # --- latency regression guard (index slower than no index) ---
 # Compares per-pattern query latency WITH the index against WITHOUT it. Runs in
-# the eviction pass but ignores the fill threshold — a harmful index is removed
-# even when there is room — so enabling it also starts the eviction task.
+# the eviction pass (requires index-eviction-enabled) but ignores the fill
+# threshold — a harmful index is removed even when there is room.
 #   "off"   (default) ignore regressions
 #   "warn"  log + report count via query_tracker_regressed_indexes, keep the index
 #   "evict" drop the pair and mark the pattern "rejected" (not rebuilt until it

@@ -979,9 +979,9 @@ pub struct QueryTrackerConfig {
     /// pattern was without it. `off` (default) ignores it; `warn` logs and bumps
     /// a metric; `evict` drops the pair and marks the pattern `rejected` so it is
     /// not rebuilt until fresh evidence shows the index would help again. See
-    /// [`IndexRegressionGuard`]. The guard runs inside the eviction pass but is
-    /// independent of the fill threshold — a harmful index is dropped even when
-    /// there is room — so enabling it also starts the eviction task.
+    /// [`IndexRegressionGuard`]. The guard runs inside the eviction pass (so it
+    /// requires `index-eviction-enabled`) but is independent of the fill
+    /// threshold — a harmful index is dropped even when there is room.
     #[serde(rename = "index-regression-guard", default)]
     pub index_regression_guard: IndexRegressionGuard,
     /// How many times slower *with* the index than without before it counts as a
