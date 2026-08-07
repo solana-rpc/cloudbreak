@@ -560,9 +560,10 @@ the previous behavior.
 | `indexer-metrics-threshold`     | `u64`         | `5`          | `cloudbreak_finalize_slot_handler_queue_size` threshold above which DDL is deferred.                                                       |
 | `max-auto-indexes`              | `usize?`      | (none)       | Optional cap on total indexes on the `snapshot_accounts` table.                                                                          |
 | `index-eviction-enabled`        | `bool`        | `false`      | Enable usage-based eviction of idle auto-indexes.                                                                                         |
+| `use-supply-for-eviction`       | `bool`        | `false`      | When `true`, also require supply-idle (`last_seen_used` / no `idx_scan` growth) for eviction eligibility. Off = demand-idle + age-grace only. Enabling is more conservative but the eviction-pass supply refresh can collapse the candidates list for up to `index-min-idle` afterward on high-rotation DBs (mitigate with more frequent eviction passes). |
 | `index-eviction-interval`       | `Duration`    | `"1h"`       | How often the eviction pass runs.                                                                                                        |
 | `index-min-age-grace`           | `Duration`    | `"1h"`       | Minimum age before an index is eligible for eviction.                                                                                    |
-| `index-min-idle`                | `Duration`    | `"24h"`      | An index must see neither demand nor `idx_scan` for this long to be idle.                                                                |
+| `index-min-idle`                | `Duration`    | `"24h"`      | How long a pattern must be idle to be droppable. Demand-idle is always required; supply-idle only when `use-supply-for-eviction` is on. |
 | `eviction-fill-threshold`       | `f64`         | `0.9`        | Fill target as a fraction of `max-auto-indexes`: creation is unguarded below it, value-guarded in the buffer band above it, and eviction trims back down to it (needs `max-auto-indexes`).                                                        |
 | `value-guard-creation-bias`     | `f64`         | `1.0`        | Multiplier on a **creation candidate's** score in the creation-time value guard, tuning stickiness toward existing indexes (which carry `gain`/`idx_scan` signal new candidates lack). `> 1.0` builds new indexes more readily (less sticky), `< 1.0` favors incumbents (stickier), `1.0` compares as-is. Only consulted in the buffer band. |
 | `drop-lock-timeout`             | `Duration`    | `"5s"`       | `lock_timeout` for each `DROP INDEX`; on timeout the drop is skipped and retried next pass.                                              |
@@ -630,7 +631,7 @@ When `index-eviction-enabled` is set, a periodic pass (`index-eviction-interval`
 
 - `track_counts` is on in Postgres — otherwise `idx_scan` is frozen and the whole pass is skipped, so stale stats can never drive a drop;
 - `max-auto-indexes` is set **and** the `snapshot_accounts` table is above the fill target (`eviction-fill-threshold`) — at or below the target nothing is dropped;
-- the pair has seen neither demand nor `idx_scan` growth for `index-min-idle`, and is older than `index-min-age-grace` — requiring *both* demand and scans to be quiet is what stops a still-wanted index from being dropped and avoids the drop→rebuild churn loop;
+- the pair is demand-idle for `index-min-idle` (and supply-idle too when `use-supply-for-eviction` is on) and older than `index-min-age-grace` — demand-idle alone stops a still-wanted index from being dropped and avoids the drop→rebuild churn loop;
 - the indexer is not under backpressure.
 
 When above the fill target (`eviction-fill-threshold`), eligible pairs are dropped in ascending `priority-mode` order (least worth keeping first) just until the table is back at the target. The trim is **unconditional** — the value trade-off already happened at creation (below), so eviction simply reclaims the buffer.

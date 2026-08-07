@@ -38,15 +38,22 @@ const PATTERN_COLUMNS: &str = "pattern_id, program, human_name, offsets_lengths,
      explain_state, EXTRACT(EPOCH FROM created_at)::float8 AS created_at_epoch";
 
 /// Shared `WHERE` fragment defining an **eviction-eligible** created index:
-/// past `index-min-age-grace` (`$1`) and idle by **both** supply and demand for
-/// `index-min-idle` (`$2`). Used by both [`Store::eviction_candidates`] and
-/// [`Store::eviction_boundary_score`] so the eviction trim and the creation-time
-/// value guard share one definition of "droppable" and can never drift apart.
-fn eviction_gate() -> String {
+/// past `index-min-age-grace` (`$1`) and demand-idle for `index-min-idle` (`$2`).
+/// When `use_supply` is set, also requires supply-idle (`last_seen_used`) for the
+/// same window — see `use-supply-for-eviction`. Used by both
+/// [`Store::eviction_candidates`] and [`Store::eviction_boundary_score`] so the
+/// eviction trim and the creation-time value guard share one definition of
+/// "droppable" and can never drift apart.
+fn eviction_gate(use_supply: bool) -> String {
+    let supply_idle = if use_supply {
+        "AND EXTRACT(EPOCH FROM (now() - COALESCE(last_seen_used, created_at, first_seen_at))) > $2 "
+    } else {
+        ""
+    };
     format!(
         "status = '{created}' \
          AND EXTRACT(EPOCH FROM (now() - COALESCE(created_at, first_seen_at))) > $1 \
-         AND EXTRACT(EPOCH FROM (now() - COALESCE(last_seen_used, created_at, first_seen_at))) > $2 \
+         {supply_idle}\
          AND EXTRACT(EPOCH FROM (now() - COALESCE(last_demand_at, first_seen_at))) > $2",
         created = status::CREATED,
     )
@@ -367,10 +374,12 @@ impl Store {
         Ok(res.rows_affected())
     }
 
-    /// Created patterns idle by **both** supply and demand for longer than
-    /// `min_idle_secs`, and older than `min_age_secs`. Requiring *both* signals
-    /// to be quiet is what avoids the drop→slow→rebuild churn loop: a pattern
-    /// Postgres is ignoring but the API is still demanding is not idle.
+    /// Created patterns idle for longer than `min_idle_secs` and older than
+    /// `min_age_secs`. Demand-idle is always required; supply-idle
+    /// (`last_seen_used`) is required only when `use_supply` is set (see
+    /// `use-supply-for-eviction`). Demand-idle alone already avoids the
+    /// drop→slow→rebuild churn loop: a pattern the API is still demanding is
+    /// never idle.
     ///
     /// Rows come back in **drop-priority order — least useful first** — each
     /// paired with its numeric score: the same [`prioritization::score_expr`]
@@ -388,13 +397,14 @@ impl Store {
         compensation: f64,
         min_idle_secs: i64,
         min_age_secs: i64,
+        use_supply: bool,
     ) -> Result<Vec<ScoredPattern>, DbErr> {
         let select = score_select(mode, compensation);
         let sql = format!(
             "SELECT {PATTERN_COLUMNS}, {select} FROM index_patterns \
              WHERE {gate} \
              ORDER BY score ASC, pattern_id ASC",
-            gate = eviction_gate(),
+            gate = eviction_gate(use_supply),
         );
         let rows = self
             .db
@@ -425,6 +435,7 @@ impl Store {
         min_idle_secs: i64,
         min_age_secs: i64,
         offset: i64,
+        use_supply: bool,
     ) -> Result<Option<f64>, DbErr> {
         let score = prioritization::score_expr(mode, compensation);
         let sql = format!(
@@ -432,7 +443,7 @@ impl Store {
              WHERE {gate} \
              ORDER BY score ASC, pattern_id ASC \
              OFFSET $3 LIMIT 1",
-            gate = eviction_gate(),
+            gate = eviction_gate(use_supply),
         );
         self.db
             .query_one(Statement::from_sql_and_values(

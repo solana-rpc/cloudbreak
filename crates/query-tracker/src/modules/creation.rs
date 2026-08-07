@@ -293,6 +293,7 @@ async fn value_guard_allows(
             config.index_min_idle.as_secs() as i64,
             config.index_min_age_grace.as_secs() as i64,
             over,
+            config.use_supply_for_eviction,
         )
         .await
     {

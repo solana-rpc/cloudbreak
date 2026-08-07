@@ -22,17 +22,20 @@
 //!    demand-vs-supply verdict for observability only, and emits **one summary
 //!    line per pass** (counts plus the worst offenders) rather than a warning per
 //!    index. It does not gate drops: a starved-but-demanded index is safe simply
-//!    because step 3 requires *both* demand and scans to be idle, so a
-//!    still-demanded index is never a drop candidate.
+//!    because step 3 requires demand-idle (and optionally supply-idle when
+//!    `use-supply-for-eviction` is on), so a still-demanded index is never a drop
+//!    candidate.
 //! 3. **Drops (unconditional trim to target)** — when the capped table is above
 //!    the fill target (`floor(eviction-fill-threshold × max-auto-indexes)`), the
-//!    idlest eligible pairs (no demand *and* no scans for `index-min-idle`, older
-//!    than `index-min-age-grace`) are dropped in ascending-score order until the
+//!    idlest eligible pairs (no demand for `index-min-idle`, and — when
+//!    `use-supply-for-eviction` — no scans either; older than
+//!    `index-min-age-grace`) are dropped in ascending-score order until the
 //!    table is back at the target. At or below the target nothing is dropped.
 //!
-//! Only eligible pairs are ever dropped — idle by **both** signals and past the
-//! age grace — so a still-demanded or freshly built index is never trimmed; if
-//! too few are eligible, the table simply stays above target until more go idle.
+//! Only eligible pairs are ever dropped — demand-idle (optionally also
+//! supply-idle) and past the age grace — so a still-demanded or freshly built
+//! index is never trimmed; if too few are eligible, the table simply stays above
+//! target until more go idle.
 //! The trim inherits the priority mode's notion of "value": lifetime-total modes
 //! weigh an idle index by its *all-time* worth, while
 //! [`Weighted`](cloudbreak_core::PriorityMode::Weighted) weighs **recent
@@ -159,13 +162,15 @@ async fn run_pass(store: &Store, config: &QueryTrackerConfig) -> Result<(), DbEr
 
     let min_idle = config.index_min_idle.as_secs() as i64;
     let min_age = config.index_min_age_grace.as_secs() as i64;
-    // Eligible drops, least-useful first (idle by both signals, past age grace).
+    // Eligible drops, least-useful first (idle + past age grace; supply-idle
+    // only when `use-supply-for-eviction` is on).
     let candidates = store
         .eviction_candidates(
             config.priority_mode,
             config.without_index_compensation_factor,
             min_idle,
             min_age,
+            config.use_supply_for_eviction,
         )
         .await?;
     if candidates.is_empty() {

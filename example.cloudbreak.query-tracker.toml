@@ -58,6 +58,12 @@ index-eviction-enabled = false
 # healthy after. Only enable where this service is the authority for node health
 # (it writes the same row the indexer uses and can otherwise clobber it).
 mark-unhealthy-for-eviction = false
+# When true, also require supply-idle (last_seen_used / idx_scan unchanged) for
+# eviction eligibility. Off by default: demand-idle + age-grace only. Enabling
+# is more conservative, but the eviction-pass supply refresh can collapse the
+# candidates list for up to index-min-idle afterward on high-rotation DBs —
+# mitigate by running eviction more frequently if you turn this on.
+use-supply-for-eviction = false
 index-eviction-interval = "1h"
 index-min-age-grace = "1h"
 index-min-idle = "24h"

@@ -63,10 +63,10 @@
 //!      fill line nothing is dropped. Once the count reaches `max-auto-indexes`,
 //!      index creation is paused until eviction makes room again; all index
 //!      candidates are kept queued in `index_patterns` with no loss of data;
-//!    - the pair is idle by **both** signals — no `idx_scan` growth *and* no new
-//!      demand for `index-min-idle` — and older than `index-min-age-grace`
-//!      (requiring both is what stops a starved-but-demanded index from being
-//!      dropped, and avoids the drop→slow→rebuild churn loop);
+//!    - the pair is demand-idle for `index-min-idle` (and supply-idle too when
+//!      `use-supply-for-eviction` is on) and older than `index-min-age-grace`
+//!      (demand-idle alone stops a still-demanded index from being dropped and
+//!      avoids the drop→slow→rebuild churn loop);
 //!    - the indexer is not under backpressure ([`modules::indexer_backpressure`]).
 //!
 //!    When above the fill target (`eviction-fill-threshold`), the least-valuable

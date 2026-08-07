@@ -156,6 +156,7 @@ pub async fn handle(state: &Arc<AppState>, query: Option<&str>) -> Response<Full
                 cfg.without_index_compensation_factor,
                 cfg.index_min_idle.as_secs() as i64,
                 cfg.index_min_age_grace.as_secs() as i64,
+                cfg.use_supply_for_eviction,
             )
             .await
         {

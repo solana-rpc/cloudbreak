@@ -909,6 +909,29 @@ pub struct QueryTrackerConfig {
         default = "QueryTrackerConfig::default_mark_unhealthy_for_eviction"
     )]
     pub mark_unhealthy_for_eviction: bool,
+    /// When `true`, an index must also be idle by **supply** (`last_seen_used` /
+    /// `idx_scan` unchanged for `index-min-idle`) to be eviction-eligible, in
+    /// addition to demand-idle. Off by default: eligibility is demand-idle +
+    /// age-grace only.
+    ///
+    /// The supply signal is useful when you want a more conservative drop set
+    /// (indexes Postgres is still scanning stay protected even with no tracked
+    /// API demand). The cost is that the eviction-pass supply refresh bumps
+    /// `last_seen_used` for every index whose `idx_scan` moved since the last
+    /// pass, which can collapse the eviction-candidates list for up to
+    /// `index-min-idle` afterward — painful on high-rotation pattern DBs, where
+    /// the creation-time value guard may then see an empty eligible set and
+    /// treat `None` as "build anyway." Turn this on only if you want that extra
+    /// conservatism; the collapse can also be mitigated by running eviction
+    /// passes more frequently (so each refresh covers a shorter window).
+    ///
+    /// Applies to the shared eligibility gate used by the idle trim, the
+    /// creation-time value guard, and `/debug/created?filter=eviction_candidates`.
+    #[serde(
+        rename = "use-supply-for-eviction",
+        default = "QueryTrackerConfig::default_use_supply_for_eviction"
+    )]
+    pub use_supply_for_eviction: bool,
     /// How often the eviction pass runs. Keep comfortably larger than the
     /// creation rate to avoid drop/rebuild churn. Default: 1h.
     #[serde(
@@ -925,8 +948,9 @@ pub struct QueryTrackerConfig {
         deserialize_with = "deserialize_duration_required"
     )]
     pub index_min_age_grace: Duration,
-    /// How long a pattern must see neither DB usage nor API demand before it is
-    /// considered idle and droppable. Default: 24h.
+    /// How long a pattern must be idle before it is droppable. Demand-idle
+    /// (`last_demand_at`) is always required; supply-idle (`last_seen_used`) is
+    /// required only when [`Self::use_supply_for_eviction`] is on. Default: 24h.
     #[serde(
         rename = "index-min-idle",
         default = "QueryTrackerConfig::default_index_min_idle",
@@ -1083,6 +1107,10 @@ impl QueryTrackerConfig {
         false
     }
 
+    const fn default_use_supply_for_eviction() -> bool {
+        false
+    }
+
     fn default_index_min_idle() -> Duration {
         Duration::from_secs(3600 * 24)
     }
@@ -1180,6 +1208,7 @@ impl Default for QueryTrackerConfig {
             max_auto_indexes: None,
             index_eviction_enabled: Self::default_index_eviction_enabled(),
             mark_unhealthy_for_eviction: Self::default_mark_unhealthy_for_eviction(),
+            use_supply_for_eviction: Self::default_use_supply_for_eviction(),
             index_eviction_interval: Self::default_index_eviction_interval(),
             index_min_age_grace: Self::default_index_min_age_grace(),
             index_min_idle: Self::default_index_min_idle(),
@@ -1461,6 +1490,10 @@ mod tests {
         assert!(
             !c.mark_unhealthy_for_eviction,
             "mark-unhealthy-for-eviction must be off by default"
+        );
+        assert!(
+            !c.use_supply_for_eviction,
+            "use-supply-for-eviction must be off by default"
         );
         assert_eq!(c.index_min_idle, Duration::from_secs(86400));
         assert_eq!(c.index_min_age_grace, Duration::from_secs(3600));
