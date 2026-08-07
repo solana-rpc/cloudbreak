@@ -260,7 +260,8 @@ impl Store {
                 self.db.get_database_backend(),
                 "UPDATE index_patterns SET status = 'created', created_at = now(), \
                    last_seen_used = now(), last_idx_scan = 0, last_create_error = NULL, \
-                   evicted_at = NULL, demand_at_create = demand_count \
+                   evicted_at = NULL, demand_at_create = demand_count, \
+                   idx_scan_prev = 0, supply_rate = NULL \
                  WHERE pattern_id = $1",
                 [pattern_id.into()],
             ))
