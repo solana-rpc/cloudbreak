@@ -14,6 +14,7 @@ use sea_orm::{
 };
 use solana_pubkey::Pubkey;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::time::Duration;
 use tokio::{
     task::{JoinHandle, JoinSet},
@@ -105,19 +106,20 @@ pub async fn save_block(
             } else {
                 None
             };
-            let pending = largest_pending
-                .entry(pubkey)
-                .or_insert_with(|| PendingLargestAccount {
-                    write_version: account.write_version,
-                    lamports: account.lamports,
-                    token,
-                });
-            if account.write_version > pending.write_version {
-                *pending = PendingLargestAccount {
-                    write_version: account.write_version,
-                    lamports: account.lamports,
-                    token,
-                };
+            let update = PendingLargestAccount {
+                write_version: account.write_version,
+                lamports: account.lamports,
+                token,
+            };
+            match largest_pending.entry(pubkey) {
+                Entry::Vacant(entry) => {
+                    entry.insert(update);
+                }
+                Entry::Occupied(mut entry) => {
+                    if update.write_version > entry.get().write_version {
+                        entry.insert(update);
+                    }
+                }
             }
         }
         // If the account is being closed we still add it to the hashmap for cleanup
@@ -305,15 +307,16 @@ async fn commit_largest_accounts(
     let query_timeout = Duration::from_secs(config.database.save_block_queries_timeout);
     let outcome = largest_accounts.apply_block(slot, largest_pending);
 
+    for mint in &outcome.newly_stale {
+        tracing::error!(
+            target: "largest_accounts",
+            "largest accounts reservoir unsound for mint {} at slot {}, marking stale",
+            mint,
+            slot
+        );
+    }
+
     for mint in outcome.newly_stale.iter().chain(outcome.cleared.iter()) {
-        if outcome.newly_stale.contains(mint) {
-            tracing::error!(
-                target: "largest_accounts",
-                "largest accounts reservoir unsound for mint {} at slot {}, marking stale",
-                mint,
-                slot
-            );
-        }
         let delete = timeout(query_timeout, largest_accounts::delete_mint_rows(db, mint)).await;
         if !matches!(delete, Ok(Ok(()))) {
             metrics::LARGEST_ACCOUNTS_DB_ERRORS.inc();
@@ -326,26 +329,26 @@ async fn commit_largest_accounts(
         }
     }
 
-    if !outcome.snapshots.is_empty() {
+    if !outcome.generations.is_empty() {
         let persist = timeout(
             query_timeout,
-            largest_accounts::persist_snapshots(db, &outcome.snapshots),
+            largest_accounts::persist_generations(db, &outcome.generations),
         )
         .await;
         if !matches!(persist, Ok(Ok(()))) {
             metrics::LARGEST_ACCOUNTS_DB_ERRORS.inc();
             tracing::error!(
                 target: "largest_accounts",
-                "failed to persist largest_accounts snapshots for slot {}, marking {} mint(s) stale: {:?}",
+                "failed to persist largest_accounts generations for slot {}, marking {} mint(s) stale: {:?}",
                 slot,
-                outcome.snapshots.len(),
+                outcome.generations.len(),
                 persist
             );
-            for snapshot in &outcome.snapshots {
-                largest_accounts.mark_mint_stale(&snapshot.mint);
+            for generation in &outcome.generations {
+                largest_accounts.mark_mint_stale(&generation.mint);
                 let delete = timeout(
                     query_timeout,
-                    largest_accounts::delete_mint_rows(db, &snapshot.mint),
+                    largest_accounts::delete_mint_rows(db, &generation.mint),
                 )
                 .await;
                 if !matches!(delete, Ok(Ok(()))) {

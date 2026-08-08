@@ -19,7 +19,7 @@ pub struct PendingLargestAccount {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MintSnapshot {
+pub struct MintGeneration {
     pub mint: Pubkey,
     pub slot: u64,
     pub rows: Vec<(Pubkey, u64)>,
@@ -27,7 +27,7 @@ pub struct MintSnapshot {
 
 #[derive(Debug, Default)]
 pub struct BlockOutcome {
-    pub snapshots: Vec<MintSnapshot>,
+    pub generations: Vec<MintGeneration>,
     pub newly_stale: Vec<Pubkey>,
     pub cleared: Vec<Pubkey>,
 }
@@ -44,7 +44,7 @@ struct MintTop {
     entries: HashMap<Pubkey, Entry>,
     dropped_floor: u64,
     stale: bool,
-    last_snapshot: Vec<(Pubkey, u64)>,
+    last_generation: Vec<(Pubkey, u64)>,
 }
 
 enum ComputedTop {
@@ -161,21 +161,6 @@ impl TrackerState {
             }
             return;
         }
-        if bootstrapping {
-            top.entries.insert(
-                pubkey,
-                Entry {
-                    amount,
-                    slot,
-                    write_version,
-                },
-            );
-            if mint != SOL_SENTINEL_MINT {
-                self.member_index.insert(pubkey, mint);
-            }
-            touched.insert(mint);
-            return;
-        }
         if old_block {
             if amount > top.dropped_floor {
                 top.dropped_floor = amount;
@@ -183,7 +168,7 @@ impl TrackerState {
             }
             return;
         }
-        if top.entries.len() >= k {
+        if !bootstrapping && top.entries.len() >= k {
             let (min_pubkey, min_amount) = top.min_entry().expect("non-empty full map");
             if amount <= min_amount {
                 if amount > top.dropped_floor {
@@ -248,22 +233,22 @@ impl TrackerState {
             ComputedTop::Unsound => {
                 if !top.stale {
                     top.stale = true;
-                    top.last_snapshot = Vec::new();
+                    top.last_generation = Vec::new();
                     outcome.newly_stale.push(mint);
                 }
             }
             ComputedTop::Sound(rows) if rows.is_empty() => {
                 top.stale = false;
-                if !top.last_snapshot.is_empty() {
-                    top.last_snapshot = Vec::new();
+                if !top.last_generation.is_empty() {
+                    top.last_generation = Vec::new();
                     outcome.cleared.push(mint);
                 }
             }
             ComputedTop::Sound(rows) => {
                 top.stale = false;
-                if rows != top.last_snapshot {
-                    top.last_snapshot = rows.clone();
-                    outcome.snapshots.push(MintSnapshot { mint, slot, rows });
+                if rows != top.last_generation {
+                    top.last_generation = rows.clone();
+                    outcome.generations.push(MintGeneration { mint, slot, rows });
                 }
             }
         }
@@ -307,13 +292,13 @@ impl LargestAccountsSeed {
     }
 }
 
-struct Inner {
+struct Shared {
     tracked_mints: HashSet<Pubkey>,
     k_per_mint: usize,
     state: Mutex<TrackerState>,
 }
 
-impl Inner {
+impl Shared {
     fn state(&self) -> MutexGuard<'_, TrackerState> {
         self.state
             .lock()
@@ -322,7 +307,7 @@ impl Inner {
 }
 
 #[derive(Clone, Default)]
-pub struct LargestAccountsTracker(Option<Arc<Inner>>);
+pub struct LargestAccountsTracker(Option<Arc<Shared>>);
 
 impl LargestAccountsTracker {
     pub fn new(tracked_mints: HashSet<Pubkey>, k_per_mint: usize) -> Self {
@@ -331,7 +316,7 @@ impl LargestAccountsTracker {
             .map(|mint| (*mint, MintTop::default()))
             .collect();
         mints.insert(SOL_SENTINEL_MINT, MintTop::default());
-        Self(Some(Arc::new(Inner {
+        Self(Some(Arc::new(Shared {
             tracked_mints,
             k_per_mint,
             state: Mutex::new(TrackerState {
@@ -346,27 +331,27 @@ impl LargestAccountsTracker {
     }
 
     pub fn is_tracked(&self, mint_bytes: &[u8]) -> bool {
-        let Some(inner) = &self.0 else {
+        let Some(shared) = &self.0 else {
             return false;
         };
         Pubkey::try_from(mint_bytes)
-            .is_ok_and(|mint| inner.tracked_mints.contains(&mint))
+            .is_ok_and(|mint| shared.tracked_mints.contains(&mint))
     }
 
     pub fn new_seed(&self) -> Option<LargestAccountsSeed> {
-        let inner = self.0.as_deref()?;
+        let shared = self.0.as_deref()?;
         Some(LargestAccountsSeed {
-            k: inner.k_per_mint,
+            k: shared.k_per_mint,
             mints: HashMap::new(),
             closes: Vec::new(),
         })
     }
 
     pub fn merge_seed(&self, seed: LargestAccountsSeed) {
-        let Some(inner) = &self.0 else {
+        let Some(shared) = &self.0 else {
             return;
         };
-        let mut state = inner.state();
+        let mut state = shared.state();
         if state.status != Status::Bootstrapping {
             return;
         }
@@ -380,13 +365,13 @@ impl LargestAccountsTracker {
             state.remove_member(SOL_SENTINEL_MINT, pubkey, slot, write_version, &mut touched);
         }
         for (mint, mut entries) in seed.mints {
-            LargestAccountsSeed::shrink(&mut entries, inner.k_per_mint);
+            LargestAccountsSeed::shrink(&mut entries, shared.k_per_mint);
             for account in &entries {
                 state.max_applied_slot = state.max_applied_slot.max(account.slot);
             }
             let reservoir = state.seed_reservoir.entry(mint).or_default();
             reservoir.extend(entries);
-            LargestAccountsSeed::shrink(reservoir, inner.k_per_mint);
+            LargestAccountsSeed::shrink(reservoir, shared.k_per_mint);
         }
     }
 
@@ -395,10 +380,10 @@ impl LargestAccountsTracker {
         slot: u64,
         pending: HashMap<Pubkey, PendingLargestAccount>,
     ) -> BlockOutcome {
-        let Some(inner) = &self.0 else {
+        let Some(shared) = &self.0 else {
             return BlockOutcome::default();
         };
-        let mut state = inner.state();
+        let mut state = shared.state();
         let bootstrapping = state.status == Status::Bootstrapping;
         let old_block = !bootstrapping && slot <= state.max_applied_slot;
         state.max_applied_slot = state.max_applied_slot.max(slot);
@@ -432,7 +417,7 @@ impl LargestAccountsTracker {
                     update.write_version,
                     bootstrapping,
                     old_block,
-                    inner.k_per_mint,
+                    shared.k_per_mint,
                     &mut touched,
                 );
             }
@@ -444,7 +429,7 @@ impl LargestAccountsTracker {
                 update.write_version,
                 bootstrapping,
                 old_block,
-                inner.k_per_mint,
+                shared.k_per_mint,
                 &mut touched,
             );
         }
@@ -460,10 +445,10 @@ impl LargestAccountsTracker {
     }
 
     pub fn finish_bootstrap(&self) -> BlockOutcome {
-        let Some(inner) = &self.0 else {
+        let Some(shared) = &self.0 else {
             return BlockOutcome::default();
         };
-        let mut state = inner.state();
+        let mut state = shared.state();
         if state.status != Status::Bootstrapping {
             return BlockOutcome::default();
         }
@@ -479,7 +464,7 @@ impl LargestAccountsTracker {
                     account.write_version,
                     true,
                     false,
-                    inner.k_per_mint,
+                    shared.k_per_mint,
                     &mut touched,
                 );
             }
@@ -490,17 +475,17 @@ impl LargestAccountsTracker {
         let effective_slot = state.max_applied_slot;
         let mut outcome = BlockOutcome::default();
         for mint in mints {
-            state.trim(mint, inner.k_per_mint);
+            state.trim(mint, shared.k_per_mint);
             state.emit(mint, effective_slot, &mut outcome);
         }
         outcome
     }
 
     pub fn mark_mint_stale(&self, mint: &Pubkey) -> bool {
-        let Some(inner) = &self.0 else {
+        let Some(shared) = &self.0 else {
             return false;
         };
-        let mut state = inner.state();
+        let mut state = shared.state();
         let Some(top) = state.mints.get_mut(mint) else {
             return false;
         };
@@ -508,15 +493,15 @@ impl LargestAccountsTracker {
             return false;
         }
         top.stale = true;
-        top.last_snapshot = Vec::new();
+        top.last_generation = Vec::new();
         true
     }
 
     pub fn stale_count(&self) -> usize {
-        let Some(inner) = &self.0 else {
+        let Some(shared) = &self.0 else {
             return 0;
         };
-        inner
+        shared
             .state()
             .mints
             .values()
@@ -525,35 +510,35 @@ impl LargestAccountsTracker {
     }
 }
 
-pub async fn persist_snapshots(
+pub async fn persist_generations(
     db: &DatabaseConnection,
-    snapshots: &[MintSnapshot],
+    generations: &[MintGeneration],
 ) -> Result<(), DbErr> {
-    if snapshots.is_empty() {
+    if generations.is_empty() {
         return Ok(());
     }
     let txn = db.begin().await?;
-    for snapshot in snapshots {
-        let mint_hex = hex::encode(snapshot.mint.as_ref());
+    for generation in generations {
+        let mint_hex = hex::encode(generation.mint.as_ref());
         txn.execute(Statement::from_string(
             DatabaseBackend::Postgres,
             format!(
                 "DELETE FROM largest_accounts WHERE mint = '\\x{mint_hex}'::bytea AND slot = {}",
-                snapshot.slot
+                generation.slot
             ),
         ))
         .await?;
-        if snapshot.rows.is_empty() {
+        if generation.rows.is_empty() {
             continue;
         }
-        let values = snapshot
+        let values = generation
             .rows
             .iter()
             .map(|(pubkey, amount)| {
                 format!(
                     "('\\x{mint_hex}'::bytea, '\\x{}'::bytea, {amount}, {})",
                     hex::encode(pubkey.as_ref()),
-                    snapshot.slot
+                    generation.slot
                 )
             })
             .collect::<Vec<_>>()
@@ -622,10 +607,10 @@ mod tests {
 
     fn token_rows(outcome: &BlockOutcome) -> Option<&Vec<(Pubkey, u64)>> {
         outcome
-            .snapshots
+            .generations
             .iter()
-            .find(|snapshot| snapshot.mint == pk(200))
-            .map(|snapshot| &snapshot.rows)
+            .find(|generation| generation.mint == pk(200))
+            .map(|generation| &generation.rows)
     }
 
     #[test]
@@ -634,7 +619,7 @@ mod tests {
         go_live(&tracker);
         tracker.apply_block(100, [(pk(1), pending_token(500, 5))].into());
         let outcome = tracker.apply_block(90, [(pk(1), pending_token(900, 9))].into());
-        assert!(outcome.snapshots.is_empty());
+        assert!(outcome.generations.is_empty());
         let outcome = tracker.apply_block(101, [(pk(2), pending_token(1, 1))].into());
         let rows = token_rows(&outcome).unwrap();
         assert_eq!(rows[0], (pk(1), 500));
@@ -702,7 +687,7 @@ mod tests {
         let outcome = tracker.apply_block(101, closes);
         assert!(outcome.newly_stale.contains(&pk(200)));
         let outcome = tracker.apply_block(102, [(pk(1), pending_token(9999, 200))].into());
-        assert!(outcome.snapshots.iter().all(|s| s.mint != pk(200)));
+        assert!(outcome.generations.iter().all(|s| s.mint != pk(200)));
     }
 
     #[test]
@@ -768,7 +753,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_only_emitted_on_change() {
+    fn generation_only_emitted_on_change() {
         let tracker = tracker(25);
         go_live(&tracker);
         tracker.apply_block(100, [(pk(1), pending_token(10, 1))].into());
@@ -789,9 +774,9 @@ mod tests {
             .into(),
         );
         let sol = outcome
-            .snapshots
+            .generations
             .iter()
-            .find(|snapshot| snapshot.mint == SOL_SENTINEL_MINT)
+            .find(|generation| generation.mint == SOL_SENTINEL_MINT)
             .unwrap();
         assert_eq!(sol.rows[0], (pk(2), 900));
         assert_eq!(sol.slot, 100);

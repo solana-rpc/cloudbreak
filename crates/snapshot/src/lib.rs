@@ -144,27 +144,27 @@ async fn finish_largest_accounts_bootstrap(
         );
     }
 
-    if outcome.snapshots.is_empty() {
+    if outcome.generations.is_empty() {
         return;
     }
 
-    match largest_accounts::persist_snapshots(database, &outcome.snapshots).await {
+    match largest_accounts::persist_generations(database, &outcome.generations).await {
         Ok(()) => {
             tracing::info!(
                 target: "largest_accounts",
-                "largest accounts bootstrap persisted {} mint snapshot(s)",
-                outcome.snapshots.len()
+                "largest accounts bootstrap persisted {} mint generation(s)",
+                outcome.generations.len()
             );
         }
         Err(e) => {
             tracing::error!(
                 target: "largest_accounts",
-                "failed to persist largest accounts bootstrap snapshots, marking {} mint(s) stale: {:?}",
-                outcome.snapshots.len(),
+                "failed to persist largest accounts bootstrap generations, marking {} mint(s) stale: {:?}",
+                outcome.generations.len(),
                 e
             );
-            for snapshot in &outcome.snapshots {
-                largest_accounts.mark_mint_stale(&snapshot.mint);
+            for generation in &outcome.generations {
+                largest_accounts.mark_mint_stale(&generation.mint);
             }
         }
     }
