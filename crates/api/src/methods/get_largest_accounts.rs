@@ -1,4 +1,4 @@
-use cloudbreak_core::modules::largest_accounts::SOL_SENTINEL_MINT;
+use cloudbreak_core::modules::largest_accounts::{decode_record, SOL_SENTINEL_MINT};
 use sea_orm::sqlx::{self, Row};
 use solana_commitment_config::CommitmentLevel;
 use solana_pubkey::Pubkey;
@@ -14,12 +14,12 @@ use crate::http::CloudbreakRpcState;
 use crate::methods::resolve_commitment;
 use crate::{db_query, metrics};
 
-pub async fn fetch_largest_generation(
+pub async fn fetch_largest_record(
     state: &CloudbreakRpcState,
     mint: &Pubkey,
     latest_slot: u64,
 ) -> Result<Vec<(Pubkey, u64)>, RpcError> {
-    let sql_template = include_str!("../db/getLargestAccountsGeneration.sql");
+    let sql_template = include_str!("../db/getLargestAccountsRecord.sql");
     let mint_hex = format!("'\\x{}'::bytea", hex::encode(mint.as_ref()));
     let sql = sql_template.replace("$1", &mint_hex);
     let sql = sql.replace("$2", &latest_slot.to_string());
@@ -27,12 +27,12 @@ pub async fn fetch_largest_generation(
 
     let pool = state.database.get_postgres_connection_pool();
     let rows = timeout(state.queries_timeout, async {
-        let span = tracing::info_span!("get_largest_accounts_generation_db");
+        let span = tracing::info_span!("get_largest_accounts_record_db");
         sqlx::raw_sql(&sql).fetch_all(pool).instrument(span).await
     })
     .await
     .map_err(|_elapsed| {
-        tracing::error!("largest accounts generation query timed out");
+        tracing::error!("largest accounts record query timed out");
         RpcError::InternalError
     })?
     .map_err(|e| {
@@ -40,17 +40,11 @@ pub async fn fetch_largest_generation(
         RpcError::InternalError
     })?;
 
-    let mut result = Vec::with_capacity(rows.len());
-    for row in &rows {
-        let pubkey_bytes: Vec<u8> = row.get("pubkey");
-        let pubkey =
-            Pubkey::try_from(pubkey_bytes.as_slice()).map_err(|_| RpcError::InternalError)?;
-        let amount: String = row.get("amount");
-        let amount: u64 = amount.parse().map_err(|_| RpcError::InternalError)?;
-        result.push((pubkey, amount));
-    }
-
-    Ok(result)
+    let Some(row) = rows.first() else {
+        return Ok(Vec::new());
+    };
+    let record_bytes: Vec<u8> = row.get("record");
+    decode_record(&record_bytes).ok_or(RpcError::InternalError)
 }
 
 #[tracing::instrument(name = "get_largest_accounts_rpc", skip_all)]
@@ -83,9 +77,9 @@ pub async fn get_largest_accounts(
 
     let (latest_slot, _block_time) = state.latest_slot_and_block_time(commitment).await?;
 
-    let rows = fetch_largest_generation(state, &SOL_SENTINEL_MINT, latest_slot).await?;
+    let rows = fetch_largest_record(state, &SOL_SENTINEL_MINT, latest_slot).await?;
     if rows.is_empty() {
-        tracing::error!("getLargestAccounts has no generation at slot {}", latest_slot);
+        tracing::error!("getLargestAccounts has no record at slot {}", latest_slot);
         return Err(RpcError::InternalError);
     }
 

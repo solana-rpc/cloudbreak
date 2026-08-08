@@ -16,7 +16,7 @@ use tracing::Instrument;
 
 use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
-use crate::methods::get_largest_accounts::fetch_largest_generation;
+use crate::methods::get_largest_accounts::fetch_largest_record;
 use crate::methods::token::parse_additional_mint_data;
 use crate::methods::{is_token_program, resolve_commitment};
 use crate::{db_query, metrics};
@@ -100,7 +100,7 @@ pub async fn get_token_largest_accounts(
         .as_ref()
         .is_some_and(|mints| mints.contains(&pubkey));
     if tracked {
-        let rows = fetch_largest_generation(state, &pubkey, latest_slot).await?;
+        let rows = fetch_largest_record(state, &pubkey, latest_slot).await?;
         if !rows.is_empty() {
             return Ok(RpcResponse {
                 context: RpcResponseContext {

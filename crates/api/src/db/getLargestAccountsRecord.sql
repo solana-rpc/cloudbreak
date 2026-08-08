@@ -1,6 +1,4 @@
-SELECT
-    pubkey,
-    amount::text AS amount
+SELECT record
 FROM largest_accounts
 WHERE mint = $1
   AND slot = (
@@ -8,6 +6,4 @@ WHERE mint = $1
       FROM largest_accounts
       WHERE mint = $1
         AND slot <= $2
-  )
-ORDER BY largest_accounts.amount DESC, pubkey DESC
-LIMIT 20;
+  );

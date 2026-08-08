@@ -329,26 +329,26 @@ async fn commit_largest_accounts(
         }
     }
 
-    if !outcome.generations.is_empty() {
+    if !outcome.records.is_empty() {
         let persist = timeout(
             query_timeout,
-            largest_accounts::persist_generations(db, &outcome.generations),
+            largest_accounts::persist_records(db, &outcome.records),
         )
         .await;
         if !matches!(persist, Ok(Ok(()))) {
             metrics::LARGEST_ACCOUNTS_DB_ERRORS.inc();
             tracing::error!(
                 target: "largest_accounts",
-                "failed to persist largest_accounts generations for slot {}, marking {} mint(s) stale: {:?}",
+                "failed to persist largest_accounts records for slot {}, marking {} mint(s) stale: {:?}",
                 slot,
-                outcome.generations.len(),
+                outcome.records.len(),
                 persist
             );
-            for generation in &outcome.generations {
-                largest_accounts.mark_mint_stale(&generation.mint);
+            for record in &outcome.records {
+                largest_accounts.mark_mint_stale(&record.mint);
                 let delete = timeout(
                     query_timeout,
-                    largest_accounts::delete_mint_rows(db, &generation.mint),
+                    largest_accounts::delete_mint_rows(db, &record.mint),
                 )
                 .await;
                 if !matches!(delete, Ok(Ok(()))) {

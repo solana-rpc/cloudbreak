@@ -22,6 +22,7 @@ mod m20260618_000000_create_auto_index_usage_table;
 mod m20260703_000000_create_recent_blockhashes_table;
 mod m20260709_000000_add_block_height_to_recent_blockhashes;
 mod m20260804_000000_create_largest_accounts_table;
+mod m20260808_000000_largest_accounts_record;
 
 pub struct Migrator;
 
@@ -44,6 +45,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260703_000000_create_recent_blockhashes_table::Migration),
             Box::new(m20260709_000000_add_block_height_to_recent_blockhashes::Migration),
             Box::new(m20260804_000000_create_largest_accounts_table::Migration),
+            Box::new(m20260808_000000_largest_accounts_record::Migration),
         ]
     }
 }

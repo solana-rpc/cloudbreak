@@ -19,7 +19,7 @@ pub struct PendingLargestAccount {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MintGeneration {
+pub struct MintRecord {
     pub mint: Pubkey,
     pub slot: u64,
     pub rows: Vec<(Pubkey, u64)>,
@@ -27,9 +27,33 @@ pub struct MintGeneration {
 
 #[derive(Debug, Default)]
 pub struct BlockOutcome {
-    pub generations: Vec<MintGeneration>,
+    pub records: Vec<MintRecord>,
     pub newly_stale: Vec<Pubkey>,
     pub cleared: Vec<Pubkey>,
+}
+
+pub const RECORD_ENTRY_SIZE: usize = 40;
+
+pub fn encode_record(rows: &[(Pubkey, u64)]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(rows.len() * RECORD_ENTRY_SIZE);
+    for (pubkey, amount) in rows {
+        bytes.extend_from_slice(pubkey.as_ref());
+        bytes.extend_from_slice(&amount.to_le_bytes());
+    }
+    bytes
+}
+
+pub fn decode_record(bytes: &[u8]) -> Option<Vec<(Pubkey, u64)>> {
+    if !bytes.len().is_multiple_of(RECORD_ENTRY_SIZE) {
+        return None;
+    }
+    let mut rows = Vec::with_capacity(bytes.len() / RECORD_ENTRY_SIZE);
+    for chunk in bytes.chunks_exact(RECORD_ENTRY_SIZE) {
+        let pubkey = Pubkey::try_from(&chunk[..32]).ok()?;
+        let amount = u64::from_le_bytes(chunk[32..].try_into().ok()?);
+        rows.push((pubkey, amount));
+    }
+    Some(rows)
 }
 
 #[derive(Clone, Copy)]
@@ -44,7 +68,7 @@ struct MintTop {
     entries: HashMap<Pubkey, Entry>,
     dropped_floor: u64,
     stale: bool,
-    last_generation: Vec<(Pubkey, u64)>,
+    last_record: Vec<(Pubkey, u64)>,
 }
 
 enum ComputedTop {
@@ -77,6 +101,15 @@ impl MintTop {
             return ComputedTop::Unsound;
         }
         ComputedTop::Sound(rows)
+    }
+
+    fn latch_stale(&mut self) -> bool {
+        if self.stale {
+            return false;
+        }
+        self.stale = true;
+        self.last_record = Vec::new();
+        true
     }
 }
 
@@ -231,24 +264,19 @@ impl TrackerState {
         };
         match top.compute_top() {
             ComputedTop::Unsound => {
-                if !top.stale {
-                    top.stale = true;
-                    top.last_generation = Vec::new();
+                if top.latch_stale() {
                     outcome.newly_stale.push(mint);
-                }
-            }
-            ComputedTop::Sound(rows) if rows.is_empty() => {
-                top.stale = false;
-                if !top.last_generation.is_empty() {
-                    top.last_generation = Vec::new();
-                    outcome.cleared.push(mint);
                 }
             }
             ComputedTop::Sound(rows) => {
                 top.stale = false;
-                if rows != top.last_generation {
-                    top.last_generation = rows.clone();
-                    outcome.generations.push(MintGeneration { mint, slot, rows });
+                if rows != top.last_record {
+                    top.last_record = rows.clone();
+                    if rows.is_empty() {
+                        outcome.cleared.push(mint);
+                    } else {
+                        outcome.records.push(MintRecord { mint, slot, rows });
+                    }
                 }
             }
         }
@@ -489,12 +517,7 @@ impl LargestAccountsTracker {
         let Some(top) = state.mints.get_mut(mint) else {
             return false;
         };
-        if top.stale {
-            return false;
-        }
-        top.stale = true;
-        top.last_generation = Vec::new();
-        true
+        top.latch_stale()
     }
 
     pub fn stale_count(&self) -> usize {
@@ -510,42 +533,26 @@ impl LargestAccountsTracker {
     }
 }
 
-pub async fn persist_generations(
+pub async fn persist_records(
     db: &DatabaseConnection,
-    generations: &[MintGeneration],
+    records: &[MintRecord],
 ) -> Result<(), DbErr> {
-    if generations.is_empty() {
+    if records.is_empty() {
         return Ok(());
     }
     let txn = db.begin().await?;
-    for generation in generations {
-        let mint_hex = hex::encode(generation.mint.as_ref());
+    for record in records {
         txn.execute(Statement::from_string(
             DatabaseBackend::Postgres,
             format!(
-                "DELETE FROM largest_accounts WHERE mint = '\\x{mint_hex}'::bytea AND slot = {}",
-                generation.slot
+                "INSERT INTO largest_accounts (mint, slot, record) \
+                 VALUES ('\\x{}'::bytea, {}, '\\x{}'::bytea) \
+                 ON CONFLICT (mint, slot) DO UPDATE \
+                 SET record = EXCLUDED.record, updated_on = now()",
+                hex::encode(record.mint.as_ref()),
+                record.slot,
+                hex::encode(encode_record(&record.rows)),
             ),
-        ))
-        .await?;
-        if generation.rows.is_empty() {
-            continue;
-        }
-        let values = generation
-            .rows
-            .iter()
-            .map(|(pubkey, amount)| {
-                format!(
-                    "('\\x{mint_hex}'::bytea, '\\x{}'::bytea, {amount}, {})",
-                    hex::encode(pubkey.as_ref()),
-                    generation.slot
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        txn.execute(Statement::from_string(
-            DatabaseBackend::Postgres,
-            format!("INSERT INTO largest_accounts (mint, pubkey, amount, slot) VALUES {values}"),
         ))
         .await?;
     }
@@ -607,10 +614,10 @@ mod tests {
 
     fn token_rows(outcome: &BlockOutcome) -> Option<&Vec<(Pubkey, u64)>> {
         outcome
-            .generations
+            .records
             .iter()
-            .find(|generation| generation.mint == pk(200))
-            .map(|generation| &generation.rows)
+            .find(|record| record.mint == pk(200))
+            .map(|record| &record.rows)
     }
 
     #[test]
@@ -619,7 +626,7 @@ mod tests {
         go_live(&tracker);
         tracker.apply_block(100, [(pk(1), pending_token(500, 5))].into());
         let outcome = tracker.apply_block(90, [(pk(1), pending_token(900, 9))].into());
-        assert!(outcome.generations.is_empty());
+        assert!(outcome.records.is_empty());
         let outcome = tracker.apply_block(101, [(pk(2), pending_token(1, 1))].into());
         let rows = token_rows(&outcome).unwrap();
         assert_eq!(rows[0], (pk(1), 500));
@@ -687,7 +694,7 @@ mod tests {
         let outcome = tracker.apply_block(101, closes);
         assert!(outcome.newly_stale.contains(&pk(200)));
         let outcome = tracker.apply_block(102, [(pk(1), pending_token(9999, 200))].into());
-        assert!(outcome.generations.iter().all(|s| s.mint != pk(200)));
+        assert!(outcome.records.iter().all(|s| s.mint != pk(200)));
     }
 
     #[test]
@@ -753,7 +760,7 @@ mod tests {
     }
 
     #[test]
-    fn generation_only_emitted_on_change() {
+    fn record_only_emitted_on_change() {
         let tracker = tracker(25);
         go_live(&tracker);
         tracker.apply_block(100, [(pk(1), pending_token(10, 1))].into());
@@ -774,12 +781,22 @@ mod tests {
             .into(),
         );
         let sol = outcome
-            .generations
+            .records
             .iter()
-            .find(|generation| generation.mint == SOL_SENTINEL_MINT)
+            .find(|record| record.mint == SOL_SENTINEL_MINT)
             .unwrap();
         assert_eq!(sol.rows[0], (pk(2), 900));
         assert_eq!(sol.slot, 100);
+    }
+
+    #[test]
+    fn record_encoding_roundtrips() {
+        let rows = vec![(pk(3), u64::MAX), (pk(2), 700), (pk(1), 0)];
+        let bytes = encode_record(&rows);
+        assert_eq!(bytes.len(), rows.len() * RECORD_ENTRY_SIZE);
+        assert_eq!(decode_record(&bytes), Some(rows));
+        assert_eq!(decode_record(&[]), Some(Vec::new()));
+        assert_eq!(decode_record(&bytes[..RECORD_ENTRY_SIZE - 1]), None);
     }
 
     #[test]
