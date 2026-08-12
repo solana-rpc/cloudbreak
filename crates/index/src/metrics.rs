@@ -7,7 +7,8 @@ use std::sync::{Once, OnceLock};
 
 use cloudbreak_core::IndexConfig;
 use prometheus::{
-    Counter, Histogram, HistogramOpts, HistogramVec, IntGauge, IntGaugeVec, Opts, Registry,
+    Counter, Histogram, HistogramOpts, HistogramVec, IntCounter, IntGauge, IntGaugeVec, Opts,
+    Registry,
 };
 use tracing::error;
 
@@ -288,6 +289,31 @@ lazy_static::lazy_static! {
         "cloudbreak_largest_accounts_stale_mints", "Number of tracked mints marked stale in the largest accounts tracker"
     )
     .expect("Failed to create largest accounts stale mints gauge");
+
+    pub static ref SUPPLY_TOTAL_LAMPORTS: IntGauge = IntGauge::new(
+        "cloudbreak_supply_total_lamports", "Running total supply in lamports"
+    )
+    .expect("Failed to create supply total lamports gauge");
+
+    pub static ref SUPPLY_SLOT: IntGauge = IntGauge::new(
+        "cloudbreak_supply_slot", "Slot of the last committed supply total"
+    )
+    .expect("Failed to create supply slot gauge");
+
+    pub static ref SUPPLY_STALE: IntGauge = IntGauge::new(
+        "cloudbreak_supply_stale", "Whether the supply tracker is stale (1) or fresh (0)"
+    )
+    .expect("Failed to create supply stale gauge");
+
+    pub static ref SUPPLY_ROUTED_MISSES: IntCounter = IntCounter::new(
+        "cloudbreak_supply_routed_misses", "Owner-routed supply prev-reads that found no previous row"
+    )
+    .expect("Failed to create supply routed misses counter");
+
+    pub static ref SUPPLY_QUERY_ERRORS: IntCounter = IntCounter::new(
+        "cloudbreak_supply_query_errors", "Supply prev-read delta queries that failed or timed out"
+    )
+    .expect("Failed to create supply query errors counter");
 }
 
 /// We use a guard to increment the current tokio tasks metric when a task is created and
@@ -426,5 +452,10 @@ pub fn register_collectors() {
         register!(FINALIZE_SLOT_DELETED_ACCOUNTS);
         register!(LARGEST_ACCOUNTS_DB_ERRORS);
         register!(LARGEST_ACCOUNTS_STALE_MINTS);
+        register!(SUPPLY_TOTAL_LAMPORTS);
+        register!(SUPPLY_SLOT);
+        register!(SUPPLY_STALE);
+        register!(SUPPLY_ROUTED_MISSES);
+        register!(SUPPLY_QUERY_ERRORS);
     });
 }

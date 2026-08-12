@@ -8,6 +8,7 @@ use cloudbreak_core::{
     modules::{
         account_owner_map::AccountOwnerMap,
         largest_accounts::{self, LargestAccountsTracker, PERSISTED_TOP_N},
+        supply_tracker::SupplyTracker,
     },
 };
 use sea_orm::{ConnectOptions, Database, DatabaseConnection};
@@ -53,6 +54,7 @@ pub struct IndexerState {
     /// Used to track the accounts owner
     pub accounts_owner_map: AccountOwnerMap,
     pub largest_accounts: LargestAccountsTracker,
+    pub supply_tracker: SupplyTracker,
 }
 
 pub async fn run(config: &str) -> CloudbreakResult<()> {
@@ -140,6 +142,18 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
             .expect("Failed to clear largest_accounts table");
     }
 
+    let supply_tracker = if config.supply_tracker_enabled {
+        if !config.programs.supports_simulation() {
+            panic!("supply-tracker-enabled requires an empty [programs] filter");
+        }
+        if !config.accounts_owner_map_enabled {
+            panic!("supply-tracker-enabled requires accounts-owner-map-enabled");
+        }
+        SupplyTracker::new()
+    } else {
+        SupplyTracker::default()
+    };
+
     // Service health is tracked as a set of reasons (Startup is set until the startup snapshot is
     // processed; GapFill is set while a gap fill is in progress).
     let health = ServiceHealth::new(db.clone());
@@ -157,12 +171,17 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
     let indexer_state = IndexerState {
         buffer_channel_rx_len: Arc::new(Mutex::new(buffer_channel_rx.len())),
         snapshot_processing_state: snapshot_processing_state.clone(),
-        self_healing_state: SelfHealingState::new(&config, slot_finalizer.clone()),
+        self_healing_state: SelfHealingState::new(
+            &config,
+            slot_finalizer.clone(),
+            supply_tracker.clone(),
+        ),
         slot_finalizer,
         updated_accounts_during_startup,
         finalize_slot_buffer_size: finalize_slot_buffer_size.clone(),
         accounts_owner_map,
         largest_accounts,
+        supply_tracker,
     };
 
     // Used for the hash-checker to signal the main loop to stop
@@ -201,6 +220,12 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
 
     let _epoch_stakes_handle =
         modules::epoch_stakes::spawn_epoch_stakes_recomputer(db.clone(), config.clone());
+
+    let _non_circulating_handle = modules::non_circulating::spawn_non_circulating_recomputer(
+        db.clone(),
+        indexer_state.supply_tracker.clone(),
+        indexer_state.accounts_owner_map.clone(),
+    );
 
     operational_endpoints::self_healing::SELF_HEALING
         .set(indexer_state.self_healing_state.clone())

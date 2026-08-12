@@ -22,10 +22,17 @@ use tokio::{
 };
 use yellowstone_grpc_proto::geyser::CommitmentLevel;
 use yellowstone_grpc_proto::geyser::SubscribeUpdateBlock;
+use cloudbreak_core::modules::supply_tracker::SupplyTracker;
 
 use crate::indexer::{AccountsReceivedPerBlock, IndexerState};
 use crate::modules::snapshot::SnapshotProcessingState;
 use crate::{db_queries, metrics, modules};
+
+struct PendingSupplyAccount {
+    owner: Option<Pubkey>,
+    lamports: u64,
+    write_version: u64,
+}
 
 /// Splits the block into chunks and saves them into the "accounts" table
 /// Also updates the HashMap with the accounts pubkeys that were updated in the slot
@@ -44,6 +51,7 @@ pub async fn save_block(
         finalize_slot_buffer_size,
         accounts_owner_map,
         largest_accounts,
+        supply_tracker,
     } = indexer_state;
 
     let start_time = Instant::now();
@@ -51,6 +59,7 @@ pub async fn save_block(
     let max_chunk_bytes_data = config.grpc.max_chunk_bytes_data;
 
     let slot = block.slot;
+    let is_repaired = block.blockhash.is_empty();
 
     modules::snapshot::process_snapshot_if_needed(
         config.clone(),
@@ -59,6 +68,7 @@ pub async fn save_block(
         finalize_slot_buffer_size.clone(),
         accounts_owner_map.clone(),
         largest_accounts.clone(),
+        supply_tracker.clone(),
     )
     .await;
 
@@ -87,6 +97,8 @@ pub async fn save_block(
 
     let largest_enabled = largest_accounts.is_enabled();
     let mut largest_pending: HashMap<Pubkey, PendingLargestAccount> = HashMap::new();
+    let supply_enabled = supply_tracker.is_enabled();
+    let mut pending_supply_accounts: HashMap<Pubkey, PendingSupplyAccount> = HashMap::new();
 
     // Create the chunks for updating the "accounts" table
     let system_program_id = [0u8; 32].to_vec();
@@ -122,6 +134,24 @@ pub async fn save_block(
                 }
             }
         }
+
+        supply_tracker.observe_account(&account.pubkey, slot, account.lamports);
+
+        if supply_enabled {
+            let pubkey = Pubkey::try_from(account.pubkey.as_slice()).unwrap();
+            let pending = pending_supply_accounts
+                .entry(pubkey)
+                .or_insert_with(|| PendingSupplyAccount {
+                    owner: accounts_owner_map.get_owner(&pubkey),
+                    lamports: account.lamports,
+                    write_version: account.write_version,
+                });
+            if account.write_version > pending.write_version {
+                pending.lamports = account.lamports;
+                pending.write_version = account.write_version;
+            }
+        }
+
         // If the account is being closed we still add it to the hashmap for cleanup
         //  but we don't add it to the "accounts" table in a normal fashion, instead we added using [`db_queries::insert_closed_accounts`]
         if account.lamports == 0 {
@@ -165,7 +195,13 @@ pub async fn save_block(
             continue;
         }
 
-        accounts_owner_map.upsert_account(&account.pubkey, &account.owner, slot);
+        let resurrects_gap_closed_account = is_repaired
+            && supply_tracker
+                .gap_close_floor(&Pubkey::try_from(account.pubkey.as_slice()).unwrap())
+                .is_some_and(|closed_slot| closed_slot >= slot);
+        if !resurrects_gap_closed_account {
+            accounts_owner_map.upsert_account(&account.pubkey, &account.owner, slot);
+        }
 
         block_bytes_data += account.data.len();
         current_chunk_bytes += account.data.len();
@@ -202,6 +238,31 @@ pub async fn save_block(
         chunks.push((current_chunk, current_chunk_bytes));
     }
 
+    let supply_write_guard = supply_tracker.lock_block_writes().await;
+    if !is_repaired {
+        supply_tracker.record_gap_closes(slot, &closed_accounts_for_slot);
+    }
+    let defer_map_removals = supply_tracker.is_gap_filling();
+    let block_supply_delta = if supply_tracker.is_tracking_deltas() {
+        compute_block_supply_delta(
+            db,
+            &config,
+            &supply_tracker,
+            pending_supply_accounts,
+            slot,
+            is_repaired,
+        )
+        .await
+    } else {
+        supply_tracker.record_startup_touches(
+            slot,
+            pending_supply_accounts
+                .into_iter()
+                .map(|(pubkey, pending)| (pubkey, pending.lamports, pending.write_version)),
+        );
+        None
+    };
+
     let closed_account_for_slot_len = closed_accounts_for_slot.len();
 
     // We delay the closed accounts insertion until the snapshot is processed to avoid reads while
@@ -212,7 +273,7 @@ pub async fn save_block(
             .expect("Failed to lock snapshot_processing_state")
     };
 
-    let closed_accounts_insert_handle: Option<JoinHandle<()>> = if snapshot_processing_state
+    let closed_accounts_insert_handle: Option<JoinHandle<bool>> = if snapshot_processing_state
         == SnapshotProcessingState::Finished
         || snapshot_processing_state == SnapshotProcessingState::FinishedAndCleanedUp
     {
@@ -222,6 +283,7 @@ pub async fn save_block(
             slot,
             &config,
             accounts_owner_map,
+            defer_map_removals,
         )
     } else {
         None
@@ -257,17 +319,31 @@ pub async fn save_block(
         tasks.spawn(async move {
             let _guard = metrics::TokioTaskCounterGuard::new("insert_accounts_chunk");
 
-            db_queries::insert_accounts_chunk(&db, chunk, byte_size, &config_clone).await;
+            db_queries::insert_accounts_chunk(&db, chunk, byte_size, &config_clone).await
         });
     }
 
-    tasks.join_all().await;
+    let mut block_writes_ok = tasks.join_all().await.into_iter().all(|inserted| inserted);
 
-    if let Some(handle) = closed_accounts_insert_handle
-        && let Err(e) = handle.await
-    {
-        tracing::error!(target: "save_block_closed_accounts_insert", "failed to insert closed accounts: {:?}", e);
+    if let Some(handle) = closed_accounts_insert_handle {
+        match handle.await {
+            Ok(inserted) => block_writes_ok &= inserted,
+            Err(e) => {
+                tracing::error!(target: "save_block_closed_accounts_insert", "failed to insert closed accounts: {:?}", e);
+                block_writes_ok = false;
+            }
+        }
     }
+
+    if block_supply_delta.is_none() && !block_writes_ok && supply_tracker.mark_bootstrap_failed() {
+        tracing::error!(
+            target: "supply_tracker",
+            "account writes failed for slot {} during supply bootstrap, marking bootstrap failed",
+            slot
+        );
+    }
+
+    drop(supply_write_guard);
 
     if largest_enabled {
         commit_largest_accounts(&largest_accounts, largest_pending, slot, db, &config).await;
@@ -292,6 +368,24 @@ pub async fn save_block(
         &config,
     )
     .await;
+
+    if let Some(block_delta) = block_supply_delta {
+        if !block_writes_ok {
+            tracing::error!(
+                target: "supply_tracker",
+                "account writes failed for slot {}, marking supply stale",
+                slot
+            );
+            if supply_tracker.mark_stale() {
+                metrics::SUPPLY_STALE.set(1);
+            }
+        } else if let Some(commit) = supply_tracker.commit_block(slot, block_delta) {
+            db_queries::upsert_supply_row(db, &commit, &config).await;
+            metrics::SUPPLY_TOTAL_LAMPORTS.set(commit.total as i64);
+            metrics::SUPPLY_SLOT.set(commit.slot as i64);
+            metrics::SUPPLY_STALE.set(0);
+        }
+    }
 
     let elapsed = start_time.elapsed().as_secs_f64();
     metrics::record_block_processing(elapsed, "block");
@@ -359,4 +453,71 @@ async fn commit_largest_accounts(
     }
 
     metrics::LARGEST_ACCOUNTS_STALE_MINTS.set(largest_accounts.stale_count() as i64);
+}
+
+async fn compute_block_supply_delta(
+    db: &DatabaseConnection,
+    config: &IndexConfig,
+    supply_tracker: &SupplyTracker,
+    pending_accounts: HashMap<Pubkey, PendingSupplyAccount>,
+    slot: u64,
+    is_repaired: bool,
+) -> Option<i128> {
+    let mut block_delta: i128 = 0;
+    let mut owners = Vec::new();
+    let mut pubkeys = Vec::new();
+    let mut new_lamports = Vec::new();
+    for (pubkey, pending) in pending_accounts {
+        let zero_prev = supply_tracker.take_zero_prev(&pubkey);
+        if is_repaired
+            && !zero_prev
+            && supply_tracker
+                .gap_close_floor(&pubkey)
+                .is_some_and(|closed_slot| closed_slot >= slot)
+        {
+            continue;
+        }
+        match pending.owner {
+            Some(owner) if !zero_prev => {
+                owners.push(owner.to_bytes().to_vec());
+                pubkeys.push(pubkey.to_bytes().to_vec());
+                new_lamports.push(pending.lamports);
+            }
+            _ => block_delta += pending.lamports as i128,
+        }
+    }
+
+    if pubkeys.is_empty() {
+        return Some(block_delta);
+    }
+
+    match db_queries::fetch_block_supply_delta(db, owners, pubkeys, new_lamports, slot, config)
+        .await
+    {
+        Ok(result) => {
+            if result.routed_misses > 0 {
+                metrics::SUPPLY_ROUTED_MISSES.inc_by(result.routed_misses);
+                tracing::warn!(
+                    target: "supply_tracker",
+                    "owner-routed prev-read found no previous row for {} accounts in slot {}",
+                    result.routed_misses,
+                    slot
+                );
+            }
+            Some(block_delta + result.block_delta)
+        }
+        Err(e) => {
+            metrics::SUPPLY_QUERY_ERRORS.inc();
+            tracing::error!(
+                target: "supply_tracker",
+                "block supply delta query failed for slot {}, marking supply stale: {}",
+                slot,
+                e
+            );
+            if supply_tracker.mark_stale() {
+                metrics::SUPPLY_STALE.set(1);
+            }
+            None
+        }
+    }
 }

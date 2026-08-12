@@ -6,6 +6,7 @@
 use crate::http::server::HttpHandlerResponse;
 use crate::http::server::ResponseBody;
 use crate::modules::cache::GpaProcessor;
+use crate::modules::supply_cache::SharedSupplySnapshot;
 use crate::modules::vote_accounts_cache::SharedStakesSnapshot;
 use crate::error::RpcError;
 use crate::query_tracker_client::QueryTrackerClient;
@@ -53,6 +54,8 @@ pub struct CloudbreakRpcState {
     pub stakes_cache: SharedStakesSnapshot,
     pub max_multiple_accounts: usize,
     pub simulation_supported: bool,
+    pub supply_supported: bool,
+    pub supply_cache: SharedSupplySnapshot,
     pub feature_set_cache: Arc<RwLock<Option<CachedFeatureSet>>>,
     pub largest_accounts_mints: Option<Arc<HashSet<Pubkey>>>,
 }
@@ -77,6 +80,8 @@ impl CloudbreakRpcState {
         max_multiple_accounts: usize,
         simulation_supported: bool,
         largest_accounts_mints: Option<Arc<HashSet<Pubkey>>>,
+        supply_supported: bool,
+        supply_cache: SharedSupplySnapshot,
     ) -> Self {
         Self {
             database,
@@ -95,6 +100,8 @@ impl CloudbreakRpcState {
             stakes_cache,
             max_multiple_accounts,
             simulation_supported,
+            supply_supported,
+            supply_cache,
             feature_set_cache: Arc::new(RwLock::new(None)),
             largest_accounts_mints,
         }

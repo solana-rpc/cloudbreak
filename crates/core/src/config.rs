@@ -458,6 +458,9 @@ pub struct IndexConfig {
     #[serde(default)]
     #[serde(rename = "accounts-owner-map-enabled")]
     pub accounts_owner_map_enabled: bool,
+    #[serde(default)]
+    #[serde(rename = "supply-tracker-enabled")]
+    pub supply_tracker_enabled: bool,
     #[serde(rename = "largest-accounts")]
     pub largest_accounts: Option<LargestAccountsConfig>,
 }

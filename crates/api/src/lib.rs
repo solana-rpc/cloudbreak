@@ -12,7 +12,7 @@ use cloudbreak_core::{ApiConfig, EnvironmentInfo, TryLoadConfig};
 use crate::{
     http::CloudbreakRpcState,
     metrics::setup_metrics,
-    modules::{cache::GpaProcessor, vote_accounts_cache},
+    modules::{cache::GpaProcessor, supply_cache, vote_accounts_cache},
     query_tracker_client::QueryTrackerClient,
 };
 use std::sync::RwLock;
@@ -134,6 +134,33 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
         );
     }
 
+    let supply_supported = indexer_filter.supports_simulation();
+    let supply_cache: supply_cache::SharedSupplySnapshot = Arc::default();
+    if supply_supported {
+        match supply_cache::load_latest_supply(&database).await {
+            Ok(Some(snapshot)) => {
+                info!(
+                    "Loaded initial supply snapshot ({} rows)",
+                    snapshot.rows.len()
+                );
+                *supply_cache.write().unwrap() = Arc::new(snapshot);
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    "supply table is empty at startup; getSupply will fail until the \
+                     indexer processes a snapshot"
+                );
+            }
+            Err(e) => {
+                tracing::error!("Failed to load initial supply snapshot: {:?}", e);
+            }
+        }
+        supply_cache::spawn_poll_task(database.clone(), supply_cache.clone());
+        info!("getSupply: supported=true (full unfiltered index)");
+    } else {
+        info!("getSupply: supported=false (indexer filter is not a full unfiltered index)");
+    }
+
     let state = CloudbreakRpcState::new(
         database,
         queries_timeout,
@@ -152,6 +179,8 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
         max_multiple_accounts,
         simulation_supported,
         largest_accounts_mints,
+        supply_supported,
+        supply_cache,
     );
 
     info!("Server is starting...");

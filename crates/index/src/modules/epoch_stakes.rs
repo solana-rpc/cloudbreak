@@ -42,7 +42,7 @@ const EPOCH_REWARDS_SYSVAR_ID: Pubkey =
     Pubkey::from_str_const("SysvarEpochRewards1111111111111111111111111");
 
 /// Latest live state per account for a given owner, across the live and snapshot tables.
-const LATEST_BY_OWNER_SQL: &str = r#"
+pub(crate) const LATEST_BY_OWNER_SQL: &str = r#"
 WITH latest AS (
     SELECT DISTINCT ON (pubkey) pubkey, data, lamports
     FROM (
@@ -173,7 +173,7 @@ pub fn spawn_epoch_stakes_recomputer(
     })
 }
 
-async fn is_healthy(db: &DatabaseConnection) -> bool {
+pub(crate) async fn is_healthy(db: &DatabaseConnection) -> bool {
     db.query_one(Statement::from_string(
         DatabaseBackend::Postgres,
         "SELECT healthy FROM service_health WHERE id = 1".to_string(),

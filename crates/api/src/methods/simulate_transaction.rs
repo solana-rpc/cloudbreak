@@ -914,7 +914,7 @@ fn sysvar_account_ids() -> [Pubkey; 9] {
 fn programdata_addresses(accounts: &HashMap<Pubkey, (AccountSharedData, Slot)>) -> Vec<Pubkey> {
     let loader = solana_sdk_ids::bpf_loader_upgradeable::id();
     let mut out = Vec::new();
-    for (_key, (account, _)) in accounts {
+    for (account, _) in accounts.values() {
         if account.owner() != &loader {
             continue;
         }
@@ -981,9 +981,10 @@ fn execute(
     }
 
     // Install v1; v2 stays the default empty loader (loader-v4 compiles via v1).
-    let mut environments = ProgramRuntimeEnvironments::default();
-    environments.program_runtime_v1 = Arc::new(program_runtime_v1);
-    processor.set_environments(environments);
+    processor.set_environments(ProgramRuntimeEnvironments {
+        program_runtime_v1: Arc::new(program_runtime_v1),
+        ..Default::default()
+    });
 
     for builtin in solana_builtins::BUILTINS {
         processor.add_builtin(
