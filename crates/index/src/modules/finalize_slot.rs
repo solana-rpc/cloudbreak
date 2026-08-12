@@ -8,7 +8,7 @@ use sea_orm::DatabaseConnection;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 use tokio::{task::JoinSet, time::Instant};
 use yellowstone_grpc_proto::geyser::CommitmentLevel;
 
@@ -90,6 +90,8 @@ pub struct SlotFinalizer {
     config: IndexConfig,
     updated_accounts_during_startup: UpdatedAccountsDuringStartup,
     health: ServiceHealth,
+    /// Latest finalized slot, watched by the largest-accounts pruner task.
+    prune_slot_tx: watch::Sender<u64>,
     /// Max number of pending live slots before `note_finalized` blocks (back-pressure bound).
     /// Bypassed by `enqueue_unbounded` and `enqueue_gap_boundary`(gap fill).
     pub bound: usize,
@@ -102,6 +104,7 @@ impl SlotFinalizer {
         config: IndexConfig,
         updated_accounts_during_startup: UpdatedAccountsDuringStartup,
         health: ServiceHealth,
+        prune_slot_tx: watch::Sender<u64>,
     ) -> Self {
         let bound = config.finalize_slot_buffer_size;
         let finalizer = Self {
@@ -112,6 +115,7 @@ impl SlotFinalizer {
             config,
             updated_accounts_during_startup,
             health,
+            prune_slot_tx,
             bound,
         };
 
@@ -314,6 +318,7 @@ impl SlotFinalizer {
                 self.db.clone(),
                 entry.accounts,
                 self.updated_accounts_during_startup.clone(),
+                &self.prune_slot_tx,
             )
             .await;
         }
@@ -407,6 +412,7 @@ async fn finalize_slot(
     db: DatabaseConnection,
     updated_accounts: AccountsReceivedPerBlock,
     updated_accounts_during_startup: UpdatedAccountsDuringStartup,
+    prune_slot_tx: &watch::Sender<u64>,
 ) {
     let start_time = Instant::now();
 
@@ -487,13 +493,7 @@ async fn finalize_slot(
         });
     }
 
-    if config.largest_accounts_enabled() {
-        let db_clone = db.clone();
-        let config_clone = config.clone();
-        join_set.spawn(async move {
-            db_queries::prune_largest_accounts(&db_clone, slot, &config_clone).await;
-        });
-    }
+    let _ = prune_slot_tx.send(slot);
 
     let closed_accounts = updated_accounts.closed_accounts.clone();
     let db_clone = db.clone();
@@ -535,6 +535,33 @@ async fn finalize_slot(
             .expect("Failed to lock new_accounts_in_slot"),
         "new_accounts_in_slot",
     );
+}
+
+/// Long-lived task that prunes stale `largest_accounts` generations at most once every
+/// `prune-interval-slots` finalized slots, off the finalization critical path.
+pub fn spawn_largest_accounts_pruner(
+    db: DatabaseConnection,
+    config: IndexConfig,
+    mut finalized_slot_rx: watch::Receiver<u64>,
+) {
+    let prune_interval_slots = config
+        .largest_accounts
+        .as_ref()
+        .map(|largest_config| largest_config.prune_interval_slots)
+        .unwrap_or_default();
+
+    tokio::spawn(async move {
+        let _guard = metrics::TokioTaskCounterGuard::new("largest_accounts_pruner");
+
+        let mut last_pruned_slot = 0u64;
+        while finalized_slot_rx.changed().await.is_ok() {
+            let finalized_slot = *finalized_slot_rx.borrow_and_update();
+            if finalized_slot.saturating_sub(last_pruned_slot) >= prune_interval_slots {
+                db_queries::prune_largest_accounts(&db, finalized_slot, &config).await;
+                last_pruned_slot = finalized_slot;
+            }
+        }
+    });
 }
 
 ///Used to store all accounts that are updated/closed while loading the snapshot, and delete them after the snapshot is processed

@@ -25,7 +25,7 @@ use yellowstone_grpc_proto::{
 use crate::modules::health::ServiceHealth;
 use crate::modules::snapshot::SnapshotProcessingState;
 use crate::modules::{
-    finalize_slot::{SlotFinalizer, UpdatedAccountsDuringStartup},
+    finalize_slot::{SlotFinalizer, UpdatedAccountsDuringStartup, spawn_largest_accounts_pruner},
     self_healing::SelfHealingState,
 };
 use crate::modules::{
@@ -161,11 +161,17 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
     let updated_accounts_during_startup =
         UpdatedAccountsDuringStartup::new(snapshot_processing_state.clone(), health.clone());
 
+    let (prune_slot_tx, prune_slot_rx) = tokio::sync::watch::channel(0u64);
+    if config.largest_accounts_enabled() {
+        spawn_largest_accounts_pruner(db.clone(), config.clone(), prune_slot_rx);
+    }
+
     let slot_finalizer = SlotFinalizer::spawn(
         db.clone(),
         config.clone(),
         updated_accounts_during_startup.clone(),
         health.clone(),
+        prune_slot_tx,
     );
 
     let indexer_state = IndexerState {

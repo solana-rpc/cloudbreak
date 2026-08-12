@@ -476,11 +476,20 @@ pub struct LargestAccountsConfig {
         default = "LargestAccountsConfig::default_accounts_per_mint"
     )]
     pub accounts_per_mint: usize,
+    #[serde(
+        rename = "prune-interval-slots",
+        default = "LargestAccountsConfig::default_prune_interval_slots"
+    )]
+    pub prune_interval_slots: u64,
 }
 
 impl LargestAccountsConfig {
     const fn default_accounts_per_mint() -> usize {
         100
+    }
+
+    const fn default_prune_interval_slots() -> u64 {
+        20
     }
 }
 
