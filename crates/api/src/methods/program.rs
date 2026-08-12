@@ -342,6 +342,16 @@ fn gpa_db_query(
                     Ok(r) => r,
                     Err(e) => {
                         tracing::error!("Database query error: {}", e);
+                        // Record the failed query too: a pattern that errors out
+                        // mid-stream is still real demand for an index.
+                        if let Some(client) = &input.state.query_tracker_client {
+                            client.buffer_query(
+                                input.program,
+                                Some(input.config.clone()),
+                                db_query_total_time.as_micros() as u64,
+                                true,
+                            );
+                        }
                         let _ = tx.send(Err(RpcError::InternalError));
                         return;
                     }
@@ -368,6 +378,7 @@ fn gpa_db_query(
                     input.program,
                     Some(input.config.clone()),
                     db_query_total_time.as_micros() as u64,
+                    false,
                 );
             }
 
@@ -381,6 +392,17 @@ fn gpa_db_query(
 
         if timeout(queries_timeout, db_query).await.is_err() {
             tracing::error!("Database streaming query timed out");
+            // A timed-out query is strong demand for an index (it currently
+            // cannot be served); record it with the timeout budget as the cost
+            // estimate so it can be prioritized for creation.
+            if let Some(client) = &input.state.query_tracker_client {
+                client.buffer_query(
+                    input.program,
+                    Some(input.config.clone()),
+                    queries_timeout.as_micros() as u64,
+                    true,
+                );
+            }
             let _ = tx.send(Err(RpcError::InternalError));
         }
     });

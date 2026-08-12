@@ -27,6 +27,12 @@ port = 8875
 endpoint = "http://localhost:4001"
 timeout = "5s"
 flush-interval = "1m"
+# Bound the in-memory buffer: at most this many distinct index patterns are held
+# between flushes; once full, new patterns are dropped (counted) while existing
+# ones keep aggregating. A failed flush re-buffers instead of losing data.
+max-buffered-identities = 10000
+# Split large flushes into batches of at most this many patterns per HTTP POST.
+max-batch-size = 1000
 
 [tracing]
 enabled = true

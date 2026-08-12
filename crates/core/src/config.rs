@@ -771,97 +771,403 @@ impl SlotSyncronizerConfig {
     }
 }
 
+/// How creation candidates are ranked when the tracker decides which index to
+/// build next. The score is computed on read from the stored demand columns, so
+/// changing this takes effect immediately without any data migration. See the
+/// query tracker's `prioritization` module for the exact `ORDER BY` mapping.
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum PriorityMode {
+    /// Rank by how many requests demanded the pattern (most frequent first).
+    #[default]
+    Frequency,
+    /// Rank by accumulated DB cost in microseconds (heaviest total load first).
+    Cost,
+    /// Rank by average cost per request, so individually expensive but rarer
+    /// patterns still rise to the top ("huge queries first").
+    CostPerHit,
+    /// Rank by average cost-per-hit scaled by a weighted blend of **windowed**
+    /// activity. Unlike the other modes — which rank on lifetime totals — this
+    /// one uses the per-window counts maintained by the score roll task, so it
+    /// reflects *current* throughput and both creation and eviction rank by the
+    /// same number.
+    ///
+    /// Score: `(avg_cost * gain) * (1 + demand_weight*demand +
+    /// supply_weight*(supply/2) + failure_weight*failed)`, where `avg_cost =
+    /// total_cost_us / demand_count`, each count is the value observed in the
+    /// last window, and `gain = 1 + latency_weight * ln(latency_ratio)` scales
+    /// `avg_cost` by how much faster the pattern is *with* the index than without
+    /// (see `latency_weight`), where `latency_ratio = (without_index_compensation_factor
+    /// × without) / with`. The `ln` is what keeps that scaling well-behaved:
+    /// it grows slowly, so a wildly faster index (`latency_ratio` in the tens or
+    /// hundreds) is compressed instead of dominating the ranking, while staying
+    /// symmetric — `ln(1) = 0` is neutral and a harmful index (`ratio < 1`) gives
+    /// a negative log that drags the score down. The `+ 1` baseline keeps the
+    /// volume factor non-zero, so a zero-activity pattern just ranks by
+    /// `avg_cost * gain` (no special-casing, and no ties at zero when evicting).
+    ///
+    /// The weights (and the measurement window) only make sense here, so they
+    /// live inside the variant. In TOML this is a table while the other modes
+    /// stay bare strings:
+    /// `priority-mode = { weighted = { demand-weight = 1.0, rate-window = "1h" } }`.
+    /// All weights default `0.0`, which collapses the score to plain average
+    /// cost-per-hit (and needs no rate roll).
+    Weighted {
+        /// Weight on demand (request count in the window). Default `0.0`.
+        #[serde(rename = "demand-weight", default)]
+        demand_weight: f64,
+        /// Weight on supply (`idx_scan` in the window, halved via
+        /// `SCANS_PER_REQUEST` so it is comparable to demand). Only contributes
+        /// for created indexes — candidates have no supply yet. Default `0.0`.
+        #[serde(rename = "supply-weight", default)]
+        supply_weight: f64,
+        /// Weight on failed/timed-out requests in the window, to prioritize
+        /// patterns that currently *cannot* be served without an index.
+        /// Default `0.0`.
+        #[serde(rename = "failure-weight", default)]
+        failure_weight: f64,
+        /// Weight on the measured latency **gain** from the index — the ratio of
+        /// the (compensated) without-index average cost to the with-index
+        /// average. Applied to `avg_cost` as `gain = 1 + latency_weight *
+        /// ln(latency_ratio)`, so a clearly helpful index (ratio > 1) boosts the
+        /// score while a harmful one (ratio < 1) drags it down; `ln` smooths
+        /// extreme ratios. The without-index side is first scaled by
+        /// `without-index-compensation-factor` (a top-level key, since the
+        /// regression guard applies it too). Stays neutral (`gain = 1`) until the
+        /// pattern has served requests both with and without the index (so a
+        /// ratio can be formed), or when the weight is `0`. Default `0.0`.
+        #[serde(rename = "latency-weight", default)]
+        latency_weight: f64,
+        /// Window over which the demand/supply/failure counts are measured. A
+        /// background task snapshots the counters at this cadence and stores the
+        /// per-window deltas the score reads. Default `1h`.
+        #[serde(
+            rename = "rate-window",
+            default = "PriorityMode::default_rate_window",
+            deserialize_with = "deserialize_duration_required"
+        )]
+        rate_window: Duration,
+    },
+}
+
+impl PriorityMode {
+    fn default_rate_window() -> Duration {
+        Duration::from_secs(3600)
+    }
+
+    /// The measurement window when this mode needs one (only `Weighted`).
+    pub fn rate_window(&self) -> Option<Duration> {
+        match self {
+            PriorityMode::Weighted { rate_window, .. } => Some(*rate_window),
+            _ => None,
+        }
+    }
+
+    /// Whether this mode needs the windowed score columns maintained. Only
+    /// `Weighted` with at least one non-zero weight does; an all-zero `Weighted`
+    /// collapses to plain average cost-per-hit and needs no rate roll.
+    pub fn uses_windowed_rate(&self) -> bool {
+        matches!(
+            self,
+            PriorityMode::Weighted { demand_weight, supply_weight, failure_weight, .. }
+                if *demand_weight != 0.0 || *supply_weight != 0.0 || *failure_weight != 0.0
+        )
+    }
+}
+
+/// What the tracker does when a created index measures **slower** than the same
+/// pattern was *without* it (a latency regression). An index becomes eligible
+/// for the guard once it is older than `index-min-age-grace` — the same
+/// lifetime gate idle eviction uses — by which point it has had time to gather
+/// with-index latency to compare against its frozen without-index baseline.
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum IndexRegressionGuard {
+    /// Ignore latency regressions entirely (no logging, no action).
+    #[default]
+    Off,
+    /// Log a warning and increment a metric, but keep the index in place.
+    Warn,
+    /// Drop the index pair and mark the pattern `rejected`, so it is not rebuilt
+    /// until fresh without-index samples show the pattern is now *slower*
+    /// without the index than it was with it.
+    Evict,
+}
+
+/// Configuration for the query tracker service.
+///
+/// The tracker is persistence-first: all demand/supply state lives in the
+/// `index_patterns` table, so every knob here only tunes *behavior* (what to
+/// build, when to evict), never durability. Defaults reproduce the previous
+/// hardcoded behavior so existing deployments need no config changes.
 #[derive(Deserialize, Debug, Clone)]
 pub struct QueryTrackerConfig {
-    #[serde(
-        rename = "cost-eligibility-threshold-us",
-        default = "QueryTrackerConfig::default_cost_eligibility_threshold_us"
-    )]
-    pub cost_eligibility_threshold_us: Option<u64>,
-    #[serde(
-        rename = "cost-weighting",
-        default = "QueryTrackerConfig::default_cost_weighting"
-    )]
-    pub cost_weighting: bool,
+    // ---- creation ---------------------------------------------------------
+    /// Master switch for building database indexes. When false the creation
+    /// loop is not spawned; demand is still recorded so a later flip has
+    /// history to act on.
     #[serde(
         rename = "create-database-indexes",
         default = "QueryTrackerConfig::default_create_database_indexes"
     )]
     pub create_database_indexes: bool,
+    /// Minimum demand count a pattern must reach before it becomes a creation
+    /// candidate. Filters out one-off queries.
     #[serde(
         rename = "index-generation-threshold",
         default = "QueryTrackerConfig::default_index_generation_threshold"
     )]
     pub index_generation_threshold: u32,
+    /// Poll interval of the creation loop: how often it wakes to pick the next
+    /// highest-priority candidate.
     #[serde(
         rename = "index-creation-delay",
         default = "QueryTrackerConfig::default_index_creation_delay",
         deserialize_with = "deserialize_duration_required"
     )]
     pub index_creation_delay: Duration,
+
+    // ---- prioritization ---------------------------------------------------
+    /// How candidates are ranked. See [`PriorityMode`].
+    #[serde(rename = "priority-mode", default)]
+    pub priority_mode: PriorityMode,
+    /// Only patterns whose average cost-per-hit reaches this many microseconds
+    /// are eligible for creation. `None` disables the gate.
     #[serde(
-        rename = "query-counts-reset-interval",
-        default = "QueryTrackerConfig::default_query_counts_reset_interval",
-        deserialize_with = "deserialize_duration_required"
+        rename = "cost-eligibility-threshold-us",
+        default = "QueryTrackerConfig::default_cost_eligibility_threshold_us"
     )]
-    pub query_counts_reset_interval: Duration,
-    /// Programs to include in the index creation, if empty, all programs will be included
-    /// In general this is meant to be used either this or excluded-programs (not both), for fine-grained control
-    /// This is different from what data is being saved in the database, which is controlled by the `index` cmd,
-    /// but it's closely related (because it only makes sense to index programs that are being saved in the database)
+    pub cost_eligibility_threshold_us: Option<u64>,
+
+    // ---- program scoping --------------------------------------------------
+    /// Programs to include in index creation; empty means "all". Use either
+    /// this or `excluded-programs`, not both.
     #[serde(rename = "included-programs", default)]
     pub included_programs: Vec<PubkeyDef>,
-    /// Programs to exclude from the index creation
+    /// Programs to exclude from index creation.
     #[serde(rename = "excluded-programs", default)]
     pub excluded_programs: Vec<PubkeyDef>,
-    /// The URL of the indexer metrics
+
+    // ---- backpressure -----------------------------------------------------
+    /// URL of the indexer metrics endpoint used to gate DDL under ingest load.
     #[serde(
         rename = "indexer-metrics",
         deserialize_with = "QueryTrackerConfig::deserialize_indexer_metrics"
     )]
     pub indexer_metrics: String,
-    /// The threshold for the indexer metrics to trigger index creation,
-    /// the used metric is `cloudbreak_finalize_slot_handler_queue_size`
+    /// If `cloudbreak_finalize_slot_handler_queue_size` exceeds this, CREATE and
+    /// DROP INDEX are deferred (they take heavy locks on hot tables).
     #[serde(
         rename = "indexer-metrics-threshold",
         default = "QueryTrackerConfig::default_indexer_metrics_threshold"
     )]
     pub indexer_metrics_threshold: u64,
-    /// Optional cap on the total number of indexes on the `snapshot_accounts` table
+    /// Optional cap on the total number of indexes on the target table.
     #[serde(rename = "max-auto-indexes", default)]
     pub max_auto_indexes: Option<usize>,
-    /// Minimum age an auto-created index must reach before it is eligible for eviction at all,
-    /// so a freshly built index is never dropped before it has had a chance to be used. Default: 1h.
+
+    // ---- eviction ---------------------------------------------------------
+    /// Master switch for usage-based eviction. Off by default; when off the
+    /// eviction task is not spawned.
     #[serde(
-        rename = "index-min-age-grace",
-        default = "QueryTrackerConfig::default_index_min_age_grace",
-        deserialize_with = "deserialize_duration_required"
+        rename = "index-eviction-enabled",
+        default = "QueryTrackerConfig::default_index_eviction_enabled"
     )]
-    pub index_min_age_grace: Duration,
-    /// How often the eviction pass runs. Keep this comfortably larger than the rate at which the
-    /// build loop creates indexes to avoid churn. Default: 1h.
+    pub index_eviction_enabled: bool,
+    /// When `true`, the eviction pass marks the whole node **unhealthy** (via the
+    /// shared `service_health` / `slots.health` flag) for the duration of the idle
+    /// trim loop, then healthy again once it finishes — so a load balancer reading
+    /// that flag drains traffic away from the node while `DROP INDEX` holds heavy
+    /// `ACCESS EXCLUSIVE` locks.
+    ///
+    /// Off by default. It writes the *same shared* health row the indexer uses, so
+    /// only enable it where the query tracker is the authority that may flip node
+    /// health: if another process on the node also toggles it, the two can clobber
+    /// each other (e.g. this restores healthy while the indexer wanted unhealthy).
+    #[serde(
+        rename = "mark-unhealthy-for-eviction",
+        default = "QueryTrackerConfig::default_mark_unhealthy_for_eviction"
+    )]
+    pub mark_unhealthy_for_eviction: bool,
+    /// When `true`, an index must also be idle by **supply** (`last_seen_used` /
+    /// `idx_scan` unchanged for `index-min-idle`) to be eviction-eligible, in
+    /// addition to demand-idle. Off by default: eligibility is demand-idle +
+    /// age-grace only.
+    ///
+    /// The supply signal is useful when you want a more conservative drop set
+    /// (indexes Postgres is still scanning stay protected even with no tracked
+    /// API demand). The cost is that the eviction-pass supply refresh bumps
+    /// `last_seen_used` for every index whose `idx_scan` moved since the last
+    /// pass, which can collapse the eviction-candidates list for up to
+    /// `index-min-idle` afterward — painful on high-rotation pattern DBs, where
+    /// the creation-time value guard may then see an empty eligible set and
+    /// treat `None` as "build anyway." Turn this on only if you want that extra
+    /// conservatism; the collapse can also be mitigated by running eviction
+    /// passes more frequently (so each refresh covers a shorter window).
+    ///
+    /// Applies to the shared eligibility gate used by the idle trim, the
+    /// creation-time value guard, and `/debug/created?filter=eviction_candidates`.
+    #[serde(
+        rename = "use-supply-for-eviction",
+        default = "QueryTrackerConfig::default_use_supply_for_eviction"
+    )]
+    pub use_supply_for_eviction: bool,
+    /// How often the eviction pass runs. Keep comfortably larger than the
+    /// creation rate to avoid drop/rebuild churn. Default: 1h.
     #[serde(
         rename = "index-eviction-interval",
         default = "QueryTrackerConfig::default_index_eviction_interval",
         deserialize_with = "deserialize_duration_required"
     )]
     pub index_eviction_interval: Duration,
-    /// Master switch for usage-based eviction of auto-created indexes. Off by default; when off,
-    /// the eviction task is not even spawned and index management behaves exactly as before.
+    /// Minimum age before an index is eligible for eviction, so a freshly built
+    /// index is never dropped before it has had a chance to be used. Default: 1h.
     #[serde(
-        rename = "index-eviction-enabled",
-        default = "QueryTrackerConfig::default_index_eviction_enabled"
+        rename = "index-min-age-grace",
+        default = "QueryTrackerConfig::default_index_min_age_grace",
+        deserialize_with = "deserialize_duration_required"
     )]
-    pub index_eviction_enabled: bool,
-    /// How long an index must go unused (no new `idx_scan`) before it is considered idle and
-    /// droppable. Intentionally conservative — too small a window risks evicting indexes that are
-    /// used in bursts, and pairs with the eviction interval to avoid drop/rebuild churn. Default: 24h.
+    pub index_min_age_grace: Duration,
+    /// How long a pattern must be idle before it is droppable. Demand-idle
+    /// (`last_demand_at`) is always required; supply-idle (`last_seen_used`) is
+    /// required only when [`Self::use_supply_for_eviction`] is on. Default: 24h.
     #[serde(
         rename = "index-min-idle",
         default = "QueryTrackerConfig::default_index_min_idle",
         deserialize_with = "deserialize_duration_required"
     )]
     pub index_min_idle: Duration,
+    /// Fraction (0.0–1.0) of `max-auto-indexes` fill above which eviction is
+    /// allowed to run. Below it we prefer keeping possibly-useful indexes and
+    /// simply let creation slow down. Requires `max-auto-indexes`. Default: 0.9.
+    #[serde(
+        rename = "eviction-fill-threshold",
+        default = "QueryTrackerConfig::default_eviction_fill_threshold"
+    )]
+    pub eviction_fill_threshold: f64,
+    /// Multiplier applied to a **creation candidate's** score in the creation-time
+    /// value guard, when it is compared against the index it would displace. It
+    /// tunes *stickiness* toward existing indexes.
+    ///
+    /// Both sides are scored by the same `priority-mode`, but a `created` index
+    /// carries realized signal a fresh candidate cannot have yet — its
+    /// with-index latency `gain` and its `idx_scan` supply — which structurally
+    /// biases the comparison toward incumbents. This factor compensates for that:
+    /// `> 1.0` favors building new indexes (less sticky, more churn), `< 1.0`
+    /// favors keeping incumbents (stickier), and `1.0` (default) compares the two
+    /// scores as-is. Only consulted while the table is in the buffer band
+    /// (at/above the fill target); below the target, creation is unguarded.
+    #[serde(
+        rename = "value-guard-creation-bias",
+        default = "QueryTrackerConfig::default_value_guard_creation_bias"
+    )]
+    pub value_guard_creation_bias: f64,
+    /// `lock_timeout` applied to each DROP INDEX. If the lock cannot be taken in
+    /// this window the drop is skipped (with a warning) and retried next pass.
+    #[serde(
+        rename = "drop-lock-timeout",
+        default = "QueryTrackerConfig::default_drop_lock_timeout",
+        deserialize_with = "deserialize_duration_required"
+    )]
+    pub drop_lock_timeout: Duration,
+    /// Number of extra attempts for a DROP INDEX that fails on lock timeout
+    /// within the same pass. Default: 1.
+    #[serde(
+        rename = "drop-retries",
+        default = "QueryTrackerConfig::default_drop_retries"
+    )]
+    pub drop_retries: u32,
+
+    // ---- latency regression guard ----------------------------------------
+    /// What to do when a created index is measured *slower* than the same
+    /// pattern was without it. `off` (default) ignores it; `warn` logs and bumps
+    /// a metric; `evict` drops the pair and marks the pattern `rejected` so it is
+    /// not rebuilt until fresh evidence shows the index would help again. See
+    /// [`IndexRegressionGuard`]. The guard runs inside the eviction pass (so it
+    /// requires `index-eviction-enabled`) but is independent of the fill
+    /// threshold — a harmful index is dropped even when there is room.
+    #[serde(rename = "index-regression-guard", default)]
+    pub index_regression_guard: IndexRegressionGuard,
+    /// How many times slower *with* the index than without before it counts as a
+    /// regression (e.g. `1.2` = the with-index average must exceed the
+    /// without-index average by 20%). Also the hysteresis a `rejected` pattern
+    /// must clear — its recent without-index average must exceed the with-index
+    /// average recorded at rejection by this factor — before it is retried.
+    /// Default: 1.2.
+    #[serde(
+        rename = "index-regression-ratio",
+        default = "QueryTrackerConfig::default_index_regression_ratio"
+    )]
+    pub index_regression_ratio: f64,
+    /// How long a pattern that was `rejected` for a latency regression must stay
+    /// rejected — accumulating fresh without-index samples — before it may be
+    /// retried. When this has elapsed *and* its without-index average since
+    /// rejection has climbed past `index-regression-ratio ×` the with-index
+    /// average recorded at rejection, it returns to `candidate`. Guards against
+    /// rebuild churn on an index we already know hurt. Default: 6h.
+    ///
+    /// (The regression *detection* side has no separate window: an index becomes
+    /// eligible for the guard once it is older than `index-min-age-grace`, the
+    /// same lifetime gate idle eviction uses — long enough to have gathered
+    /// with-index latency to compare against its frozen without-index baseline.)
+    #[serde(
+        rename = "index-regression-retry-delay",
+        default = "QueryTrackerConfig::default_index_regression_retry_delay",
+        deserialize_with = "deserialize_duration_required"
+    )]
+    pub index_regression_retry_delay: Duration,
+    /// Multiplier applied to the **without-index** average cost wherever it is
+    /// compared against the with-index average — that is, in the `weighted`
+    /// priority mode's latency gain (`ln((factor × without) / with)`) *and* in
+    /// the latency regression guard's detection and recovery comparisons.
+    ///
+    /// It compensates for Postgres settings that keep the two sides from being
+    /// strictly comparable: a without-index `getProgramAccounts` may fan out
+    /// across several parallel workers, so its wall-clock time looks small even
+    /// though it burns far more CPU/IO than a single-worker index scan. A
+    /// `factor > 1` inflates that measured without-index cost to reflect the
+    /// resources it actually consumed, so the index earns proportionally more
+    /// credit (and is less likely to be judged a regression). `1.0` (default) is
+    /// a no-op — the raw wall-clock averages are compared as-is.
+    #[serde(
+        rename = "without-index-compensation-factor",
+        default = "QueryTrackerConfig::default_without_index_compensation_factor"
+    )]
+    pub without_index_compensation_factor: f64,
+
+    // ---- discrepancy detection -------------------------------------------
+    /// Emit a metric/log when demand (API) and supply (`idx_scan`) diverge,
+    /// surfacing indexes Postgres is ignoring despite live demand.
+    #[serde(
+        rename = "discrepancy-enabled",
+        default = "QueryTrackerConfig::default_discrepancy_enabled"
+    )]
+    pub discrepancy_enabled: bool,
+    /// Relative gap (0.0–1.0) between normalized demand and supply beyond which
+    /// a pattern is flagged as discrepant. Default: 0.10 (10%).
+    #[serde(
+        rename = "discrepancy-delta",
+        default = "QueryTrackerConfig::default_discrepancy_delta"
+    )]
+    pub discrepancy_delta: f64,
+
+    // ---- optional: EXPLAIN sampling --------------------------------------
+    /// Opt-in third signal: periodically `EXPLAIN` (not ANALYZE) a synthetic
+    /// probe of each created index to see whether the planner *would* use it
+    /// right now — the only signal that cleanly tells "no traffic" apart from
+    /// "planner refuses". Off by default.
+    #[serde(
+        rename = "explain-enabled",
+        default = "QueryTrackerConfig::default_explain_enabled"
+    )]
+    pub explain_enabled: bool,
+    /// How often the EXPLAIN sampling pass runs when enabled. Default: 6h.
+    #[serde(
+        rename = "explain-interval",
+        default = "QueryTrackerConfig::default_explain_interval",
+        deserialize_with = "deserialize_duration_required"
+    )]
+    pub explain_interval: Duration,
 }
 
 impl QueryTrackerConfig {
@@ -873,7 +1179,15 @@ impl QueryTrackerConfig {
         Duration::from_secs(3600)
     }
 
-    fn default_index_eviction_enabled() -> bool {
+    const fn default_index_eviction_enabled() -> bool {
+        false
+    }
+
+    const fn default_mark_unhealthy_for_eviction() -> bool {
+        false
+    }
+
+    const fn default_use_supply_for_eviction() -> bool {
         false
     }
 
@@ -881,12 +1195,52 @@ impl QueryTrackerConfig {
         Duration::from_secs(3600 * 24)
     }
 
-    const fn default_cost_eligibility_threshold_us() -> Option<u64> {
-        None
+    const fn default_eviction_fill_threshold() -> f64 {
+        0.9
     }
 
-    const fn default_cost_weighting() -> bool {
+    const fn default_value_guard_creation_bias() -> f64 {
+        1.0
+    }
+
+    fn default_drop_lock_timeout() -> Duration {
+        Duration::from_secs(5)
+    }
+
+    const fn default_drop_retries() -> u32 {
+        1
+    }
+
+    const fn default_index_regression_ratio() -> f64 {
+        1.2
+    }
+
+    fn default_index_regression_retry_delay() -> Duration {
+        Duration::from_secs(6 * 3600)
+    }
+
+    const fn default_without_index_compensation_factor() -> f64 {
+        1.0
+    }
+
+    const fn default_discrepancy_enabled() -> bool {
+        true
+    }
+
+    const fn default_discrepancy_delta() -> f64 {
+        0.10
+    }
+
+    const fn default_explain_enabled() -> bool {
         false
+    }
+
+    fn default_explain_interval() -> Duration {
+        Duration::from_secs(3600 * 6)
+    }
+
+    const fn default_cost_eligibility_threshold_us() -> Option<u64> {
+        None
     }
 
     const fn default_create_database_indexes() -> bool {
@@ -898,11 +1252,7 @@ impl QueryTrackerConfig {
     }
 
     fn default_index_creation_delay() -> Duration {
-        Duration::from_secs(10) // 10 seconds
-    }
-
-    fn default_query_counts_reset_interval() -> Duration {
-        Duration::from_secs(86400) // 24 hours
+        Duration::from_secs(10)
     }
 
     fn default_indexer_metrics_threshold() -> u64 {
@@ -927,20 +1277,33 @@ impl Default for QueryTrackerConfig {
     fn default() -> Self {
         Self {
             create_database_indexes: Self::default_create_database_indexes(),
-            index_min_age_grace: Self::default_index_min_age_grace(),
-            index_eviction_interval: Self::default_index_eviction_interval(),
-            index_eviction_enabled: Self::default_index_eviction_enabled(),
-            index_min_idle: Self::default_index_min_idle(),
-            cost_eligibility_threshold_us: Self::default_cost_eligibility_threshold_us(),
-            cost_weighting: Self::default_cost_weighting(),
             index_generation_threshold: Self::default_index_generation_threshold(),
             index_creation_delay: Self::default_index_creation_delay(),
-            query_counts_reset_interval: Self::default_query_counts_reset_interval(),
+            priority_mode: PriorityMode::default(),
+            cost_eligibility_threshold_us: Self::default_cost_eligibility_threshold_us(),
             included_programs: Vec::new(),
             excluded_programs: Vec::new(),
             indexer_metrics: String::default(),
             indexer_metrics_threshold: Self::default_indexer_metrics_threshold(),
             max_auto_indexes: None,
+            index_eviction_enabled: Self::default_index_eviction_enabled(),
+            mark_unhealthy_for_eviction: Self::default_mark_unhealthy_for_eviction(),
+            use_supply_for_eviction: Self::default_use_supply_for_eviction(),
+            index_eviction_interval: Self::default_index_eviction_interval(),
+            index_min_age_grace: Self::default_index_min_age_grace(),
+            index_min_idle: Self::default_index_min_idle(),
+            eviction_fill_threshold: Self::default_eviction_fill_threshold(),
+            value_guard_creation_bias: Self::default_value_guard_creation_bias(),
+            drop_lock_timeout: Self::default_drop_lock_timeout(),
+            drop_retries: Self::default_drop_retries(),
+            index_regression_guard: IndexRegressionGuard::default(),
+            index_regression_ratio: Self::default_index_regression_ratio(),
+            index_regression_retry_delay: Self::default_index_regression_retry_delay(),
+            without_index_compensation_factor: Self::default_without_index_compensation_factor(),
+            discrepancy_enabled: Self::default_discrepancy_enabled(),
+            discrepancy_delta: Self::default_discrepancy_delta(),
+            explain_enabled: Self::default_explain_enabled(),
+            explain_interval: Self::default_explain_interval(),
         }
     }
 }
@@ -967,7 +1330,6 @@ impl ApiConfig {
 pub struct QueryTrackerServiceConfig {
     pub database: DatabaseConfig,
     pub server: ServerConfig,
-    pub metrics: MetricsConfig,
     #[serde(rename = "query-tracker")]
     pub query_tracker: QueryTrackerConfig,
 }
@@ -975,6 +1337,9 @@ pub struct QueryTrackerServiceConfig {
 impl TryLoadConfig for QueryTrackerServiceConfig {}
 
 impl QueryTrackerServiceConfig {
+    /// Address of the single HTTP server, which serves the functional endpoints
+    /// (`/track`, `/debug/*`) and the operational endpoints (`/metrics`,
+    /// `/health`) on the same port.
     pub fn server_addr(&self) -> SocketAddr {
         SocketAddr::from_str(&format!(
             "{}:{}",
@@ -985,34 +1350,55 @@ impl QueryTrackerServiceConfig {
         ))
         .expect("error getting endpoint")
     }
-
-    pub fn metrics_addr(&self) -> SocketAddr {
-        SocketAddr::from_str(&format!(
-            "{}:{}",
-            self.metrics.host.as_ref().map_or("0.0.0.0", |v| v),
-            self.metrics
-                .port
-                .unwrap_or(DEFAULT_QUERY_TRACKER_METRICS_PORT)
-        ))
-        .expect("error getting metrics endpoint")
-    }
 }
 
+/// API-side client that buffers observed GPA patterns and flushes them to the
+/// tracker over HTTP. Buffering is keyed by `IndexIdentity` (so many raw queries
+/// collapse into one entry) and is bounded so a slow/unreachable tracker can
+/// never grow memory without limit.
 #[derive(Deserialize, Debug, Clone)]
 pub struct QueryTrackerClientConfig {
+    /// Base URL of the tracker's HTTP `/track` endpoint host, e.g.
+    /// `http://query-tracker:4001`.
     pub endpoint: String,
+    /// Per-request HTTP timeout when flushing a batch.
     #[serde(default, deserialize_with = "deserialize_duration")]
     pub timeout: Option<Duration>,
+    /// How often the buffer is flushed to the tracker.
     #[serde(
         rename = "flush-interval",
         default,
         deserialize_with = "deserialize_duration"
     )]
     pub flush_interval: Option<Duration>,
+    /// Max number of distinct identities held in the buffer. When full, new
+    /// identities are dropped (with a counter) rather than growing unbounded;
+    /// already-buffered identities keep aggregating. Default: 10_000.
+    #[serde(
+        rename = "max-buffered-identities",
+        default = "QueryTrackerClientConfig::default_max_buffered_identities"
+    )]
+    pub max_buffered_identities: usize,
+    /// Max identities sent per flush request; larger buffers are split across
+    /// several requests so a single POST body stays bounded. Default: 1_000.
+    #[serde(
+        rename = "max-batch-size",
+        default = "QueryTrackerClientConfig::default_max_batch_size"
+    )]
+    pub max_batch_size: usize,
+}
+
+impl QueryTrackerClientConfig {
+    const fn default_max_buffered_identities() -> usize {
+        10_000
+    }
+
+    const fn default_max_batch_size() -> usize {
+        1_000
+    }
 }
 
 pub const DEFAULT_QUERY_TRACKER_SERVER_PORT: u16 = 4001;
-pub const DEFAULT_QUERY_TRACKER_METRICS_PORT: u16 = 8876;
 
 /// Configuration for owner-based partitioning of the `accounts` and `snapshot_accounts` tables.
 ///
@@ -1181,8 +1567,18 @@ mod tests {
     fn query_tracker_eviction_defaults_are_safe() {
         let c = QueryTrackerConfig::default();
         assert!(!c.index_eviction_enabled, "eviction must be off by default");
+        assert!(
+            !c.mark_unhealthy_for_eviction,
+            "mark-unhealthy-for-eviction must be off by default"
+        );
+        assert!(
+            !c.use_supply_for_eviction,
+            "use-supply-for-eviction must be off by default"
+        );
         assert_eq!(c.index_min_idle, Duration::from_secs(86400));
         assert_eq!(c.index_min_age_grace, Duration::from_secs(3600));
         assert_eq!(c.index_eviction_interval, Duration::from_secs(3600));
+        // Neutral value guard by default: candidate and incumbent scores compared as-is.
+        assert_eq!(c.value_guard_creation_bias, 1.0);
     }
 }

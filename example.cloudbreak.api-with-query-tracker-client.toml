@@ -14,6 +14,8 @@ port = 8875
 endpoint = "http://localhost:4001"
 timeout = "5s"
 flush-interval = "1m"
+max-buffered-identities = 10000
+max-batch-size = 1000
 
 # How to handle requests with "processed" commitment level.
 # "reject" (default) — return an error for processed commitment requests.

@@ -56,7 +56,9 @@ pub fn serve(config: &IndexConfig) -> anyhow::Result<()> {
 
         let listener = match TcpListener::bind(address).await {
             Ok(l) => {
-                info!("Operational endpoints server started at http://{address} (/metrics, /debug/...)");
+                info!(
+                    "Operational endpoints server started at http://{address} (/metrics, /debug/...)"
+                );
                 l
             }
             Err(e) => {

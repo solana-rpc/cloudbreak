@@ -1,3 +1,5 @@
+# Single HTTP server serves the functional endpoints (/track, /debug/*) and the
+# operational endpoints (/metrics, /health) on this one port.
 [server]
 host = "0.0.0.0"
 port = 4001
@@ -6,20 +8,113 @@ max-connections = 100
 [database]
 url = "postgres://cloudbreak:cloudbreak@localhost:5432/cloudbreak"
 
-[metrics]
-host = "0.0.0.0"
-port = 8876
-
 [query-tracker]
+# --- creation ---
 create-database-indexes = true
 index-generation-threshold = 10
 index-creation-delay = "10s"
-query-counts-reset-interval = "24h"
+
+# --- prioritization ---
+# Creation and eviction rank by the SAME criterion (creation builds the highest,
+# eviction drops the lowest). Three modes are bare strings and rank on lifetime
+# totals:
+#   "frequency"    (default) most-demanded first
+#   "cost"         heaviest accumulated DB cost first
+#   "cost-per-hit" heaviest average cost per request first
+# The "weighted" mode is a table with its own weights and measurement window
+# (they only apply here) and ranks on RECENT windowed activity, not lifetime
+# totals:
+#   priority-mode = { weighted = { demand-weight = 1.0, supply-weight = 0.0, failure-weight = 0.0, latency-weight = 0.0, rate-window = "1h" } }
+# Score = (avg_cost * gain) * (1 + demand-weight*demand + supply-weight*(supply/2)
+#                                + failure-weight*failed), each count being the
+# value seen in the last rate-window. supply is halved because a served GPA scans
+# both tables of the pair (~2 idx_scan per request). "gain" scales avg_cost by the
+# measured latency win from the index:
+#   gain = 1 + latency-weight*ln((without-index-compensation-factor*without)/with),
+# neutral (=1) until the pattern has served requests both with and without the
+# index. All weights default 0.0, which degenerates to plain average cost-per-hit
+# (and needs no rate roll).
+priority-mode = "frequency"
+# Only index patterns whose average cost-per-hit reaches this many microseconds
+# (omit to disable the gate).
+# cost-eligibility-threshold-us = 50000
+
+# --- program scoping ---
 included-programs = []
 excluded-programs = [
   "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
   "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
 ]
+
+# --- backpressure ---
 indexer-metrics = "localhost:8875"
 indexer-metrics-threshold = 5
 max-auto-indexes = 100
+
+# --- eviction (usage-based; off by default) ---
+index-eviction-enabled = false
+# Drain traffic off the node while the trim holds DROP INDEX locks: mark the
+# shared service_health/slots.health flag unhealthy before the trim loop and
+# healthy after. Only enable where this service is the authority for node health
+# (it writes the same row the indexer uses and can otherwise clobber it).
+mark-unhealthy-for-eviction = false
+# When true, also require supply-idle (last_seen_used / idx_scan unchanged) for
+# eviction eligibility. Off by default: demand-idle + age-grace only. Enabling
+# is more conservative, but the eviction-pass supply refresh can collapse the
+# candidates list for up to index-min-idle afterward on high-rotation DBs —
+# mitigate by running eviction more frequently if you turn this on.
+use-supply-for-eviction = false
+index-eviction-interval = "1h"
+index-min-age-grace = "1h"
+index-min-idle = "24h"
+# Fill target as a fraction of max-auto-indexes (needs max-auto-indexes). Below
+# the target, creation builds freely; in the buffer band above it, a
+# creation-time value guard only builds an index that out-values the one it would
+# displace (or builds anyway up to the hard cap when nothing is reclaimable to
+# displace); eviction then trims the buffer back down to the target.
+eviction-fill-threshold = 0.9
+# Multiplier on a creation candidate's score in the value guard, tuning
+# stickiness toward existing indexes (they carry gain/idx_scan signal new
+# candidates lack). >1.0 = less sticky (build new indexes more readily),
+# <1.0 = stickier (favor incumbents), 1.0 = compare scores as-is.
+value-guard-creation-bias = 1.0
+drop-lock-timeout = "5s"
+drop-retries = 1
+
+# --- latency regression guard (index slower than no index) ---
+# Compares per-pattern query latency WITH the index against WITHOUT it. Runs in
+# the eviction pass (requires index-eviction-enabled) but ignores the fill
+# threshold — a harmful index is removed even when there is room.
+#   "off"   (default) ignore regressions
+#   "warn"  log + report count via query_tracker_regressed_indexes, keep the index
+#   "evict" drop the pair and mark the pattern "rejected" (not rebuilt until it
+#           is proven slower without the index than it was with it)
+index-regression-guard = "off"
+# How many times slower WITH the index than without before it counts as a
+# regression (1.2 = at least 20% slower). Also the hysteresis a rejected pattern
+# must clear before it is retried.
+index-regression-ratio = 1.2
+# How long a pattern rejected for a regression must stay rejected — gathering
+# fresh without-index samples — before it may be retried (and only then if its
+# without-index average has climbed past the with-index average recorded at
+# rejection). Guards against rebuild churn on an index we already know hurt. The
+# detection side needs no window of its own: an index is judged once it is older
+# than index-min-age-grace, the same grace idle eviction uses.
+index-regression-retry-delay = "6h"
+# Multiplier applied to the WITHOUT-index average cost wherever it is compared to
+# the with-index average: the weighted latency gain above AND this guard's
+# detection/recovery. Compensates for pg settings that keep the two sides from
+# being strictly comparable — e.g. a without-index getProgramAccounts fans out
+# across parallel workers, so its wall-clock looks cheap while it burns far more
+# CPU/IO than a single-worker index scan. factor > 1 inflates that measured
+# without-index cost so the index earns proportional credit (and is less likely
+# to be judged a regression). 1.0 (default) compares raw wall-clock as-is.
+without-index-compensation-factor = 1.0
+
+# --- discrepancy detection (demand vs. supply) ---
+discrepancy-enabled = true
+discrepancy-delta = 0.10
+
+# --- optional: EXPLAIN sampling (planner-level third signal; off by default) ---
+explain-enabled = false
+explain-interval = "6h"

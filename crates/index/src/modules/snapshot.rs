@@ -3,7 +3,6 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-use std::sync::{Arc, Mutex};
 use cloudbreak_core::{
     IndexConfig, SnapshotConfig,
     modules::{
@@ -11,6 +10,7 @@ use cloudbreak_core::{
         supply_tracker::SupplyTracker,
     },
 };
+use std::sync::{Arc, Mutex};
 
 use crate::metrics;
 use crate::modules::finalize_slot::UpdatedAccountsDuringStartup;

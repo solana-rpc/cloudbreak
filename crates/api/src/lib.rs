@@ -52,6 +52,8 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
                 &qt_config.endpoint,
                 qt_config.timeout,
                 qt_config.flush_interval,
+                qt_config.max_buffered_identities,
+                qt_config.max_batch_size,
             ))
         }
         None => {
