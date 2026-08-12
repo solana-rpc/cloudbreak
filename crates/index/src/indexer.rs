@@ -229,8 +229,10 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
 
     let _non_circulating_handle = modules::non_circulating::spawn_non_circulating_recomputer(
         db.clone(),
+        config.clone(),
         indexer_state.supply_tracker.clone(),
         indexer_state.accounts_owner_map.clone(),
+        indexer_state.largest_accounts.clone(),
     );
 
     operational_endpoints::self_healing::SELF_HEALING

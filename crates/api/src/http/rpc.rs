@@ -22,8 +22,8 @@ use crate::http::CloudbreakRpcState;
 use crate::http::server::{HttpHandlerResponse, ResponseBody};
 use crate::http::streaming::gpa_streaming_response_body;
 use crate::http::{
-    JsonRpcRequest, JsonRpcResponse, RpcRequestPayload, extract_param, http_status_for_error,
-    make_error_response, make_error_response_with_status,
+    JsonRpcRequest, JsonRpcResponse, RpcRequestPayload, extract_optional_param, extract_param,
+    http_status_for_error, make_error_response, make_error_response_with_status,
 };
 use crate::methods::slot::RpcGetSlotConfig;
 use crate::methods::token::{
@@ -488,7 +488,10 @@ async fn process_single_request(
             let start_time = Instant::now();
 
             let config: Option<solana_rpc_client_api::config::RpcLargestAccountsConfig> =
-                extract_param(&rpc_request.params, 0).ok().flatten();
+                match extract_optional_param(&rpc_request.params, 0) {
+                    Ok(config) => config,
+                    Err(e) => return make_error_response(id, -32602, e),
+                };
 
             let result = methods::get_largest_accounts::get_largest_accounts(state, config).await;
 

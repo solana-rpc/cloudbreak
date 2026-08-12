@@ -121,6 +121,7 @@ pub async fn save_block(
             let update = PendingLargestAccount {
                 write_version: account.write_version,
                 lamports: account.lamports,
+                non_circulating: supply_tracker.is_non_circulating(&pubkey),
                 token,
             };
             match largest_pending.entry(pubkey) {
@@ -398,8 +399,18 @@ async fn commit_largest_accounts(
     db: &DatabaseConnection,
     config: &IndexConfig,
 ) {
-    let query_timeout = Duration::from_secs(config.database.save_block_queries_timeout);
     let outcome = largest_accounts.apply_block(slot, largest_pending);
+    persist_largest_outcome(largest_accounts, outcome, slot, db, config).await;
+}
+
+pub(crate) async fn persist_largest_outcome(
+    largest_accounts: &LargestAccountsTracker,
+    outcome: largest_accounts::BlockOutcome,
+    slot: u64,
+    db: &DatabaseConnection,
+    config: &IndexConfig,
+) {
+    let query_timeout = Duration::from_secs(config.database.save_block_queries_timeout);
 
     for mint in &outcome.newly_stale {
         tracing::error!(

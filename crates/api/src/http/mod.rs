@@ -242,6 +242,22 @@ fn extract_param<T: serde::de::DeserializeOwned>(
     }
 }
 
+fn extract_optional_param<T: serde::de::DeserializeOwned>(
+    params: &serde_json::Value,
+    index: usize,
+) -> Result<Option<T>, String> {
+    match params {
+        serde_json::Value::Array(arr) => match arr.get(index) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(v) => serde_json::from_value(v.clone())
+                .map(Some)
+                .map_err(|e| format!("Invalid parameter: {}", e)),
+        },
+        serde_json::Value::Null => Ok(None),
+        _ => Err("Parameters must be an array".to_string()),
+    }
+}
+
 fn make_error_response(id: serde_json::Value, code: i32, message: String) -> HttpHandlerResponse {
     make_error_response_with_status(id, code, message, StatusCode::OK)
 }

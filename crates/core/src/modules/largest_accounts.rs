@@ -1,3 +1,4 @@
+use crate::modules::supply_tracker::NonCirculatingBalance;
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, DbErr, Statement, TransactionTrait};
 use solana_pubkey::Pubkey;
 use std::collections::{HashMap, HashSet};
@@ -6,6 +7,14 @@ use std::sync::{Arc, Mutex, MutexGuard};
 pub const PERSISTED_TOP_N: usize = 20;
 
 pub const SOL_SENTINEL_MINT: Pubkey = Pubkey::new_from_array([0u8; 32]);
+pub const CIRCULATING_SENTINEL_MINT: Pubkey = Pubkey::new_from_array([1u8; 32]);
+pub const NON_CIRCULATING_SENTINEL_MINT: Pubkey = Pubkey::new_from_array([2u8; 32]);
+
+fn is_sentinel(mint: &Pubkey) -> bool {
+    *mint == SOL_SENTINEL_MINT
+        || *mint == CIRCULATING_SENTINEL_MINT
+        || *mint == NON_CIRCULATING_SENTINEL_MINT
+}
 
 pub const TOKEN_PROGRAM_ID: Pubkey =
     Pubkey::from_str_const("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
@@ -15,6 +24,7 @@ pub const TOKEN_2022_PROGRAM_ID: Pubkey =
 pub struct PendingLargestAccount {
     pub write_version: u64,
     pub lamports: u64,
+    pub non_circulating: bool,
     pub token: Option<(Pubkey, u64)>,
 }
 
@@ -154,7 +164,7 @@ impl TrackerState {
         };
         if (slot, write_version) > (entry.slot, entry.write_version) {
             top.entries.remove(&pubkey);
-            if mint != SOL_SENTINEL_MINT {
+            if !is_sentinel(&mint) {
                 self.member_index.remove(&pubkey);
             }
             touched.insert(mint);
@@ -211,7 +221,7 @@ impl TrackerState {
                 return;
             }
             top.entries.remove(&min_pubkey);
-            if mint != SOL_SENTINEL_MINT {
+            if !is_sentinel(&mint) {
                 self.member_index.remove(&min_pubkey);
             }
             top.dropped_floor = top.dropped_floor.max(min_amount);
@@ -224,7 +234,7 @@ impl TrackerState {
                 write_version,
             },
         );
-        if mint != SOL_SENTINEL_MINT {
+        if !is_sentinel(&mint) {
             self.member_index.insert(pubkey, mint);
         }
         touched.insert(mint);
@@ -252,7 +262,7 @@ impl TrackerState {
         for (pubkey, amount) in victims {
             top.entries.remove(&pubkey);
             top.dropped_floor = top.dropped_floor.max(amount);
-            if mint != SOL_SENTINEL_MINT {
+            if !is_sentinel(&mint) {
                 member_index.remove(&pubkey);
             }
         }
@@ -344,6 +354,8 @@ impl LargestAccountsTracker {
             .map(|mint| (*mint, MintTop::default()))
             .collect();
         mints.insert(SOL_SENTINEL_MINT, MintTop::default());
+        mints.insert(CIRCULATING_SENTINEL_MINT, MintTop::default());
+        mints.insert(NON_CIRCULATING_SENTINEL_MINT, MintTop::default());
         Self(Some(Arc::new(Shared {
             tracked_mints,
             k_per_mint,
@@ -390,7 +402,13 @@ impl LargestAccountsTracker {
             if let Some(mint) = state.member_index.get(&pubkey).copied() {
                 state.remove_member(mint, pubkey, slot, write_version, &mut touched);
             }
-            state.remove_member(SOL_SENTINEL_MINT, pubkey, slot, write_version, &mut touched);
+            for sentinel in [
+                SOL_SENTINEL_MINT,
+                CIRCULATING_SENTINEL_MINT,
+                NON_CIRCULATING_SENTINEL_MINT,
+            ] {
+                state.remove_member(sentinel, pubkey, slot, write_version, &mut touched);
+            }
         }
         for (mint, mut entries) in seed.mints {
             LargestAccountsSeed::shrink(&mut entries, shared.k_per_mint);
@@ -427,13 +445,13 @@ impl LargestAccountsTracker {
                 if bootstrapping {
                     state.record_tombstone(pubkey, slot, update.write_version);
                 }
-                state.remove_member(
+                for sentinel in [
                     SOL_SENTINEL_MINT,
-                    pubkey,
-                    slot,
-                    update.write_version,
-                    &mut touched,
-                );
+                    CIRCULATING_SENTINEL_MINT,
+                    NON_CIRCULATING_SENTINEL_MINT,
+                ] {
+                    state.remove_member(sentinel, pubkey, slot, update.write_version, &mut touched);
+                }
                 continue;
             }
             if let Some((mint, amount)) = update.token {
@@ -451,6 +469,29 @@ impl LargestAccountsTracker {
             }
             state.apply_update(
                 SOL_SENTINEL_MINT,
+                pubkey,
+                update.lamports,
+                slot,
+                update.write_version,
+                bootstrapping,
+                old_block,
+                shared.k_per_mint,
+                &mut touched,
+            );
+            let (class_mint, other_class_mint) = if update.non_circulating {
+                (NON_CIRCULATING_SENTINEL_MINT, CIRCULATING_SENTINEL_MINT)
+            } else {
+                (CIRCULATING_SENTINEL_MINT, NON_CIRCULATING_SENTINEL_MINT)
+            };
+            state.remove_member(
+                other_class_mint,
+                pubkey,
+                slot,
+                update.write_version,
+                &mut touched,
+            );
+            state.apply_update(
+                class_mint,
                 pubkey,
                 update.lamports,
                 slot,
@@ -507,6 +548,125 @@ impl LargestAccountsTracker {
             state.emit(mint, effective_slot, &mut outcome);
         }
         outcome
+    }
+
+    /// True once bootstrap has finished and the tracker is applying live blocks.
+    pub fn is_live(&self) -> bool {
+        self.0
+            .as_deref()
+            .is_some_and(|shared| shared.state().status == Status::Live)
+    }
+
+    /// Reseeds the circulating/non-circulating sentinels from a freshly recomputed
+    /// non-circulating member set and its balances, returning the records to persist.
+    pub fn seed_class_sentinels(
+        &self,
+        recompute_slot: u64,
+        members: &HashSet<Pubkey>,
+        balances: &[NonCirculatingBalance],
+    ) -> Option<BlockOutcome> {
+        let shared = self.0.as_deref()?;
+        let mut state = shared.state();
+        if state.status != Status::Live {
+            return None;
+        }
+        let mut touched = HashSet::new();
+        let stale_non_circulating: Vec<Pubkey> = state
+            .mints
+            .get(&NON_CIRCULATING_SENTINEL_MINT)
+            .map(|top| {
+                top.entries
+                    .keys()
+                    .filter(|pubkey| !members.contains(pubkey))
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default();
+        for pubkey in stale_non_circulating {
+            state.remove_member(
+                NON_CIRCULATING_SENTINEL_MINT,
+                pubkey,
+                recompute_slot,
+                0,
+                &mut touched,
+            );
+        }
+        let stale_circulating: Vec<Pubkey> = state
+            .mints
+            .get(&CIRCULATING_SENTINEL_MINT)
+            .map(|top| {
+                top.entries
+                    .keys()
+                    .filter(|pubkey| members.contains(pubkey))
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default();
+        for pubkey in stale_circulating {
+            state.remove_member(
+                CIRCULATING_SENTINEL_MINT,
+                pubkey,
+                recompute_slot,
+                0,
+                &mut touched,
+            );
+        }
+        if let Some(top) = state.mints.get_mut(&NON_CIRCULATING_SENTINEL_MINT) {
+            top.dropped_floor = 0;
+        }
+        for balance in balances {
+            if balance.lamports == 0 || !members.contains(&balance.pubkey) {
+                continue;
+            }
+            state.apply_update(
+                NON_CIRCULATING_SENTINEL_MINT,
+                balance.pubkey,
+                balance.lamports,
+                balance.slot,
+                0,
+                false,
+                false,
+                shared.k_per_mint,
+                &mut touched,
+            );
+        }
+        let sol_floor = state
+            .mints
+            .get(&SOL_SENTINEL_MINT)
+            .map(|top| top.dropped_floor)
+            .unwrap_or(0);
+        let candidates: Vec<(Pubkey, Entry)> = state
+            .mints
+            .get(&SOL_SENTINEL_MINT)
+            .map(|top| {
+                top.entries
+                    .iter()
+                    .filter(|(pubkey, _)| !members.contains(*pubkey))
+                    .map(|(pubkey, entry)| (*pubkey, *entry))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(top) = state.mints.get_mut(&CIRCULATING_SENTINEL_MINT) {
+            top.dropped_floor = sol_floor;
+        }
+        for (pubkey, entry) in candidates {
+            state.apply_update(
+                CIRCULATING_SENTINEL_MINT,
+                pubkey,
+                entry.amount,
+                entry.slot,
+                entry.write_version,
+                false,
+                false,
+                shared.k_per_mint,
+                &mut touched,
+            );
+        }
+        let effective_slot = state.max_applied_slot;
+        let mut outcome = BlockOutcome::default();
+        state.emit(NON_CIRCULATING_SENTINEL_MINT, effective_slot, &mut outcome);
+        state.emit(CIRCULATING_SENTINEL_MINT, effective_slot, &mut outcome);
+        Some(outcome)
     }
 
     pub fn mark_mint_stale(&self, mint: &Pubkey) -> bool {
@@ -596,6 +756,7 @@ mod tests {
         PendingLargestAccount {
             write_version,
             lamports,
+            non_circulating: false,
             token: None,
         }
     }
@@ -604,6 +765,7 @@ mod tests {
         PendingLargestAccount {
             write_version,
             lamports: 1_000_000,
+            non_circulating: false,
             token: Some((pk(200), amount)),
         }
     }
@@ -613,10 +775,17 @@ mod tests {
     }
 
     fn token_rows(outcome: &BlockOutcome) -> Option<&Vec<(Pubkey, u64)>> {
+        sentinel_rows(outcome, &pk(200))
+    }
+
+    fn sentinel_rows<'a>(
+        outcome: &'a BlockOutcome,
+        mint: &Pubkey,
+    ) -> Option<&'a Vec<(Pubkey, u64)>> {
         outcome
             .records
             .iter()
-            .find(|record| record.mint == pk(200))
+            .find(|record| record.mint == *mint)
             .map(|record| &record.rows)
     }
 
@@ -810,6 +979,7 @@ mod tests {
                 PendingLargestAccount {
                     write_version: 1,
                     lamports: 5,
+                    non_circulating: false,
                     token: Some((pk(201), 777)),
                 },
             )]

@@ -1,9 +1,10 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use cloudbreak_core::STAKE_PROGRAM_ID;
 use cloudbreak_core::modules::account_owner_map::AccountOwnerMap;
+use cloudbreak_core::modules::largest_accounts::LargestAccountsTracker;
 use cloudbreak_core::modules::supply_tracker::SupplyTracker;
+use cloudbreak_core::{IndexConfig, STAKE_PROGRAM_ID};
 use futures::TryStreamExt;
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement, StreamTrait};
 use solana_program::clock::Clock;
@@ -13,8 +14,9 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::modules::epoch_stakes::{LATEST_BY_OWNER_SQL, is_healthy};
-use crate::{db_queries, metrics};
 use crate::modules::non_circulating_lists::{NON_CIRCULATING_ACCOUNTS, WITHDRAW_AUTHORITY};
+use crate::modules::save_block::persist_largest_outcome;
+use crate::{db_queries, metrics};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(60);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(600);
@@ -26,8 +28,10 @@ const CLOCK_SYSVAR_ID: Pubkey =
 
 pub fn spawn_non_circulating_recomputer(
     db: DatabaseConnection,
+    config: IndexConfig,
     supply_tracker: SupplyTracker,
     accounts_owner_map: AccountOwnerMap,
+    largest_accounts: LargestAccountsTracker,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let _guard = metrics::TokioTaskCounterGuard::new("non_circulating_recomputer");
@@ -36,10 +40,13 @@ pub fn spawn_non_circulating_recomputer(
             return;
         }
 
+        let mut interval = tokio::time::interval(POLL_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut last_recompute: Option<Instant> = None;
         let mut next_lockup_expiry: Option<i64> = None;
+        let mut class_sentinels_seeded = !largest_accounts.is_enabled();
         loop {
-            tokio::time::sleep(POLL_INTERVAL).await;
+            interval.tick().await;
 
             if !is_healthy(&db).await {
                 continue;
@@ -50,8 +57,11 @@ pub fn spawn_non_circulating_recomputer(
                 .unwrap_or_default()
                 .as_secs() as i64;
             let expiry_due = next_lockup_expiry.is_some_and(|ts| now >= ts);
+            let seed_due = !class_sentinels_seeded && largest_accounts.is_live();
 
-            if !expiry_due && last_recompute.is_some_and(|last| last.elapsed() < HEARTBEAT_INTERVAL)
+            if !expiry_due
+                && !seed_due
+                && last_recompute.is_some_and(|last| last.elapsed() < HEARTBEAT_INTERVAL)
             {
                 continue;
             }
@@ -90,7 +100,14 @@ pub fn spawn_non_circulating_recomputer(
             last_recompute = Some(Instant::now());
             next_lockup_expiry = next_expiry;
             db_queries::upsert_non_circulating_accounts(&db, slot, &accounts).await;
-            supply_tracker.set_non_circulating_accounts(accounts, balances);
+            let member_set: HashSet<Pubkey> = accounts.iter().copied().collect();
+            supply_tracker.set_non_circulating_accounts(accounts, balances.clone());
+            if let Some(outcome) =
+                largest_accounts.seed_class_sentinels(slot, &member_set, &balances)
+            {
+                persist_largest_outcome(&largest_accounts, outcome, slot, &db, &config).await;
+                class_sentinels_seeded = true;
+            }
         }
     })
 }

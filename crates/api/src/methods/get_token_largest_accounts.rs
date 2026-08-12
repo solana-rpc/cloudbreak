@@ -82,8 +82,8 @@ pub async fn get_token_largest_accounts(
         });
     }
     if !is_token_program(&owner) {
-        return Err(RpcError::NotATokenAccount {
-            pubkey: pubkey.to_string(),
+        return Err(RpcError::NotATokenMint {
+            mint: pubkey.to_string(),
         });
     }
     let data: Vec<u8> = mint_row.get("data");

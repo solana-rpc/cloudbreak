@@ -1,8 +1,10 @@
-use cloudbreak_core::modules::largest_accounts::{decode_record, SOL_SENTINEL_MINT};
+use cloudbreak_core::modules::largest_accounts::{
+    decode_record, CIRCULATING_SENTINEL_MINT, NON_CIRCULATING_SENTINEL_MINT, SOL_SENTINEL_MINT,
+};
 use sea_orm::sqlx::{self, Row};
 use solana_commitment_config::CommitmentLevel;
 use solana_pubkey::Pubkey;
-use solana_rpc_client_api::config::RpcLargestAccountsConfig;
+use solana_rpc_client_api::config::{RpcLargestAccountsConfig, RpcLargestAccountsFilter};
 use solana_rpc_client_api::response::{
     Response as RpcResponse, RpcAccountBalance, RpcResponseContext,
 };
@@ -61,11 +63,20 @@ pub async fn get_largest_accounts(
     }
 
     let config = config.unwrap_or_default();
-    if config.filter.is_some() {
-        return Err(RpcError::InvalidParamsWithMessage(
-            "getLargestAccounts filter is not supported on this node".to_string(),
-        ));
-    }
+    let sentinel = match &config.filter {
+        None => SOL_SENTINEL_MINT,
+        Some(filter) => {
+            if !state.supply_supported {
+                return Err(RpcError::InvalidParamsWithMessage(
+                    "getLargestAccounts filter is not supported on this node".to_string(),
+                ));
+            }
+            match filter {
+                RpcLargestAccountsFilter::Circulating => CIRCULATING_SENTINEL_MINT,
+                RpcLargestAccountsFilter::NonCirculating => NON_CIRCULATING_SENTINEL_MINT,
+            }
+        }
+    };
 
     let commitment = config
         .commitment
@@ -77,7 +88,7 @@ pub async fn get_largest_accounts(
 
     let (latest_slot, _block_time) = state.latest_slot_and_block_time(commitment).await?;
 
-    let rows = fetch_largest_record(state, &SOL_SENTINEL_MINT, latest_slot).await?;
+    let rows = fetch_largest_record(state, &sentinel, latest_slot).await?;
     if rows.is_empty() {
         tracing::error!("getLargestAccounts has no record at slot {}", latest_slot);
         return Err(RpcError::InternalError);
