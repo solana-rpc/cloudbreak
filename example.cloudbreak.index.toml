@@ -60,6 +60,21 @@ port = 8875
 [programs]
 include = ["Stake11111111111111111111111111111111111111"]
 
+# Maintains persisted top-N holder sets serving getLargestAccounts and
+# getTokenLargestAccounts. When enabled, the native-SOL top (getLargestAccounts)
+# and the circulating/non-circulating class tops (its `filter` param) are always
+# maintained; token tops are kept only for the mints listed in tracked-mints.
+[largest-accounts]
+enabled = false
+# In-memory holders kept per mint; only the top 20 are persisted and served,
+# the surplus absorbs evictions
+accounts-per-mint = 100
+# Prune stale largest_accounts rows every N finalized slots, off the
+# finalize critical path
+prune-interval-slots = 20
+# Mint addresses to track for getTokenLargestAccounts
+tracked-mints = []
+
 # When set, the indexer runs in consistency-check mode: it indexes until the
 # limit is reached, compares its computed LtHash against the snapshot's, and
 # exits 0 on match / 1 on mismatch. Provide either time-limit or slot-limit.

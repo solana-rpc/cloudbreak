@@ -1,13 +1,29 @@
+//! In-memory top-N largest-accounts tracker backing `getLargestAccounts` and
+//! `getTokenLargestAccounts`.
+//!
+//! The indexer maintains a top-N holder set per tracked mint plus three sentinel
+//! "mints" (native-SOL, circulating, non-circulating). Whenever a top-N changes,
+//! the persisted slice is written as one packed-`bytea` record per
+//! (mint, slot) row in the `largest_accounts` table (Model B: the API reads the
+//! record at `max(slot <= commitment slot)`).
+
 use crate::modules::supply_tracker::NonCirculatingBalance;
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, DbErr, Statement, TransactionTrait};
 use solana_pubkey::Pubkey;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+/// Number of rows persisted (and served) per record. The in-memory top can be
+/// larger (`accounts-per-mint`); the surplus acts as an eviction reservoir.
 pub const PERSISTED_TOP_N: usize = 20;
 
+/// Sentinel mint keying the native-SOL top-N that serves plain `getLargestAccounts`.
 pub const SOL_SENTINEL_MINT: Pubkey = Pubkey::new_from_array([0u8; 32]);
+/// Sentinel mint keying the circulating-accounts top-N behind the
+/// `getLargestAccounts` `filter: circulating` option.
 pub const CIRCULATING_SENTINEL_MINT: Pubkey = Pubkey::new_from_array([1u8; 32]);
+/// Sentinel mint keying the non-circulating-accounts top-N behind the
+/// `getLargestAccounts` `filter: nonCirculating` option.
 pub const NON_CIRCULATING_SENTINEL_MINT: Pubkey = Pubkey::new_from_array([2u8; 32]);
 
 fn is_sentinel(mint: &Pubkey) -> bool {
@@ -21,6 +37,8 @@ pub const TOKEN_PROGRAM_ID: Pubkey =
 pub const TOKEN_2022_PROGRAM_ID: Pubkey =
     Pubkey::from_str_const("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
 
+/// One account's post-block state as collected by the ingest path, before it is
+/// routed into the token, SOL, and circulating-class tops by `apply_block`.
 pub struct PendingLargestAccount {
     pub write_version: u64,
     pub lamports: u64,
@@ -28,6 +46,8 @@ pub struct PendingLargestAccount {
     pub token: Option<(Pubkey, u64)>,
 }
 
+/// A snapshot of one mint's persisted top-N at a slot: the payload for a single
+/// `largest_accounts` row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MintRecord {
     pub mint: Pubkey,
@@ -35,6 +55,9 @@ pub struct MintRecord {
     pub rows: Vec<(Pubkey, u64)>,
 }
 
+/// What the caller must persist after applying a block: changed records to
+/// upsert, mints that just became unservable, and mints whose rows should be
+/// deleted because their top emptied.
 #[derive(Debug, Default)]
 pub struct BlockOutcome {
     pub records: Vec<MintRecord>,
@@ -42,6 +65,8 @@ pub struct BlockOutcome {
     pub cleared: Vec<Pubkey>,
 }
 
+/// Bytes per entry in a packed record: a 32-byte pubkey followed by a
+/// little-endian `u64` amount.
 pub const RECORD_ENTRY_SIZE: usize = 40;
 
 pub fn encode_record(rows: &[(Pubkey, u64)]) -> Vec<u8> {
@@ -66,6 +91,8 @@ pub fn decode_record(bytes: &[u8]) -> Option<Vec<(Pubkey, u64)>> {
     Some(rows)
 }
 
+/// A tracked holder's amount stamped with the (slot, write_version) that set it,
+/// so stale out-of-order updates never clobber newer state.
 #[derive(Clone, Copy)]
 struct Entry {
     amount: u64,
@@ -73,6 +100,8 @@ struct Entry {
     write_version: u64,
 }
 
+/// One mint's (or sentinel's) live top-N holder set, with the bookkeeping needed
+/// to know when the set is no longer provably correct (`dropped_floor` / `stale`).
 #[derive(Default)]
 struct MintTop {
     entries: HashMap<Pubkey, Entry>,
@@ -81,6 +110,8 @@ struct MintTop {
     last_record: Vec<(Pubkey, u64)>,
 }
 
+/// Result of extracting a mint's persisted top-N: `Sound` rows safe to serve, or
+/// `Unsound` when evictions mean the true top-N can no longer be proven.
 enum ComputedTop {
     Sound(Vec<(Pubkey, u64)>),
     Unsound,
@@ -123,6 +154,8 @@ impl MintTop {
     }
 }
 
+/// Tracker lifecycle: `Bootstrapping` while snapshot seeds are still merging,
+/// `Live` once records may be emitted.
 #[derive(Clone, Copy, Default, PartialEq)]
 enum Status {
     #[default]
@@ -130,6 +163,8 @@ enum Status {
     Live,
 }
 
+/// All mutable tracker state behind the mutex: per-mint tops, the reverse
+/// holder→mint index, and the bootstrap-only tombstones and seed reservoir.
 #[derive(Default)]
 struct TrackerState {
     status: Status,
@@ -300,6 +335,8 @@ pub struct SeedAccount {
     pub write_version: u64,
 }
 
+/// Per-snapshot-file accumulator of candidate holders and observed closes, built
+/// without locking and merged into the tracker while it is still bootstrapping.
 pub struct LargestAccountsSeed {
     k: usize,
     mints: HashMap<Pubkey, Vec<SeedAccount>>,
@@ -330,6 +367,8 @@ impl LargestAccountsSeed {
     }
 }
 
+/// The tracker's shared innards: the immutable configuration (tracked mints,
+/// top size) plus the mutex-guarded state.
 struct Shared {
     tracked_mints: HashSet<Pubkey>,
     k_per_mint: usize,
@@ -344,6 +383,9 @@ impl Shared {
     }
 }
 
+/// Cheap-clone handle to the largest-accounts tracker shared by the ingest and
+/// snapshot paths. The default (`None`) means the feature is disabled and every
+/// operation is a no-op.
 #[derive(Clone, Default)]
 pub struct LargestAccountsTracker(Option<Arc<Shared>>);
 
