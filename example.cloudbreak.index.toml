@@ -74,6 +74,21 @@ accounts-per-mint = 100
 prune-interval-slots = 20
 # Mint addresses to track for getTokenLargestAccounts
 tracked-mints = []
+# Real example — the highest-holder mints (getLargestAccounts' SOL / circulating /
+# non-circulating tops are always maintained when enabled; these only add
+# getTokenLargestAccounts for the listed mints):
+# tracked-mints = [
+#     "kinXdEcpDQeHPEuQnqmUgtYykqKGVFq6CeVX5iAHJq6",  # KIN
+#     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+#     "So11111111111111111111111111111111111111112",  # wSOL
+#     "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+#     "CKaKtYvz6dKPyMvYq9Rh3UBrnNqYZAyd7iF4hJtjUvks",
+#     "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
+#     "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
+#     "2zMMhcVQEXDtdE6vsFS7S7D5oUodfJHE8vd1gnBouauv",
+#     "6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN",  # TRUMP
+#     "7atgF8KQo4wJrD5ATGX7t1V2zVvykPJbFfNeVf1icFv1",
+# ]
 
 # When set, the indexer runs in consistency-check mode: it indexes until the
 # limit is reached, compares its computed LtHash against the snapshot's, and
