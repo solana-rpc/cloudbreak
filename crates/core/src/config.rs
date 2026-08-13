@@ -734,17 +734,29 @@ pub enum PriorityMode {
     /// cost-per-hit (and needs no rate roll).
     Weighted {
         /// Weight on demand (request count in the window). Default `0.0`.
-        #[serde(rename = "demand-weight", default)]
+        #[serde(
+            rename = "demand-weight",
+            default,
+            deserialize_with = "deserialize_nonneg_finite_f64"
+        )]
         demand_weight: f64,
         /// Weight on supply (`idx_scan` in the window, halved via
         /// `SCANS_PER_REQUEST` so it is comparable to demand). Only contributes
         /// for created indexes — candidates have no supply yet. Default `0.0`.
-        #[serde(rename = "supply-weight", default)]
+        #[serde(
+            rename = "supply-weight",
+            default,
+            deserialize_with = "deserialize_nonneg_finite_f64"
+        )]
         supply_weight: f64,
         /// Weight on failed/timed-out requests in the window, to prioritize
         /// patterns that currently *cannot* be served without an index.
         /// Default `0.0`.
-        #[serde(rename = "failure-weight", default)]
+        #[serde(
+            rename = "failure-weight",
+            default,
+            deserialize_with = "deserialize_nonneg_finite_f64"
+        )]
         failure_weight: f64,
         /// Weight on the measured latency **gain** from the index — the ratio of
         /// the (compensated) without-index average cost to the with-index
@@ -756,7 +768,11 @@ pub enum PriorityMode {
         /// regression guard applies it too). Stays neutral (`gain = 1`) until the
         /// pattern has served requests both with and without the index (so a
         /// ratio can be formed), or when the weight is `0`. Default `0.0`.
-        #[serde(rename = "latency-weight", default)]
+        #[serde(
+            rename = "latency-weight",
+            default,
+            deserialize_with = "deserialize_nonneg_finite_f64"
+        )]
         latency_weight: f64,
         /// Window over which the demand/supply/failure counts are measured. A
         /// background task snapshots the counters at this cadence and stores the
@@ -1051,7 +1067,8 @@ pub struct QueryTrackerConfig {
     /// a no-op — the raw wall-clock averages are compared as-is.
     #[serde(
         rename = "without-index-compensation-factor",
-        default = "QueryTrackerConfig::default_without_index_compensation_factor"
+        default = "QueryTrackerConfig::default_without_index_compensation_factor",
+        deserialize_with = "deserialize_pos_finite_f64"
     )]
     pub without_index_compensation_factor: f64,
 
@@ -1476,6 +1493,39 @@ where
     })
 }
 
+/// Validate a `weighted` priority weight: it must be finite and non-negative.
+/// The weights are Display-formatted into the score SQL, so a non-finite value
+/// (`inf`/`nan`) becomes a bare token Postgres reads as an unknown column and
+/// fails every create/evict pass; a negative weight silently inverts the ranking.
+fn deserialize_nonneg_finite_f64<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = f64::deserialize(deserializer)?;
+    if !value.is_finite() || value < 0.0 {
+        return Err(serde::de::Error::custom(format!(
+            "a `weighted` priority weight must be finite and non-negative, got {value}"
+        )));
+    }
+    Ok(value)
+}
+
+/// Validate `without-index-compensation-factor`: finite and strictly positive.
+/// It multiplies the without-index cost, so `0` or negative breaks the latency
+/// gain comparison and the regression guard.
+fn deserialize_pos_finite_f64<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = f64::deserialize(deserializer)?;
+    if !value.is_finite() || value <= 0.0 {
+        return Err(serde::de::Error::custom(format!(
+            "`without-index-compensation-factor` must be finite and positive, got {value}"
+        )));
+    }
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1500,5 +1550,37 @@ mod tests {
         assert_eq!(c.index_eviction_interval, Duration::from_secs(3600));
         // Neutral value guard by default: candidate and incumbent scores compared as-is.
         assert_eq!(c.value_guard_creation_bias, 1.0);
+    }
+
+    // A non-finite weight would be formatted into the score SQL as a bare `inf`/`NaN`
+    // token and error every scoring pass; a negative weight inverts the ranking. Both
+    // must be rejected at load, not at runtime.
+    #[test]
+    fn weighted_weights_must_be_finite_and_nonneg() {
+        let base = "indexer-metrics = \"http://localhost:9100/metrics\"\n";
+        let load = |pm: &str| {
+            from_str::<QueryTrackerConfig>(&format!(
+                "{base}priority-mode = {{ weighted = {{ {pm} }} }}"
+            ))
+        };
+        assert!(load("demand-weight = 1.0").is_ok());
+        assert!(load("demand-weight = -1.0").is_err());
+        assert!(load("latency-weight = inf").is_err());
+        assert!(load("supply-weight = nan").is_err());
+    }
+
+    // The compensation factor multiplies the without-index cost, so it must be finite
+    // and strictly positive.
+    #[test]
+    fn compensation_factor_must_be_finite_and_positive() {
+        let base = "indexer-metrics = \"http://localhost:9100/metrics\"\n";
+        let load = |value: &str| {
+            from_str::<QueryTrackerConfig>(&format!(
+                "{base}without-index-compensation-factor = {value}"
+            ))
+        };
+        assert!(load("1.5").is_ok());
+        assert!(load("0.0").is_err());
+        assert!(load("-1.0").is_err());
     }
 }

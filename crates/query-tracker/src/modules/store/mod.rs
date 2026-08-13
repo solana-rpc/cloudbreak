@@ -23,9 +23,7 @@ use crate::stats::variety::VarietySketch;
 use cloudbreak_core::PriorityMode;
 use cloudbreak_core::modules::index_identity::IndexIdentity;
 use patterns::{PatternRow, offsets_from_json, offsets_to_json, status};
-use sea_orm::{
-    ConnectionTrait, DatabaseConnection, DbErr, QueryResult, Statement, TransactionTrait, Value,
-};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbErr, QueryResult, Statement, Value};
 use std::collections::HashSet;
 
 /// Columns selected into a [`PatternRow`]; kept in one place so every read
@@ -142,10 +140,13 @@ impl Store {
     /// Fold one aggregated observation into the pattern's row: bump demand,
     /// cost and failure counters, refresh `last_demand_at`, resurrect an evicted
     /// pattern back to `candidate`, and merge value fingerprints into the
-    /// variety sketch. Runs in a transaction so the sketch read-modify-write is
-    /// consistent under concurrent `/track` requests.
-    pub async fn record_demand(
+    /// variety sketch. Runs against the caller's `conn`, which owns the
+    /// transaction, so the sketch read-modify-write stays consistent under
+    /// concurrent `/track` requests.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_demand<C: ConnectionTrait>(
         &self,
+        conn: &C,
         identity: &IndexIdentity,
         count: u32,
         cost_us: u64,
@@ -153,10 +154,8 @@ impl Store {
         fingerprints: &HashSet<u64>,
         example_request: Option<serde_json::Value>,
     ) -> Result<(), DbErr> {
-        let backend = self.db.get_database_backend();
+        let backend = conn.get_database_backend();
         let pattern_id = identity.pattern_id();
-
-        let txn = self.db.begin().await?;
 
         // New rows are always `candidate` (no index yet), so their first cost
         // goes to the without-index bucket. On update we route by the row's
@@ -203,7 +202,7 @@ impl Store {
             ],
         );
 
-        let existing_hll: Option<Vec<u8>> = txn
+        let existing_hll: Option<Vec<u8>> = conn
             .query_one(insert)
             .await?
             .and_then(|row| row.try_get::<Option<Vec<u8>>>("", "variety_hll").ok())
@@ -214,7 +213,7 @@ impl Store {
             sketch.insert_many(fingerprints.iter().copied());
             let hll_bytes = sketch.to_bytes();
             let estimate = sketch.estimate() as i64;
-            txn.execute(Statement::from_sql_and_values(
+            conn.execute(Statement::from_sql_and_values(
                 backend,
                 "UPDATE index_patterns SET variety_hll = $2, variety_estimate = $3 \
                  WHERE pattern_id = $1",
@@ -223,7 +222,7 @@ impl Store {
             .await?;
         }
 
-        txn.commit().await
+        Ok(())
     }
 
     // ---- creation ---------------------------------------------------------
