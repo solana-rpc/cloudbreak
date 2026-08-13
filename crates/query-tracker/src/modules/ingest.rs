@@ -19,15 +19,15 @@ use crate::modules::store::Store;
 use crate::stats::metrics;
 use cloudbreak_core::modules::index_identity::IndexIdentity;
 use cloudbreak_core::modules::query_tracker_api::{TrackBatch, TrackResponse};
-use sea_orm::DbErr;
+use sea_orm::{DbErr, TransactionTrait};
 use solana_pubkey::Pubkey;
 use std::str::FromStr;
 use tracing::error;
 
 pub async fn apply_batch(store: &Store, batch: TrackBatch) -> Result<TrackResponse, DbErr> {
-    let mut accepted = 0usize;
     let mut skipped = 0usize;
 
+    let mut resolved = Vec::with_capacity(batch.observations.len());
     for obs in batch.observations {
         let program = match Pubkey::from_str(&obs.program) {
             Ok(p) => p,
@@ -55,19 +55,35 @@ pub async fn apply_batch(store: &Store, batch: TrackBatch) -> Result<TrackRespon
             .as_ref()
             .and_then(|c| serde_json::to_value(c).ok());
 
+        resolved.push((
+            identity,
+            obs.count,
+            obs.total_cost_us,
+            obs.failed_count,
+            obs.value_fingerprints,
+            example_request,
+        ));
+    }
+
+    resolved.sort_by_cached_key(|(identity, ..)| identity.pattern_id());
+
+    let accepted = resolved.len();
+
+    let txn = store.db().begin().await?;
+    for (identity, count, cost_us, failed, fingerprints, example_request) in resolved {
         store
             .record_demand(
+                &txn,
                 &identity,
-                obs.count,
-                obs.total_cost_us,
-                obs.failed_count,
-                &obs.value_fingerprints,
+                count,
+                cost_us,
+                failed,
+                &fingerprints,
                 example_request,
             )
             .await?;
-
-        accepted += 1;
     }
+    txn.commit().await?;
 
     metrics::OBSERVATIONS_TOTAL.inc_by(accepted as u64);
     Ok(TrackResponse { accepted, skipped })
