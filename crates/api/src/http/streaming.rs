@@ -18,6 +18,7 @@
 
 use std::convert::Infallible;
 use std::ops::Range;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_stream::stream;
@@ -32,6 +33,7 @@ use solana_rpc_client_api::response::RpcResponseContext;
 use tokio::time::Instant;
 
 use crate::error::RpcError;
+use crate::http::RequestContext;
 use crate::methods::program::{GpaStreamingResponse, encoding_to_string};
 use crate::metrics;
 use crate::modules::cache::MaybeJsonAccount;
@@ -52,7 +54,7 @@ pub async fn gpa_streaming_response_body(
     id: serde_json::Value,
     gpa_response: GpaStreamingResponse,
     gpa_global_start_time: Instant,
-    subscription_id: String,
+    ctx: Arc<RequestContext>,
 ) -> Result<UnsyncBoxBody<Bytes, Infallible>, RpcError> {
     let _guard = metrics::InFlightRequestGuard::new("gpa_streaming");
     let mut accounts_stream = gpa_response.accounts_stream;
@@ -78,6 +80,9 @@ pub async fn gpa_streaming_response_body(
             "json_encoding",
             program = %program,
             encoding = encoding_to_string(&encoding),
+            request_id = %ctx.request_id,
+            subscription_id = %ctx.subscription_id,
+            client_ip = %ctx.client_ip,
             accounts = tracing::field::Empty,
             wall_time = tracing::field::Empty,
             json_bytes = tracing::field::Empty,
@@ -208,11 +213,11 @@ pub async fn gpa_streaming_response_body(
         if let Some(metrics_data) = metrics_data {
             metrics_data.record_metrics(
                 json_encode_ms.as_millis() as f64,
-                gpa_global_start_time.elapsed().as_millis() as f64,
+                gpa_global_start_time.elapsed(),
                 json_bytes,
                 total_cache_bytes,
                 cache_hit_percent,
-                subscription_id,
+                &ctx.subscription_id,
             );
         }
 

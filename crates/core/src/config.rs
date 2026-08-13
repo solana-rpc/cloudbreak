@@ -548,14 +548,22 @@ pub struct MetricsConfig {
     )]
     pub subscription_id_key: String,
 
+    /// Request header carrying the caller's request ID.
+    #[serde(
+        rename = "request-id-key",
+        default = "MetricsConfig::default_request_id_key"
+    )]
+    pub request_id_key: String,
+
     /// Enable the per-client-IP egress bandwidth metrics module (peak gauge +
     /// throughput histogram). Off by default.
     #[serde(rename = "client-ip-bandwidth-enabled", default)]
     pub client_ip_bandwidth_enabled: bool,
 
-    /// Request header carrying the client IP used to group the per-client-IP
-    /// bandwidth metrics. When unset — or when the header is absent on a
-    /// request — all bandwidth folds into a single placeholder label.
+    /// Request header carrying the client IP, used to group the per-client-IP
+    /// bandwidth metrics and recorded as a trace span field. When unset — or
+    /// when the header is absent on a request — all bandwidth folds into a
+    /// single placeholder label and the span field reports that placeholder.
     #[serde(rename = "client-ip-key", default)]
     pub client_ip_key: Option<String>,
 }
@@ -563,6 +571,10 @@ pub struct MetricsConfig {
 impl MetricsConfig {
     fn default_subscription_id_key() -> String {
         "x-subscription-id".to_string()
+    }
+
+    fn default_request_id_key() -> String {
+        "x-request-id".to_string()
     }
 }
 

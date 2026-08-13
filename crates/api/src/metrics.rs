@@ -3,17 +3,18 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+use cloudbreak_core::ApiConfig;
 use hyper::StatusCode;
 use prometheus::{
     HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
 };
+use sea_orm::DatabaseConnection;
 use std::{
     convert::Infallible,
     sync::{Arc, Mutex, Once},
+    time::Duration,
 };
-use sea_orm::DatabaseConnection;
 use tracing::error;
-use cloudbreak_core::ApiConfig;
 
 use crate::http::server::HttpHandlerResponse;
 
@@ -86,6 +87,16 @@ lazy_static::lazy_static! {
         Opts::new(
             "cloudbreak_api_data_fetched_by_subscription_id",
             "Amount of data fetched by subscription ID in bytes."
+        ),
+        &["subscription_id_key"]
+    )
+    .unwrap();
+
+    /// Cumulative request handling time by subscription ID, in microseconds.
+    pub static ref CLOUDBREAK_API_DURATION_US_BY_SUBSCRIPTION_ID: IntCounterVec = IntCounterVec::new(
+        Opts::new(
+            "cloudbreak_api_duration_us_by_subscription_id",
+            "Cumulative request handling time by subscription ID in microseconds (divide by 1000 for milliseconds)."
         ),
         &["subscription_id_key"]
     )
@@ -222,6 +233,7 @@ pub fn setup_metrics(config: &ApiConfig) -> anyhow::Result<()> {
         register!(CLOUDBREAK_API_RESPONSE_BYTES_TOTAL);
         register!(CLOUDBREAK_API_DATA_FETCHED_BY_SUBSCRIPTION_ID);
         register!(CLOUDBREAK_API_REQUESTS_BY_SUBSCRIPTION_ID);
+        register!(CLOUDBREAK_API_DURATION_US_BY_SUBSCRIPTION_ID);
         register!(CLOUDBREAK_API_INFLIGHT_REQUESTS);
         register!(CLOUDBREAK_API_BATCH_REQUESTS);
         register!(CLOUDBREAK_API_DB_POOL_CONNECTIONS);
@@ -277,11 +289,11 @@ impl GpaMetricsData {
     pub fn record_metrics(
         &self,
         json_enconde_time: f64,
-        total_time: f64,
+        total_time: Duration,
         json_bytes: u64,
         cache_bytes: u64,
         cache_hit_percent: f64,
-        subscription_id: String,
+        subscription_id: &str,
     ) {
         let bytes_bucket = bytes_bucket(json_bytes);
         let label = &self.label;
@@ -304,7 +316,7 @@ impl GpaMetricsData {
 
         CLOUDBREAK_API_REQUEST_DURATION_MS
             .with_label_values(&[label.as_str(), bytes_bucket])
-            .observe(total_time);
+            .observe(total_time.as_millis() as f64);
 
         CLOUDBREAK_API_CACHE_HIT_PERCENT
             .with_label_values(&[label.as_str(), bytes_bucket])
@@ -319,12 +331,16 @@ impl GpaMetricsData {
             .inc_by(cache_bytes);
 
         CLOUDBREAK_API_REQUESTS_BY_SUBSCRIPTION_ID
-            .with_label_values(&[&subscription_id])
+            .with_label_values(&[subscription_id])
             .inc();
 
         CLOUDBREAK_API_DATA_FETCHED_BY_SUBSCRIPTION_ID
-            .with_label_values(&[&subscription_id])
+            .with_label_values(&[subscription_id])
             .inc_by(json_bytes);
+
+        CLOUDBREAK_API_DURATION_US_BY_SUBSCRIPTION_ID
+            .with_label_values(&[subscription_id])
+            .inc_by(total_time.as_micros() as u64);
     }
 }
 

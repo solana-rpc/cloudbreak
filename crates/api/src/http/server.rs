@@ -29,31 +29,22 @@ use tokio::net::TcpListener;
 use tracing::Instrument;
 use tracing::{error, info};
 
-use crate::http::CloudbreakRpcState;
 use crate::http::operational_endpoints;
 use crate::http::rpc;
+use crate::http::{CloudbreakRpcState, HeaderKeys, RequestContext};
 use crate::metrics;
 use crate::modules::bandwidth;
 
 pub struct HttpServer {
     state: Arc<CloudbreakRpcState>,
-    subscription_id_key: String,
-    /// Header carrying the client IP for the (optional) per-client-IP bandwidth
-    /// metrics. `None` means "not configured" — all bandwidth is attributed to
-    /// a single placeholder label rather than reading any request header.
-    client_ip_key: Option<String>,
+    header_keys: Arc<HeaderKeys>,
 }
 
 impl HttpServer {
-    pub fn new(
-        state: CloudbreakRpcState,
-        subscription_id_key: String,
-        client_ip_key: Option<String>,
-    ) -> Self {
+    pub fn new(state: CloudbreakRpcState, header_keys: HeaderKeys) -> Self {
         Self {
             state: Arc::new(state),
-            subscription_id_key,
-            client_ip_key,
+            header_keys: Arc::new(header_keys),
         }
     }
 
@@ -62,16 +53,14 @@ impl HttpServer {
         info!("HTTP server listening on http://{}", addr);
 
         let state = self.state;
-        let subscription_id_key = self.subscription_id_key;
-        let client_ip_key = self.client_ip_key;
+        let header_keys = self.header_keys;
 
         loop {
             let (stream, _remote_addr) = listener.accept().await?;
 
             let io = TokioIo::new(stream);
             let state = state.clone();
-            let subscription_id_key = subscription_id_key.clone();
-            let client_ip_key = client_ip_key.clone();
+            let header_keys = header_keys.clone();
 
             tokio::spawn(async move {
                 let start_time = Instant::now();
@@ -81,15 +70,11 @@ impl HttpServer {
 
                 let service = service_fn(move |req: Request<Incoming>| {
                     let state = state.clone();
-                    let subscription_id_key = subscription_id_key.clone();
-                    let client_ip_key = client_ip_key.clone();
+                    let header_keys = header_keys.clone();
 
                     *requests_in_connection.lock().unwrap() += 1;
 
-                    async move {
-                        handle_request(req, state, subscription_id_key.clone(), client_ip_key)
-                            .await
-                    }
+                    async move { handle_request(req, state, header_keys).await }
                 });
 
                 let connection_span = tracing::info_span!(
@@ -124,38 +109,25 @@ impl HttpServer {
 async fn handle_request(
     req: Request<Incoming>,
     state: Arc<CloudbreakRpcState>,
-    subscription_id_key: String,
-    client_ip_key: Option<String>,
+    header_keys: Arc<HeaderKeys>,
 ) -> Result<Response<UnsyncBoxBody<Bytes, Infallible>>, Infallible> {
     let request_start = Instant::now();
     let inflight_guard = metrics::InFlightRequestGuard::new("http");
     let request_timeout = state.request_timeout;
 
-    // Extract subscription ID from headers
-    let subscription_id = req
-        .headers()
-        .get(subscription_id_key)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown-subscription-id")
-        .to_string();
+    let ctx = Arc::new(RequestContext::from_headers(req.headers(), &header_keys));
 
     // Resolve the per-client-IP bandwidth handle once per request; the transport
     // path is then a lock-free atomic add per frame. `None` when the module is
-    // disabled. When `client-ip-key` is unset — or the header is absent — bytes
-    // fold into a single placeholder label rather than reading any
-    // client-settable/PII header value.
+    // disabled.
     let bw = if bandwidth::is_enabled() {
-        let label = client_ip_key
-            .as_deref()
-            .and_then(|key| req.headers().get(key).and_then(|v| v.to_str().ok()))
-            .unwrap_or(bandwidth::UNCONFIGURED_CLIENT_IP);
-        bandwidth::handle_for(label)
+        bandwidth::handle_for(&ctx.client_ip)
     } else {
         None
     };
 
     let handler_response = match (req.method(), req.uri().path()) {
-        (&Method::POST, "/") => rpc::handle_rpc_request(req, state, &subscription_id).await,
+        (&Method::POST, "/") => rpc::handle_rpc_request(req, state, &ctx).await,
         (&Method::GET, "/metrics") => metrics::metrics_handler(&state.database)?,
         (&Method::GET, "/debug/log_filter") => operational_endpoints::log_filter_handler(&req)?,
         (&Method::GET, "/debug/modules/gpa_cache") => {

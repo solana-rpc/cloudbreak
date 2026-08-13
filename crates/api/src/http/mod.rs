@@ -5,6 +5,7 @@
 
 use crate::http::server::HttpHandlerResponse;
 use crate::http::server::ResponseBody;
+use crate::modules::bandwidth;
 use crate::modules::cache::GpaProcessor;
 use crate::modules::vote_accounts_cache::SharedStakesSnapshot;
 use crate::error::RpcError;
@@ -32,6 +33,62 @@ pub mod operational_endpoints;
 pub mod rpc;
 pub mod server;
 pub mod streaming;
+
+/// Label used when the subscription-ID header is absent from a request.
+pub const UNKNOWN_SUBSCRIPTION_ID: &str = "unknown-subscription-id";
+
+/// Span field value used when the request-ID header is absent from a request.
+pub const UNKNOWN_REQUEST_ID: &str = "unknown-request-id";
+
+/// Names of the request headers carrying the [`RequestContext`] values, taken
+/// from the `[metrics]` config section.
+pub struct HeaderKeys {
+    pub subscription_id: String,
+    pub request_id: String,
+    /// `None` means "not configured": no header is read and the client IP folds
+    /// into a single placeholder instead of a client-settable/PII value.
+    pub client_ip: Option<String>,
+}
+
+/// Per-request identity read once from the request headers and threaded through
+/// the handler chain, where it feeds trace span fields and the per-subscription
+/// metrics.
+///
+/// Only `subscription_id` is ever used as a metric label — `request_id` and
+/// `client_ip` are unbounded (and the latter is PII), so they stay confined to
+/// span fields.
+///
+/// The fields are `Arc<str>` because the whole context is shared: a batch
+/// request fans out one clone per entry and a streaming response holds onto it
+/// past the end of the handler.
+pub struct RequestContext {
+    pub subscription_id: Arc<str>,
+    pub request_id: Arc<str>,
+    pub client_ip: Arc<str>,
+}
+
+impl RequestContext {
+    pub fn from_headers(headers: &hyper::HeaderMap, keys: &HeaderKeys) -> Self {
+        let read = |key: &str, fallback: &str| -> Arc<str> {
+            headers
+                .get(key)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or(fallback)
+                .into()
+        };
+
+        Self {
+            subscription_id: read(&keys.subscription_id, UNKNOWN_SUBSCRIPTION_ID),
+            request_id: read(&keys.request_id, UNKNOWN_REQUEST_ID),
+            // Unset `client-ip-key`: don't look at any header, everything folds
+            // into the same placeholder the bandwidth module uses.
+            client_ip: match &keys.client_ip {
+                Some(key) => read(key, bandwidth::UNCONFIGURED_CLIENT_IP),
+                None => bandwidth::UNCONFIGURED_CLIENT_IP.into(),
+            },
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct CloudbreakRpcState {

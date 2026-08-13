@@ -10,7 +10,7 @@ use std::time::Duration;
 use cloudbreak_core::{ApiConfig, EnvironmentInfo, TryLoadConfig};
 
 use crate::{
-    http::CloudbreakRpcState,
+    http::{CloudbreakRpcState, HeaderKeys},
     metrics::setup_metrics,
     modules::{cache::GpaProcessor, vote_accounts_cache},
     query_tracker_client::QueryTrackerClient,
@@ -64,8 +64,11 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
         }
     };
 
-    let subscription_id_key = config.metrics.subscription_id_key.clone();
-    let client_ip_key = config.metrics.client_ip_key.clone();
+    let header_keys = HeaderKeys {
+        subscription_id: config.metrics.subscription_id_key.clone(),
+        request_id: config.metrics.request_id_key.clone(),
+        client_ip: config.metrics.client_ip_key.clone(),
+    };
 
     let (mut slot_syncronizer_handle, slot_syncronizer_data) =
         match slot_syncronizer::start_slot_syncronizer(database.clone(), &config) {
@@ -145,7 +148,7 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
 
     info!("Server is starting...");
 
-    let server = http::server::HttpServer::new(state, subscription_id_key, client_ip_key);
+    let server = http::server::HttpServer::new(state, header_keys);
 
     tokio::select! {
         result = server.run(config.server_addr()) => { match result {
