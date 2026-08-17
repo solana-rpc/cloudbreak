@@ -29,6 +29,7 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 solana-lattice-hash = { workspace = true }
 solana-accounts-db = { workspace = true }
+agave-fs = { workspace = true }
 solana-pubkey = { workspace = true }
 blake3 = { workspace = true }
 hex = { workspace = true }

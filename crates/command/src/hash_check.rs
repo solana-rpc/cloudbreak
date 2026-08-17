@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use sea_orm::{ConnectOptions, ConnectionTrait, Database, DbBackend, Statement};
 use serde::Deserialize;
+use agave_fs::FileInfo;
 use solana_accounts_db::accounts_file::AccountsFile;
 use solana_pubkey::Pubkey;
 use std::{
@@ -299,9 +300,8 @@ fn scan_to_prefix_files(
         }
 
         let af = AccountsFile::new_for_startup(
-            &file_data.path,
-            file_data.size,
-            solana_accounts_db::accounts_file::StorageAccess::default(),
+            FileInfo::new_from_path(&file_data.path)
+                .map_err(|e| anyhow::anyhow!("{:?}: {:?}", file_data.path, e))?,
         )
         .map_err(|e| anyhow::anyhow!("{:?}: {:?}", file_data.path, e))?;
 

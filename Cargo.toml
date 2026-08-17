@@ -35,26 +35,28 @@ yellowstone-grpc-client = { version = "9" }
 anyhow = "1.0.97"
 thiserror = "2.0.12"
 async-trait = "0.1.88"
-solana-account = "3.0.0"
-solana-pubkey = "4.0.0"
-solana-program = "3.0.0"
-solana-runtime = "3.1.5"
-solana-accounts-db = "3.1.5"
-solana-hash = "4.0.1"
-solana-hard-forks = "3.0.0"
-solana-fee-calculator = "3.0.0"
+solana-account = "4.3.1"
+solana-pubkey = "4.2.0"
+solana-program = "4.0.0"
+solana-runtime = { version = "4.2.1", features = ["agave-unstable-api"] }
+solana-accounts-db = { version = "4.2.1", features = ["agave-unstable-api"] }
+agave-fs = { version = "4.2.1", features = ["agave-unstable-api"] }
+solana-hash = "4.4.0"
+solana-hard-forks = "3.1.1"
+solana-fee-calculator = "3.2.2"
 solana-rent-collector = "2.3.0"
-solana-epoch-schedule = "3.0.0"
-solana-inflation = "3.0.0"
-solana-stake-interface = "2.0.2"
+solana-epoch-schedule = "3.2.0"
+solana-inflation = "3.1.1"
+solana-stake-interface = "4.3.0"
 solana-serde = "3.0.0"
-solana-rpc-client-api = "3.1.5"
-solana-account-decoder-client-types = "3.1.5"
-solana-account-decoder = "3.1.5"
-solana-vote-interface = { version = "4.0.4", default-features = false, features = ["bincode", "serde"] }
-solana-commitment-config = "3.1.0"
-solana-client = "3.1.5"
-solana-nonce-account = "3.0"
+solana-rpc-client-api = "4.2.1"
+solana-account-decoder-client-types = { version = "4.2.1", features = ["agave-unstable-api"] }
+solana-account-decoder = { version = "4.2.1", features = ["agave-unstable-api"] }
+solana-vote-interface = { version = "6.0.2", default-features = false, features = ["bincode", "serde"] }
+solana-vote = { version = "4.2.1", features = ["agave-unstable-api"] }
+solana-commitment-config = "3.1.1"
+solana-client = "4.2.1"
+solana-nonce-account = "4.1.0"
 futures = "0.3.31"
 rust_decimal = "1.37.1"
 pin-project = "1.1.10"
@@ -67,34 +69,34 @@ prometheus = { version = "0.14.0", features = ["push"] }
 reqwest = "0.12"
 tower = "0.5.2"
 bs58 = "0.5.1"
-solana-lattice-hash = "3.1.5"
-solana-svm = { version = "4.0.0", features = ["agave-unstable-api"] }
-solana-svm-callback = { version = "=4.0.0", features = ["agave-unstable-api"] }
-agave-precompiles = { version = "4.0.0", features = ["agave-unstable-api"] }
-solana-program-runtime = { version = "4.0.0", features = ["agave-unstable-api"] }
-agave-syscalls = { version = "4.0.0", features = ["agave-unstable-api"] }
-solana-builtins = { version = "4.0.0", features = ["agave-unstable-api"] }
-solana-bpf-loader-program = "4.0.0"
-agave-feature-set = { version = "=4.0.0", features = ["agave-unstable-api"] }
-agave-reserved-account-keys = { version = "=4.0.0", features = ["agave-unstable-api"] }
-solana-compute-budget = { version = "4.0.0", features = ["agave-unstable-api"] }
-solana-compute-budget-instruction = { version = "4.0.0", features = ["agave-unstable-api"] }
-solana-svm-feature-set = "=4.0.0"
-solana-svm-transaction = "=4.0.0"
-solana-transaction = { version = "3.1", features = ["bincode", "blake3", "verify", "serde"] }
-solana-message = "3.1"
-solana-address-lookup-table-interface = { version = "3.0", features = ["bincode", "bytemuck"] }
-solana-loader-v3-interface = { version = "6.1", features = ["serde"] }
+solana-lattice-hash = { version = "4.2.1", features = ["agave-unstable-api"] }
+solana-svm = { version = "4.2.1", features = ["agave-unstable-api"] }
+solana-svm-callback = { version = "=4.2.1", features = ["agave-unstable-api"] }
+agave-precompiles = { version = "4.2.1", features = ["agave-unstable-api"] }
+solana-program-runtime = { version = "4.2.1", features = ["agave-unstable-api"] }
+solana-syscalls = { version = "4.2.1", default-features = false, features = ["agave-unstable-api"] }
+solana-builtins = { version = "4.2.1", features = ["agave-unstable-api"] }
+solana-bpf-loader-program = { version = "4.2.1", features = ["agave-unstable-api"] }
+agave-feature-set = { version = "=4.2.1", features = ["agave-unstable-api"] }
+agave-reserved-account-keys = { version = "=4.2.1", features = ["agave-unstable-api"] }
+solana-compute-budget = { version = "4.2.1", features = ["agave-unstable-api"] }
+solana-compute-budget-instruction = { version = "4.2.1", features = ["agave-unstable-api"] }
+solana-svm-feature-set = "=4.2.1"
+solana-svm-transaction = "=4.2.0"
+solana-transaction = { version = "4.1.4", features = ["blake3", "verify", "serde"] }
+solana-message = "4.2.3"
+solana-address-lookup-table-interface = { version = "3.1", features = ["bincode", "bytemuck"] }
+solana-loader-v3-interface = { version = "7.0", features = ["serde"] }
 solana-sdk-ids = "3.1"
-solana-clock = "3.0"
+solana-clock = "3.0.1"
 solana-fee-structure = "3.0"
-solana-rent = "3.0"
-solana-transaction-error = "3.1"
+solana-rent = "4.2.1"
+solana-transaction-error = "3.3.1"
 solana-precompile-error = "3.0"
-solana-transaction-status-client-types = "3.1.5"
-spl-token-2022 = "10.0.0"
-spl-token-2022-interface = "2.1.0"
-spl-token-interface = "2.0.0"
+solana-transaction-status-client-types = { version = "4.2.1", features = ["agave-unstable-api"] }
+spl-token-2022 = "11.0.0"
+spl-token-2022-interface = "3.1.0"
+spl-token-interface = "3.0.0"
 bincode = "1.3"
 blake3 = "1"
 tracing-opentelemetry = "0.32.0"

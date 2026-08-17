@@ -4,7 +4,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use agave_feature_set::{FEATURE_NAMES, FeatureSet};
-use agave_syscalls::create_program_runtime_environment_v1;
+use solana_syscalls::create_program_runtime_environment;
 use base64::Engine as _;
 use rust_decimal::prelude::ToPrimitive;
 use sea_orm::sqlx::{self, Row};
@@ -25,8 +25,9 @@ use solana_program_runtime::execution_budget::{
     SVMTransactionExecutionBudget, SVMTransactionExecutionCost,
 };
 use solana_program_runtime::loaded_programs::{
-    BlockRelation, ForkGraph, ProgramCacheEntry, ProgramRuntimeEnvironments,
+    BlockRelation, ForkGraph, ProgramRuntimeEnvironments,
 };
+use solana_program_runtime::program_cache_entry::ProgramCacheEntry;
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::config::RpcSimulateTransactionConfig;
 use solana_rpc_client_api::response::{
@@ -144,7 +145,8 @@ pub async fn simulate_transaction(
 
     let address_table_lookups: Vec<MessageAddressTableLookup> = match &versioned_tx.message {
         VersionedMessage::V0(m) => m.address_table_lookups.clone(),
-        VersionedMessage::Legacy(_) => Vec::new(),
+        // v1 resolves addresses inline rather than through lookup tables.
+        VersionedMessage::Legacy(_) | VersionedMessage::V1(_) => Vec::new(),
     };
     let table_keys: Vec<Pubkey> = address_table_lookups.iter().map(|l| l.account_key).collect();
     let tables = fetch_lookup_tables(state, slot, &table_keys).await?;
@@ -583,7 +585,12 @@ fn map_result(
             Some(Vec::new()),
             none_accounts,
             Some(0),
-            Some(fees.rollback_accounts.data_size() as u32),
+            Some(
+                fees.rollback_accounts
+                    .iter()
+                    .map(|(_, account)| account.data().len())
+                    .sum::<usize>() as u32,
+            ),
             Some(fees.fee_details.total_fee()),
             None,
             None,
@@ -956,10 +963,8 @@ fn execute(
 ) -> Result<LoadAndExecuteSanitizedTransactionsOutput, RpcError> {
     let svm_feature_set = feature_set.runtime_features();
     let simd_0268 = feature_set.is_active(&agave_feature_set::raise_cpi_nesting_limit_to_8::id());
-    let simd_0339 =
-        feature_set.is_active(&agave_feature_set::increase_cpi_account_info_limit::id());
 
-    let program_runtime_v1 = create_program_runtime_environment_v1(
+    let program_runtime_env = create_program_runtime_environment(
         &svm_feature_set,
         &SVMTransactionExecutionBudget::new_with_defaults(simd_0268),
         false,
@@ -973,22 +978,19 @@ fn execute(
     let fork_graph = Arc::new(RwLock::new(SimulationForkGraph));
     let mut processor =
         TransactionBatchProcessor::<SimulationForkGraph>::new_uninitialized(slot, epoch);
-    processor.set_execution_cost(SVMTransactionExecutionCost::new_with_defaults(simd_0339));
+    processor.set_execution_cost(SVMTransactionExecutionCost::default());
     {
         let mut cache = processor.global_program_cache.write().unwrap();
         cache.set_fork_graph(Arc::downgrade(&fork_graph));
         cache.latest_root_slot = slot;
     }
 
-    // Install v1; v2 stays the default empty loader (loader-v4 compiles via v1).
-    let mut environments = ProgramRuntimeEnvironments::default();
-    environments.program_runtime_v1 = Arc::new(program_runtime_v1);
-    processor.set_environments(environments);
+    processor.set_program_runtime_environment(program_runtime_env);
 
     for builtin in solana_builtins::BUILTINS {
         processor.add_builtin(
             builtin.program_id,
-            ProgramCacheEntry::new_builtin(0, builtin.name.len(), builtin.entrypoint),
+            ProgramCacheEntry::new_builtin(0, builtin.name.len(), builtin.register_fn),
         );
     }
 
@@ -997,10 +999,13 @@ fn execute(
     let environment = TransactionProcessingEnvironment {
         blockhash,
         blockhash_lamports_per_signature,
+        alpenglow_migration_succeeded: false,
         epoch_total_stake: 0,
         feature_set: svm_feature_set,
-        program_runtime_environments_for_execution: processor.get_environments_for_epoch(epoch),
-        program_runtime_environments_for_deployment: processor.get_environments_for_epoch(epoch),
+        program_runtime_environments: ProgramRuntimeEnvironments::new(
+            processor.program_runtime_environment_for_epoch(epoch),
+            processor.program_runtime_environment_for_epoch(epoch),
+        ),
         rent: solana_rent::Rent::default(),
     };
 
@@ -1012,6 +1017,7 @@ fn execute(
         recording_config: ExecutionRecordingConfig::new_single_setting(true),
         drop_on_failure: false,
         all_or_nothing: false,
+        strict_nonce_size_check: false,
     };
 
     Ok(processor.load_and_execute_sanitized_transactions(

@@ -4,6 +4,7 @@
  */
 
 use sea_orm::{ConnectOptions, Database, DatabaseConnection};
+use agave_fs::FileInfo;
 use solana_accounts_db::accounts_file::AccountsFile;
 use std::{
     path::PathBuf,
@@ -192,7 +193,8 @@ async fn process_downloaded_snapshot(
 
     for AccountFileData {
         path,
-        size: current_len,
+        // 4.2's AccountsFile derives the storage length from file metadata.
+        size: _,
         slot: account_file_slot,
         write_version,
     } in solana_snapshot
@@ -232,11 +234,7 @@ async fn process_downloaded_snapshot(
 
         account_file_workers.spawn(async move {
             let start_time = Instant::now();
-            let accounts = AccountsFile::new_for_startup(
-                path,
-                current_len,
-                solana_accounts_db::accounts_file::StorageAccess::default(),
-            )?;
+            let accounts = AccountsFile::new_for_startup(FileInfo::new_from_path(path)?)?;
 
             let elapsed = start_time.elapsed().as_micros();
             *total_accounts_files_opening_time_micros
@@ -459,7 +457,8 @@ pub async fn process_downloaded_snapshot_with_gap_filling(
 
     for AccountFileData {
         path,
-        size: current_len,
+        // 4.2's AccountsFile derives the storage length from file metadata.
+        size: _,
         slot: account_file_slot,
         write_version,
     } in solana_snapshot
@@ -494,11 +493,7 @@ pub async fn process_downloaded_snapshot_with_gap_filling(
 
         let block_sender = block_sender.clone();
         account_file_workers.spawn(async move {
-            let accounts = AccountsFile::new_for_startup(
-                path,
-                current_len,
-                solana_accounts_db::accounts_file::StorageAccess::default(),
-            )?;
+            let accounts = AccountsFile::new_for_startup(FileInfo::new_from_path(path)?)?;
 
             let mut accounts_for_slot = Vec::new();
 

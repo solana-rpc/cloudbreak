@@ -269,6 +269,9 @@ async fn recompute(db: &DatabaseConnection, epoch: u64) -> Result<(usize, u128),
         let Some(delegation) = state.delegation() else {
             continue;
         };
+        // stake_v2() is gated on upgrade_bpf_stake_program_to_v5_1, which is not active on
+        // mainnet; agave still takes this path, so match it.
+        #[allow(deprecated)]
         let effective = delegation.stake(epoch, &history, NEW_RATE_ACTIVATION_EPOCH);
         if effective > 0 {
             *by_voter.entry(delegation.voter_pubkey).or_default() += effective;
