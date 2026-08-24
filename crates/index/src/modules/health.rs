@@ -39,6 +39,15 @@ impl ServiceHealth {
         }
     }
 
+    /// Returns `true` when there are no active unhealthy reasons, mirroring the
+    /// value written to `service_health.healthy` / `slots.health`.
+    pub fn is_healthy(&self) -> bool {
+        self.reasons
+            .lock()
+            .expect("Failed to lock health reasons")
+            .is_empty()
+    }
+
     /// Adds an unhealthy reason. If it was not already present, marks the service unhealthy.
     pub async fn add_reason(&self, reason: HealthReason) {
         let newly_added = self

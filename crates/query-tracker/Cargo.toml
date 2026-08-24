@@ -24,8 +24,6 @@ sea-orm = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 humantime = { workspace = true }
-jsonrpsee = { workspace = true, features = ["server", "macros", "client", "http-client"] }
-jsonrpsee-types = { workspace = true }
 solana-pubkey = { workspace = true }
 solana-rpc-client-api = { workspace = true }
 thiserror = { workspace = true }
@@ -36,4 +34,6 @@ hyper = { workspace = true }
 hyper-util = { workspace = true }
 http-body-util = { workspace = true }
 hex = { workspace = true }
+chrono = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
+hyperloglogplus = "0.4.1"

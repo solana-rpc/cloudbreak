@@ -70,18 +70,22 @@ pub async fn get_slot_data(db: &DatabaseConnection) -> Option<SlotSyncronizerDat
         .unwrap_or_default();
     let mut res_iter = res.into_iter();
 
-    let confirmed_slot = res_iter.next().map(|slot| SlotData {
-        slot: slot.slot as u64,
-        block_time: slot.block_time,
-    })?;
-    let finalized_slot = res_iter.next().map(|slot| SlotData {
-        slot: slot.slot as u64,
-        block_time: slot.block_time,
-    })?;
+    let confirmed = res_iter.next()?;
+    let finalized = res_iter.next()?;
+
+    // Health is denormalised identically onto every slot row; read it from either.
+    let healthy = confirmed.health;
 
     Some(SlotSyncronizerData {
-        confirmed_slot,
-        finalized_slot,
+        confirmed_slot: SlotData {
+            slot: confirmed.slot as u64,
+            block_time: confirmed.block_time,
+        },
+        finalized_slot: SlotData {
+            slot: finalized.slot as u64,
+            block_time: finalized.block_time,
+        },
+        healthy,
     })
 }
 

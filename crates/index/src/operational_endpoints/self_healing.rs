@@ -146,7 +146,11 @@ pub(crate) async fn handle(query: Option<&str>) -> Result<Response<Full<Bytes>>,
 }
 
 /// Groups an ascending, de-duplicated list of missing slots into contiguous runs.
-fn group_gaps(missing: &[u64], boundaries: &BTreeSet<u64>, confirmed: Option<u64>) -> Vec<GapDebug> {
+fn group_gaps(
+    missing: &[u64],
+    boundaries: &BTreeSet<u64>,
+    confirmed: Option<u64>,
+) -> Vec<GapDebug> {
     let mut gaps: Vec<GapDebug> = Vec::new();
     let mut iter = missing.iter().copied();
     if let Some(first) = iter.next() {

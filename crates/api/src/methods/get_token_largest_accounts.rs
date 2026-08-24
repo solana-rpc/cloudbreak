@@ -3,8 +3,6 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-use cloudbreak_entity::slots;
-use sea_orm::EntityTrait;
 use sea_orm::sqlx::Row;
 use sea_orm::sqlx::{self};
 use solana_account_decoder::parse_token::token_amount_to_ui_amount_v3;
@@ -41,24 +39,7 @@ pub async fn get_token_largest_accounts(
         .transpose()?
         .unwrap_or(CommitmentLevel::Finalized);
 
-    let (latest_slot, block_time): (u64, i64) = match &state.slot_syncronizer_data {
-        Some(data) => {
-            let data = data.read().expect("Failed to read slot syncronizer data");
-            (
-                data.get_slot_for_commitment(commitment),
-                data.get_block_time_for_commitment(commitment),
-            )
-        }
-        None => {
-            let slot_model = slots::Entity::find_by_id(commitment as i32)
-                .one(&state.database)
-                .instrument(tracing::info_span!("slot_db"))
-                .await?;
-
-            let model = slot_model.ok_or(RpcError::InternalError)?;
-            (model.slot as u64, model.block_time)
-        }
-    };
+    let (latest_slot, block_time) = state.latest_slot_and_block_time(commitment).await?;
 
     let mint_sql = include_str!("../db/getAccountInfo.sql");
     let mint_hex = format!("'\\x{}'::bytea", hex::encode(pubkey.as_ref()));

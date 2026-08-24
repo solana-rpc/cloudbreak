@@ -14,11 +14,20 @@ port = 8875
 endpoint = "http://localhost:4001"
 timeout = "5s"
 flush-interval = "1m"
+max-buffered-identities = 10000
+max-batch-size = 1000
 
 # How to handle requests with "processed" commitment level.
 # "reject" (default) — return an error for processed commitment requests.
 # "use-confirmed" — silently respond with confirmed data instead.
 # processed-commitment = "reject"
+
+# How to respond to requests while the node is unhealthy.
+# "json-rpc-error" (default) — return a NODE_UNHEALTHY JSON-RPC error with HTTP 200.
+# "http-unavailable" — return an HTTP 503 Service Unavailable response instead.
+#   (Note: only applies to single requests; batch requests always return HTTP 200
+#    with per-item JSON-RPC errors.)
+# unhealthy-response = "json-rpc-error"
 
 [tracing]
 enabled = true

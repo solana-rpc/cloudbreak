@@ -3,13 +3,12 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+use cloudbreak_core::{IndexConfig, SnapshotConfig, modules::account_owner_map::AccountOwnerMap};
 use std::sync::{Arc, Mutex};
-use cloudbreak_core::{
-    IndexConfig, SnapshotConfig,
-    modules::{account_owner_map::AccountOwnerMap, supply_tracker::SupplyTracker},
-};
+use cloudbreak_core::modules::supply_tracker::SupplyTracker;
 
 use crate::metrics;
+use crate::modules::finalize_slot::UpdatedAccountsDuringStartup;
 
 /// Only on `FinishedAndCleanedUp` state we mark the serviceas healthy, but on `Started` state
 ///  we don't execute the `process_snapshot_if_needed` function again
@@ -24,18 +23,30 @@ pub enum SnapshotProcessingState {
 /// Only tries to process the snapshot if we set the `snapshot` config section on `IndexConfig`
 /// Loads the snapshot on startup and marks the SnapshotState as `Started`.
 /// On finished, marks the SnapshotState as `Finished` and cleans up the stored accounts.
+///
+/// When there is no `snapshot` config section there is nothing to bootstrap, so startup is
+/// already effectively finished: we clear the `Startup` unhealthy reason once (via
+/// [`UpdatedAccountsDuringStartup::finish_startup_without_snapshot`]) so a no-snapshot node
+/// reports healthy and its slot-dependent reads are not gated forever.
 pub async fn process_snapshot_if_needed(
     config: IndexConfig,
     slot: u64,
-    snapshot_processing_state: Arc<Mutex<SnapshotProcessingState>>,
+    updated_accounts_during_startup: &UpdatedAccountsDuringStartup,
     finalize_slot_buffer_size: Arc<Mutex<usize>>,
     accounts_owner_map: AccountOwnerMap,
     supply_tracker: SupplyTracker,
 ) {
     let snapshot_config = match config.snapshot {
         Some(snapshot_config) => snapshot_config,
-        None => return,
+        None => {
+            updated_accounts_during_startup
+                .finish_startup_without_snapshot()
+                .await;
+            return;
+        }
     };
+
+    let snapshot_processing_state = &updated_accounts_during_startup.snapshot_processing_state;
 
     {
         let snapshot_processing_state = snapshot_processing_state

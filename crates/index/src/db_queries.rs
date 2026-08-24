@@ -11,7 +11,7 @@ use std::{
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use solana_pubkey::Pubkey;
 use sea_orm::{
-    ActiveValue::{NotSet, Set},
+    ActiveValue::Set,
     ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait,
     QueryFilter, Statement, Value,
     prelude::Expr,
@@ -29,7 +29,7 @@ use cloudbreak_core::{
         supply_tracker::{NonCirculatingBalance, SUPPLY_RING_SLOTS, SupplyCommit},
     },
 };
-use cloudbreak_entity::{accounts, service_health, slots};
+use cloudbreak_entity::{accounts, slots};
 use cloudbreak_snapshot::{bytea_array, owner_pubkey_arrays, parse_pubkey, pubkey_bytea_array};
 
 use crate::metrics;
@@ -38,39 +38,21 @@ use crate::metrics;
 ///  to unhealthy when we get a slot gap.
 ///
 /// By default we set the service as unhealthy on migration.
+///
+/// The authoritative `service_health` row and the denormalised `slots.health` flag are written
+/// in a single transaction so they can never diverge.
 pub async fn update_service_health(db: &DatabaseConnection, healthy: bool) {
-    let query = service_health::Entity::insert(service_health::ActiveModel {
-        id: Set(1), //It will always write to the one default record
-        healthy: Set(healthy),
-        last_updated_at: NotSet,
-    })
-    .on_conflict(
-        OnConflict::columns([service_health::Column::Id])
-            .update_columns([
-                service_health::Column::Healthy,
-                service_health::Column::LastUpdatedAt,
-            ])
-            .to_owned(),
-    )
-    .exec_without_returning(db);
-
-    let result = timeout(Duration::from_secs(30), query)
-        .await
-        .unwrap_or_else(|elapsed| {
-            tracing::error!("update_service_health timeout ERROR: {}", elapsed);
-            metrics::increment_db_errors();
-            Err(sea_orm::DbErr::RecordNotInserted)
-        });
-
-    match result {
-        Ok(result) => {
-            tracing::debug!("update_service_health: updated service health: {}", result);
+    // The atomic upsert now lives in `core` so every service shares it; keep the
+    // indexer's fire-and-forget logging and db-error metric here.
+    match cloudbreak_core::modules::service_health::update_service_health(db, healthy).await {
+        Ok(()) => {
+            tracing::debug!(
+                "update_service_health: updated service + slots health to {}",
+                healthy
+            );
         }
         Err(e) => {
-            tracing::error!(
-                "update_service_health: failed to update service health: {}",
-                e
-            );
+            tracing::error!("update_service_health: failed to update health: {}", e);
             metrics::increment_db_errors();
         }
     }
@@ -329,6 +311,7 @@ pub async fn insert_slot(
     slot: u64,
     block_time: Option<UnixTimestamp>,
     commitment: CommitmentLevel,
+    healthy: bool,
     db: &DatabaseConnection,
     config: &IndexConfig,
 ) {
@@ -340,6 +323,11 @@ pub async fn insert_slot(
         slot: Set(slot as i64),
         commitment: Set(commitment as i32),
         block_time: Set(block_time),
+        // Stamp the current health so a freshly inserted row is consistent with the
+        // live health state even if it is created after the last health transition.
+        // `update_service_health` remains the sole authority for transitions on
+        // existing rows, so we never clobber `health` on conflict.
+        health: Set(healthy),
     })
     .on_conflict(
         OnConflict::columns([slots::Column::Commitment])

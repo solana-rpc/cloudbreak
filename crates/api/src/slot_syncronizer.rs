@@ -19,9 +19,16 @@ use cloudbreak_core::ApiConfig;
 pub struct SlotSyncronizerData {
     pub confirmed_slot: SlotData,
     pub finalized_slot: SlotData,
+    /// Denormalised service health (mirrors the `slots.health` column). Defaults
+    /// to `false` (unhealthy) until the first successful sync populates it.
+    pub healthy: bool,
 }
 
 impl SlotSyncronizerData {
+    pub fn is_healthy(&self) -> bool {
+        self.healthy
+    }
+
     pub fn get_slot_for_commitment(&self, commitment: CommitmentLevel) -> u64 {
         match commitment {
             CommitmentLevel::Finalized => self.finalized_slot.slot,

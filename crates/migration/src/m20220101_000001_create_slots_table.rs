@@ -19,6 +19,12 @@ impl MigrationTrait for Migration {
                     .col(ColumnDef::new(Slot::Slot).big_integer().not_null())
                     .col(ColumnDef::new(Slot::Commitment).integer().not_null())
                     .col(ColumnDef::new(Slot::BlockTime).big_integer().not_null())
+                    .col(
+                        ColumnDef::new(Slot::Health)
+                            .boolean()
+                            .not_null()
+                            .default(false),
+                    )
                     .primary_key(Index::create().col(Slot::Commitment))
                     .to_owned(),
             )
@@ -44,4 +50,5 @@ pub enum Slot {
     Slot,
     Commitment,
     BlockTime,
+    Health,
 }

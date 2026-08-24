@@ -22,7 +22,8 @@ use crate::http::CloudbreakRpcState;
 use crate::http::server::{HttpHandlerResponse, ResponseBody};
 use crate::http::streaming::gpa_streaming_response_body;
 use crate::http::{
-    JsonRpcRequest, JsonRpcResponse, RpcRequestPayload, extract_param, make_error_response,
+    JsonRpcRequest, JsonRpcResponse, RequestContext, RpcRequestPayload, extract_param,
+    http_status_for_error, make_error_response, make_error_response_with_status,
 };
 use crate::methods::slot::RpcGetSlotConfig;
 use crate::methods::token::{
@@ -33,7 +34,7 @@ use crate::{db_query, methods, metrics};
 pub async fn handle_rpc_request(
     req: Request<Incoming>,
     state: Arc<CloudbreakRpcState>,
-    subscription_id: &str,
+    ctx: &Arc<RequestContext>,
 ) -> HttpHandlerResponse {
     let body = match http_body_util::BodyExt::collect(req.into_body()).await {
         Ok(collected) => collected.to_bytes(),
@@ -58,17 +59,15 @@ pub async fn handle_rpc_request(
     };
 
     match payload {
-        RpcRequestPayload::Single(req) => {
-            process_single_request(req, &state, subscription_id, false).await
-        }
-        RpcRequestPayload::Batch(requests) => process_batch(requests, state, subscription_id).await,
+        RpcRequestPayload::Single(req) => process_single_request(req, &state, ctx, false).await,
+        RpcRequestPayload::Batch(requests) => process_batch(requests, state, ctx).await,
     }
 }
 
 async fn process_batch(
     requests: Vec<JsonRpcRequest>,
     state: Arc<CloudbreakRpcState>,
-    subscription_id: &str,
+    ctx: &Arc<RequestContext>,
 ) -> HttpHandlerResponse {
     let batch_size = requests.len();
     metrics::CLOUDBREAK_API_BATCH_REQUESTS
@@ -78,16 +77,15 @@ async fn process_batch(
     let semaphore = Arc::new(tokio::sync::Semaphore::new(
         state.batch_handling_max_concurrency,
     ));
-    let subscription_id = subscription_id.to_string();
     let mut handles = Vec::with_capacity(batch_size);
 
     for req in requests {
         let state = state.clone();
-        let sub_id = subscription_id.clone();
+        let ctx = ctx.clone();
         let sem = semaphore.clone();
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
-            process_single_request(req, &state, &sub_id, true).await
+            process_single_request(req, &state, &ctx, true).await
         }));
     }
 
@@ -120,13 +118,13 @@ async fn process_batch(
 async fn process_single_request(
     rpc_request: JsonRpcRequest,
     state: &Arc<CloudbreakRpcState>,
-    subscription_id: &str,
+    ctx: &Arc<RequestContext>,
     in_batch: bool,
 ) -> HttpHandlerResponse {
     let id = rpc_request.id.clone();
     let method = rpc_request.method.as_str();
 
-    let response_bytes: Vec<u8> = match method {
+    let (response_bytes, status): (Vec<u8>, StatusCode) = match method {
         "getHealth" => {
             let healthy = db_query::get_service_health(&state.database).await;
 
@@ -136,30 +134,30 @@ async fn process_single_request(
                 Ok(serde_json::Value::String("ok".to_string()))
             };
 
-            json_serialize_response(id, result).await
+            json_serialize_response(id, result, ctx).await
         }
         "getSlot" => {
             let config: Option<RpcGetSlotConfig> =
                 extract_param(&rpc_request.params, 0).ok().flatten();
             let slot = methods::slot::get_slot(state, config).await;
 
-            json_serialize_response(id, slot).await
+            json_serialize_response(id, slot, ctx).await
         }
         "getVersion" => {
             let version = methods::version::get_version(state).await;
 
-            json_serialize_response(id, version).await
+            json_serialize_response(id, version, ctx).await
         }
         "getGenesisHash" => {
             let hash = methods::genesis::get_genesis_hash(state).await;
 
-            json_serialize_response(id, hash).await
+            json_serialize_response(id, hash, ctx).await
         }
         "getVoteAccounts" => {
             let config: Option<methods::vote_accounts::GetVoteAccountsConfig> =
                 extract_param(&rpc_request.params, 0).ok().flatten();
             let result = methods::vote_accounts::get_vote_accounts(state, config).await;
-            json_serialize_response(id, result).await
+            json_serialize_response(id, result, ctx).await
         }
         "simulateTransaction" => {
             let transaction: String = match extract_param(&rpc_request.params, 0) {
@@ -171,13 +169,13 @@ async fn process_single_request(
             let result =
                 methods::simulate_transaction::simulate_transaction(state, transaction, config)
                     .await;
-            json_serialize_response(id, result).await
+            json_serialize_response(id, result, ctx).await
         }
         "getSupply" => {
             let config: Option<RpcSupplyConfig> =
                 extract_param(&rpc_request.params, 0).ok().flatten();
             let result = methods::get_supply::get_supply(state, config).await;
-            json_serialize_response(id, result).await
+            json_serialize_response(id, result, ctx).await
         }
         "getAccountInfo" => {
             let start_time = Instant::now();
@@ -201,10 +199,10 @@ async fn process_single_request(
                 .with_label_values(&["gAI", status_label])
                 .inc();
 
-            let json_response = json_serialize_response(id, result).await;
+            let json_response = json_serialize_response(id, result, ctx).await;
 
             metrics::CLOUDBREAK_API_REQUEST_DURATION_MS
-                .with_label_values(&["gAI", metrics::bytes_bucket(json_response.len() as u64)])
+                .with_label_values(&["gAI", metrics::bytes_bucket(json_response.0.len() as u64)])
                 .observe(start_time.elapsed().as_millis() as f64);
 
             json_response
@@ -231,12 +229,12 @@ async fn process_single_request(
                 .with_label_values(&["getBalance", status_label])
                 .inc();
 
-            let json_response = json_serialize_response(id, result).await;
+            let json_response = json_serialize_response(id, result, ctx).await;
 
             metrics::CLOUDBREAK_API_REQUEST_DURATION_MS
                 .with_label_values(&[
                     "getBalance",
-                    metrics::bytes_bucket(json_response.len() as u64),
+                    metrics::bytes_bucket(json_response.0.len() as u64),
                 ])
                 .observe(start_time.elapsed().as_millis() as f64);
 
@@ -269,12 +267,12 @@ async fn process_single_request(
                 .with_label_values(&["getMultipleAccounts", status_label])
                 .inc();
 
-            let json_response = json_serialize_response(id, result).await;
+            let json_response = json_serialize_response(id, result, ctx).await;
 
             metrics::CLOUDBREAK_API_REQUEST_DURATION_MS
                 .with_label_values(&[
                     "getMultipleAccounts",
-                    metrics::bytes_bucket(json_response.len() as u64),
+                    metrics::bytes_bucket(json_response.0.len() as u64),
                 ])
                 .observe(start_time.elapsed().as_millis() as f64);
 
@@ -299,10 +297,11 @@ async fn process_single_request(
                     metrics::CLOUDBREAK_API_REQUESTS_TOTAL
                         .with_label_values(&["gPA", "error"])
                         .inc();
-                    return make_error_response(
+                    return make_error_response_with_status(
                         id,
                         e.to_numeric_code(),
                         e.to_error_code().to_string(),
+                        http_status_for_error(&e),
                     );
                 }
             };
@@ -311,7 +310,7 @@ async fn process_single_request(
                 id.clone(),
                 gpa_response,
                 gpa_global_start_time,
-                subscription_id.to_string(),
+                ctx.clone(),
             )
             .await
             {
@@ -321,17 +320,18 @@ async fn process_single_request(
                     metrics::CLOUDBREAK_API_REQUESTS_TOTAL
                         .with_label_values(&["gPA", "error"])
                         .inc();
-                    return make_error_response(
+                    return make_error_response_with_status(
                         id,
                         e.to_numeric_code(),
                         e.to_error_code().to_string(),
+                        http_status_for_error(&e),
                     );
                 }
             };
 
             if in_batch {
                 // Await and collect the streaming body into a `Vec<u8>`
-                gpa_streamed_to_buffered(body, id).await
+                (gpa_streamed_to_buffered(body, id).await, StatusCode::OK)
             } else {
                 return HttpHandlerResponse {
                     status: StatusCode::OK,
@@ -360,10 +360,11 @@ async fn process_single_request(
                     metrics::CLOUDBREAK_API_REQUESTS_TOTAL
                         .with_label_values(&["gTABM", "error"])
                         .inc();
-                    return make_error_response(
+                    return make_error_response_with_status(
                         id,
                         e.to_numeric_code(),
                         e.to_error_code().to_string(),
+                        http_status_for_error(&e),
                     );
                 }
             };
@@ -372,7 +373,7 @@ async fn process_single_request(
                 id.clone(),
                 gpa_response,
                 gpa_global_start_time,
-                subscription_id.to_string(),
+                ctx.clone(),
             )
             .await
             {
@@ -382,16 +383,17 @@ async fn process_single_request(
                     metrics::CLOUDBREAK_API_REQUESTS_TOTAL
                         .with_label_values(&["gTABM", "error"])
                         .inc();
-                    return make_error_response(
+                    return make_error_response_with_status(
                         id,
                         e.to_numeric_code(),
                         e.to_error_code().to_string(),
+                        http_status_for_error(&e),
                     );
                 }
             };
 
             if in_batch {
-                gpa_streamed_to_buffered(body, id).await
+                (gpa_streamed_to_buffered(body, id).await, StatusCode::OK)
             } else {
                 return HttpHandlerResponse {
                     status: StatusCode::OK,
@@ -429,12 +431,12 @@ async fn process_single_request(
                 .with_label_values(&["getTokenAccountBalance", status_label])
                 .inc();
 
-            let json_response = json_serialize_response(id, result).await;
+            let json_response = json_serialize_response(id, result, ctx).await;
 
             metrics::CLOUDBREAK_API_REQUEST_DURATION_MS
                 .with_label_values(&[
                     "getTokenAccountBalance",
-                    metrics::bytes_bucket(json_response.len() as u64),
+                    metrics::bytes_bucket(json_response.0.len() as u64),
                 ])
                 .observe(start_time.elapsed().as_millis() as f64);
 
@@ -468,12 +470,12 @@ async fn process_single_request(
                 .with_label_values(&["getTokenSupply", status_label])
                 .inc();
 
-            let json_response = json_serialize_response(id, result).await;
+            let json_response = json_serialize_response(id, result, ctx).await;
 
             metrics::CLOUDBREAK_API_REQUEST_DURATION_MS
                 .with_label_values(&[
                     "getTokenSupply",
-                    metrics::bytes_bucket(json_response.len() as u64),
+                    metrics::bytes_bucket(json_response.0.len() as u64),
                 ])
                 .observe(start_time.elapsed().as_millis() as f64);
 
@@ -508,12 +510,12 @@ async fn process_single_request(
                 .with_label_values(&["getTokenLargestAccounts", status_label])
                 .inc();
 
-            let json_response = json_serialize_response(id, result).await;
+            let json_response = json_serialize_response(id, result, ctx).await;
 
             metrics::CLOUDBREAK_API_REQUEST_DURATION_MS
                 .with_label_values(&[
                     "getTokenLargestAccounts",
-                    metrics::bytes_bucket(json_response.len() as u64),
+                    metrics::bytes_bucket(json_response.0.len() as u64),
                 ])
                 .observe(start_time.elapsed().as_millis() as f64);
 
@@ -545,17 +547,17 @@ async fn process_single_request(
 
             let json_start_time = Instant::now();
 
-            let json_response = json_serialize_response(id, response).await;
-            let response_size = json_response.len() as u64;
+            let json_response = json_serialize_response(id, response, ctx).await;
+            let response_size = json_response.0.len() as u64;
 
             if let Some(metrics_data) = metrics_data {
                 metrics_data.record_metrics(
                     json_start_time.elapsed().as_millis() as f64,
-                    start_time.elapsed().as_millis() as f64,
+                    start_time.elapsed(),
                     response_size,
                     0,
                     0.0,
-                    subscription_id.to_string(),
+                    &ctx.subscription_id,
                 );
             } else {
                 tracing::error!(target: "api_request_errors_count", "getTokenAccountsByOwner error: no metrics data");
@@ -591,17 +593,17 @@ async fn process_single_request(
             };
             let json_start_time = Instant::now();
 
-            let json_response = json_serialize_response(id, response).await;
-            let response_size = json_response.len() as u64;
+            let json_response = json_serialize_response(id, response, ctx).await;
+            let response_size = json_response.0.len() as u64;
 
             if let Some(metrics_data) = metrics_data {
                 metrics_data.record_metrics(
                     json_start_time.elapsed().as_millis() as f64,
-                    start_time.elapsed().as_millis() as f64,
+                    start_time.elapsed(),
                     response_size,
                     0,
                     0.0,
-                    subscription_id.to_string(),
+                    &ctx.subscription_id,
                 );
             } else {
                 tracing::error!(target: "api_request_errors_count", "getTokenAccountsByDelegate error: no metrics data");
@@ -618,16 +620,34 @@ async fn process_single_request(
     };
 
     HttpHandlerResponse {
-        status: StatusCode::OK,
+        status,
         body: ResponseBody::Buffered(response_bytes),
     }
 }
 
-#[tracing::instrument(name = "json_encoding", skip_all)]
+/// Serializes an RPC method result into JSON-RPC response bytes and the HTTP
+/// status the response should carry. The status is always `200 OK` except for
+/// an unhealthy node when `unhealthy-response = "http-unavailable"` (baked into
+/// the error at its source; see [`http_status_for_error`]).
+#[tracing::instrument(
+    name = "json_encoding",
+    skip_all,
+    fields(
+        request_id = %ctx.request_id,
+        subscription_id = %ctx.subscription_id,
+        client_ip = %ctx.client_ip,
+    )
+)]
 async fn json_serialize_response<T: Serialize + Send + 'static>(
     id: serde_json::Value,
     result: Result<T, RpcError>,
-) -> Vec<u8> {
+    ctx: &RequestContext,
+) -> (Vec<u8>, StatusCode) {
+    let status = match &result {
+        Ok(_) => StatusCode::OK,
+        Err(e) => http_status_for_error(e),
+    };
+
     let res = match result {
         Ok(value) => tokio::task::spawn_blocking(move || {
             let response = JsonRpcResponse::success(id, value);
@@ -648,10 +668,12 @@ async fn json_serialize_response<T: Serialize + Send + 'static>(
         }
     };
 
-    res.unwrap_or_else(|_| {
+    let bytes = res.unwrap_or_else(|_| {
         tracing::error!("Failed to json_serialize_response");
         vec![]
-    })
+    });
+
+    (bytes, status)
 }
 
 async fn gpa_streamed_to_buffered(

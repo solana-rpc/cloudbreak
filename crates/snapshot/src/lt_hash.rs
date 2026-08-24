@@ -4,6 +4,7 @@
  */
 
 use anyhow::{Context, Result};
+use agave_fs::FileInfo;
 use solana_accounts_db::accounts_file::AccountsFile;
 use solana_lattice_hash::lt_hash::LtHash;
 use solana_pubkey::Pubkey;
@@ -61,9 +62,9 @@ fn for_each_deduplicated_snapshot_account(
         }
 
         let accounts_file = AccountsFile::new_for_startup(
-            &file_data.path,
-            file_data.size,
-            solana_accounts_db::accounts_file::StorageAccess::default(),
+            FileInfo::new_from_path(&file_data.path).map_err(|e| {
+                anyhow::anyhow!("Failed to open account file {:?}: {:?}", file_data.path, e)
+            })?,
         )
         .map_err(|e| {
             anyhow::anyhow!("Failed to open account file {:?}: {:?}", file_data.path, e)
@@ -105,9 +106,9 @@ fn for_each_deduplicated_snapshot_account(
         }
 
         let accounts_file = AccountsFile::new_for_startup(
-            &file_data.path,
-            file_data.size,
-            solana_accounts_db::accounts_file::StorageAccess::default(),
+            FileInfo::new_from_path(&file_data.path).map_err(|e| {
+                anyhow::anyhow!("Failed to open account file {:?}: {:?}", file_data.path, e)
+            })?,
         )
         .map_err(|e| {
             anyhow::anyhow!("Failed to open account file {:?}: {:?}", file_data.path, e)
@@ -206,9 +207,9 @@ pub fn compute_snapshot_lt_hash_filtered_single_pass(
         }
 
         let accounts_file = AccountsFile::new_for_startup(
-            &file_data.path,
-            file_data.size,
-            solana_accounts_db::accounts_file::StorageAccess::default(),
+            FileInfo::new_from_path(&file_data.path).map_err(|e| {
+                anyhow::anyhow!("Failed to open account file {:?}: {:?}", file_data.path, e)
+            })?,
         )
         .map_err(|e| {
             anyhow::anyhow!("Failed to open account file {:?}: {:?}", file_data.path, e)

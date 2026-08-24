@@ -14,6 +14,7 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub commitment: i32,
     pub block_time: i64,
+    pub health: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

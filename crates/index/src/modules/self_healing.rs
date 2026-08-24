@@ -3,7 +3,7 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-use cloudbreak_core::{IndexConfig, SnapshotConfig, modules::supply_tracker::SupplyTracker};
+use cloudbreak_core::{IndexConfig, SnapshotConfig, SnapshotConfigOnIndexer, modules::supply_tracker::SupplyTracker};
 use cloudbreak_snapshot::sidecar::{SnapshotPair, SnapshotType};
 use sea_orm::DatabaseConnection;
 use std::{
@@ -168,6 +168,16 @@ impl SelfHealingState {
         tokio::spawn(async move {
             let _guard = metrics::TokioTaskCounterGuard::new("self_healing_fill_gaps");
 
+            // Bound how long we tolerate the tracker having no covering snapshot for a confirmed
+            // gap: after this many consecutive failed fetches we fail the indexer instead of
+            // retrying forever. Resets on the first successful fetch.
+            let max_snapshot_retries = config
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.gap_fill_max_snapshot_retries)
+                .unwrap_or_else(SnapshotConfigOnIndexer::default_gap_fill_max_snapshot_retries);
+            let mut snapshot_unavailable_retries: u32 = 0;
+
             loop {
                 // TODO: Make the gap filling interval configurable
                 tokio::time::sleep(Duration::from_secs(30)).await;
@@ -238,10 +248,31 @@ impl SelfHealingState {
                 )
                 .await
                 {
-                    Ok(snapshot_pair) => snapshot_pair,
+                    Ok(snapshot_pair) => {
+                        snapshot_unavailable_retries = 0;
+                        snapshot_pair
+                    }
                     Err(e) => {
+                        snapshot_unavailable_retries += 1;
+
+                        if snapshot_unavailable_retries >= max_snapshot_retries {
+                            tracing::error!(
+                                target: "self_healing",
+                                "Snapshot still unavailable for gap filling after {} consecutive attempts (limit: {}); giving up and failing the indexer (error: {:?})",
+                                snapshot_unavailable_retries,
+                                max_snapshot_retries,
+                                e
+                            );
+                            return Err(anyhow::anyhow!(
+                                "snapshot unavailable for gap filling after {} consecutive attempts",
+                                snapshot_unavailable_retries
+                            ));
+                        }
+
                         tracing::warn!(
-                            "Snapshot is not available for gap filling yet, waiting for next iteration (error: {:?})",
+                            "Snapshot is not available for gap filling yet, waiting for next iteration (attempt {}/{}) (error: {:?})",
+                            snapshot_unavailable_retries,
+                            max_snapshot_retries,
                             e
                         );
                         continue;

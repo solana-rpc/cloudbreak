@@ -28,6 +28,7 @@ solana-pubkey = { workspace = true }
 yellowstone-grpc-proto = { workspace = true }
 solana-program = { workspace = true }
 solana-accounts-db = { workspace = true }
+agave-fs = { workspace = true }
 solana-runtime = { workspace = true }
 solana-hash = { workspace = true }
 solana-hard-forks =  { workspace = true }
@@ -35,6 +36,7 @@ solana-fee-calculator = { workspace = true }
 solana-epoch-schedule = { workspace = true }
 solana-inflation = { workspace = true }
 solana-stake-interface = { workspace = true }
+solana-vote = { workspace = true }
 solana-serde =  { workspace = true }
 futures = { workspace = true }
 rust_decimal = { workspace = true }
