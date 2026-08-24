@@ -14,10 +14,12 @@ use cloudbreak_entity::snapshot_accounts::{self};
 use rust_decimal::Decimal;
 use sea_orm::{
     ActiveValue::Set, ConnectionTrait, DatabaseConnection, EntityTrait, Statement,
-    TransactionTrait, Value,
+    TransactionTrait, Value, sea_query::ArrayType,
 };
-use tokio::time::Instant;
+use solana_pubkey::Pubkey;
+use tokio::time::{Instant, timeout};
 use yellowstone_grpc_proto::geyser::SubscribeUpdateAccount;
+use cloudbreak_core::modules::supply_tracker::{SUPPLY_RING_SLOTS, SupplyCommit};
 
 use crate::metrics;
 use crate::stake_data::SnapshotStakeData;
@@ -551,5 +553,197 @@ pub async fn persist_epoch_stakes(
         start_time.elapsed().as_secs_f64()
     );
 
+    Ok(())
+}
+
+pub async fn persist_supply_seed(
+    db: &DatabaseConnection,
+    bank_info: &crate::sidecar::SnapshotBankInfo,
+) -> Result<(), anyhow::Error> {
+    db.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "WITH upsert AS ( \
+            INSERT INTO supply (slot, total) VALUES ($1, $2) \
+            ON CONFLICT (slot) DO UPDATE SET total = EXCLUDED.total, updated_at = now() \
+         ) \
+         DELETE FROM supply WHERE slot < $3",
+        [
+            Value::from(bank_info.slot as i64),
+            Value::from(Decimal::from(bank_info.capitalization)),
+            Value::from(bank_info.slot.saturating_sub(SUPPLY_RING_SLOTS) as i64),
+        ],
+    ))
+    .await?;
+
+    tracing::info!(
+        target: "persist_supply_seed",
+        "seeded supply from snapshot: slot {} capitalization {}",
+        bank_info.slot,
+        bank_info.capitalization
+    );
+
+    Ok(())
+}
+
+const STARTUP_BALANCES_QUERY_TIMEOUT: Duration = Duration::from_secs(60);
+
+pub fn bytea_array(items: Vec<Vec<u8>>) -> Value {
+    Value::Array(
+        ArrayType::Bytes,
+        Some(Box::new(
+            items
+                .into_iter()
+                .map(|bytes| Value::Bytes(Some(Box::new(bytes))))
+                .collect(),
+        )),
+    )
+}
+
+pub fn pubkey_bytea_array(pubkeys: &[Pubkey]) -> Value {
+    bytea_array(
+        pubkeys
+            .iter()
+            .map(|pubkey| pubkey.to_bytes().to_vec())
+            .collect(),
+    )
+}
+
+pub fn parse_pubkey(bytes: Vec<u8>) -> Result<Pubkey, sea_orm::DbErr> {
+    Pubkey::try_from(bytes.as_slice())
+        .map_err(|_| sea_orm::DbErr::Custom("invalid pubkey bytes in query result".to_string()))
+}
+
+async fn query_all_with_timeout(
+    name: &str,
+    query: impl Future<Output = Result<Vec<sea_orm::QueryResult>, sea_orm::DbErr>>,
+) -> Result<Vec<sea_orm::QueryResult>, sea_orm::DbErr> {
+    timeout(STARTUP_BALANCES_QUERY_TIMEOUT, query)
+        .await
+        .map_err(|elapsed| sea_orm::DbErr::Custom(format!("{name} timeout: {elapsed}")))?
+}
+
+pub fn owner_pubkey_arrays(pairs: &[(Pubkey, Pubkey)]) -> (Value, Value) {
+    let owners = pairs
+        .iter()
+        .map(|(owner, _)| owner.to_bytes().to_vec())
+        .collect();
+    let pubkeys = pairs
+        .iter()
+        .map(|(_, pubkey)| pubkey.to_bytes().to_vec())
+        .collect();
+    (bytea_array(owners), bytea_array(pubkeys))
+}
+
+pub struct StartupBalanceProbe {
+    pub resolved: Vec<(Pubkey, u64)>,
+    pub misses: Vec<Pubkey>,
+}
+
+pub async fn fetch_startup_balances_by_owner(
+    db: &DatabaseConnection,
+    entries: &[(Pubkey, Pubkey)],
+    startup_slot: u64,
+) -> Result<StartupBalanceProbe, sea_orm::DbErr> {
+    let mut probe = StartupBalanceProbe {
+        resolved: Vec::new(),
+        misses: Vec::new(),
+    };
+    if entries.is_empty() {
+        return Ok(probe);
+    }
+
+    let (owners, pubkeys) = owner_pubkey_arrays(entries);
+
+    let query = db.query_all(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        r#"
+        SELECT v.pubkey, prev.lamports
+        FROM unnest($1::bytea[], $2::bytea[]) AS v(owner, pubkey)
+        LEFT JOIN LATERAL (
+            SELECT lamports FROM snapshot_accounts
+            WHERE owner = v.owner AND pubkey = v.pubkey AND slot <= $3
+            ORDER BY slot DESC
+            LIMIT 1
+        ) prev ON true
+        "#,
+        [owners, pubkeys, Value::BigInt(Some(startup_slot as i64))],
+    ));
+
+    let rows = query_all_with_timeout("fetch_startup_balances_by_owner", query).await?;
+
+    for row in rows {
+        let pubkey = parse_pubkey(row.try_get("", "pubkey")?)?;
+        let lamports: Option<i64> = row.try_get("", "lamports")?;
+        match lamports {
+            Some(lamports) => probe.resolved.push((pubkey, lamports as u64)),
+            None => probe.misses.push(pubkey),
+        }
+    }
+
+    Ok(probe)
+}
+
+pub async fn fetch_startup_balances_from_versions(
+    db: &DatabaseConnection,
+    pubkeys: &[Pubkey],
+    startup_slot: u64,
+) -> Result<Vec<(Pubkey, u64)>, sea_orm::DbErr> {
+    if pubkeys.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let query = db.query_all(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        r#"
+        SELECT v.pubkey, COALESCE(prev.lamports, 0) AS lamports
+        FROM unnest($1::bytea[]) AS v(pubkey)
+        LEFT JOIN LATERAL (
+            SELECT owner FROM temp_snapshot_account_versions
+            WHERE pubkey = v.pubkey AND slot <= $2
+            ORDER BY slot DESC
+            LIMIT 1
+        ) version ON true
+        LEFT JOIN LATERAL (
+            SELECT lamports FROM snapshot_accounts
+            WHERE owner = version.owner AND pubkey = v.pubkey AND slot <= $2
+            ORDER BY slot DESC
+            LIMIT 1
+        ) prev ON true
+        "#,
+        [
+            pubkey_bytea_array(pubkeys),
+            Value::BigInt(Some(startup_slot as i64)),
+        ],
+    ));
+
+    let rows = query_all_with_timeout("fetch_startup_balances_from_versions", query).await?;
+
+    rows.into_iter()
+        .map(|row| {
+            let pubkey = parse_pubkey(row.try_get("", "pubkey")?)?;
+            let lamports: i64 = row.try_get("", "lamports")?;
+            Ok((pubkey, lamports as u64))
+        })
+        .collect()
+}
+
+pub async fn persist_supply_total(
+    db: &DatabaseConnection,
+    commit: &SupplyCommit,
+) -> Result<(), anyhow::Error> {
+    db.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "INSERT INTO supply (slot, total, non_circulating_lamports) VALUES ($1, $2, $3) \
+         ON CONFLICT (slot) DO UPDATE SET \
+            total = EXCLUDED.total, \
+            non_circulating_lamports = EXCLUDED.non_circulating_lamports, \
+            updated_at = now()",
+        [
+            Value::from(commit.slot as i64),
+            Value::from(Decimal::from(commit.total)),
+            Value::from(commit.non_circulating.map(Decimal::from)),
+        ],
+    ))
+    .await?;
     Ok(())
 }

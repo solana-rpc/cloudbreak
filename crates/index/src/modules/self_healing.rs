@@ -3,7 +3,7 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-use cloudbreak_core::{IndexConfig, SnapshotConfig, SnapshotConfigOnIndexer};
+use cloudbreak_core::{IndexConfig, SnapshotConfig, SnapshotConfigOnIndexer, modules::supply_tracker::SupplyTracker};
 use cloudbreak_snapshot::sidecar::{SnapshotPair, SnapshotType};
 use sea_orm::DatabaseConnection;
 use std::{
@@ -38,15 +38,21 @@ pub struct SelfHealingState {
     /// [`SlotFinalizer::enqueue_gap_boundary`]).
     pub gap_boundaries: Arc<Mutex<BTreeSet<u64>>>,
     pub finalizer: SlotFinalizer,
+    pub supply_tracker: SupplyTracker,
 }
 
 impl SelfHealingState {
-    pub fn new(_config: &IndexConfig, finalizer: SlotFinalizer) -> Self {
+    pub fn new(
+        _config: &IndexConfig,
+        finalizer: SlotFinalizer,
+        supply_tracker: SupplyTracker,
+    ) -> Self {
         Self {
             last_slot_received: Arc::new(Mutex::new(0)),
             gaps_list: Arc::new(Mutex::new(Vec::new())),
             gap_boundaries: Arc::new(Mutex::new(BTreeSet::new())),
             finalizer,
+            supply_tracker,
         }
     }
 
@@ -130,6 +136,10 @@ impl SelfHealingState {
                 // startup pauses the very worker that completes startup; that is intentionally
                 // unsupported and `fill_gaps` fails fast in that case.
                 self.finalizer.pause().await;
+
+                if self.supply_tracker.mark_gap() {
+                    metrics::SUPPLY_STALE.set(1);
+                }
             }
         }
 
@@ -407,6 +417,7 @@ impl SelfHealingState {
                     .expect("Failed to lock gaps_list")
                     .is_empty();
                 if !gaps_remaining {
+                    self.supply_tracker.finish_gap();
                     self.finalizer.resume().await;
                 }
             }

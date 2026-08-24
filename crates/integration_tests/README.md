@@ -57,6 +57,7 @@ cargo run --bin integration_tests -- benchmark get-account-info
 cargo run --bin integration_tests -- benchmark get-multiple-accounts
 cargo run --bin integration_tests -- benchmark get-balance
 cargo run --bin integration_tests -- benchmark get-token-account-balance
+cargo run --bin integration_tests -- benchmark simulate-transaction
 cargo run --bin integration_tests -- benchmark -c custom.toml gpa
 ```
 
@@ -64,7 +65,7 @@ cargo run --bin integration_tests -- benchmark -c custom.toml gpa
 
 | Argument              | Description                                                                                                                                                                                  |
 | --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `<request_type>`      | Required. One of: `gpa`, `gtabo`, `gtabd`, `gpa-token-owner`, `gpa-token-mint`, `get-account-info`, `get-multiple-accounts`, `get-balance`, `get-token-account-balance`                       |
+| `<request_type>`      | Required. One of: `gpa`, `gtabo`, `gtabd`, `gpa-token-owner`, `gpa-token-mint`, `get-account-info`, `get-multiple-accounts`, `get-balance`, `get-token-account-balance`, `simulate-transaction`                       |
 | `-c, --config <path>` | Path to TOML config file (default: `cloudbreak.integration_tests.toml`)                                                                                                                       |
 
 **Request types:**

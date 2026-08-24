@@ -32,7 +32,10 @@ pub enum RequestType {
     GetMultipleAccounts,
     GetBalance,
     GetTokenAccountBalance,
+    GetTokenSupply,
+    GetTokenLargestAccounts,
     SimulateTransaction,
+    GetSupply,
 }
 
 pub async fn run(args: &BenchmarkArgs) -> Result<()> {
