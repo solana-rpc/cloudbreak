@@ -33,6 +33,7 @@ pub enum RequestType {
     GetBalance,
     GetTokenAccountBalance,
     GetTokenSupply,
+    GetTokenLargestAccounts,
     SimulateTransaction,
     GetSupply,
 }

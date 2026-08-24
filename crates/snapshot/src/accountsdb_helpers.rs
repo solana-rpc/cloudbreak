@@ -6,12 +6,61 @@
 use std::collections::{HashMap, HashSet};
 
 use serde::Deserialize;
-use solana_accounts_db::{ancestors::AncestorsForSerialization, blockhash_queue::BlockhashQueue};
+use solana_accounts_db::blockhash_queue::BlockhashQueue;
 use solana_program::clock::{Epoch, Slot, UnixTimestamp};
 use solana_pubkey::Pubkey;
+use solana_runtime::stake_history::StakeHistory;
 use solana_serde::default_on_eof;
+use solana_vote::vote_account::VoteAccounts;
 
 pub const MAX_STREAM_SIZE: u64 = 32 * 1024 * 1024 * 1024;
+
+/// Mirror of solana-runtime's `stakes::DeserializableStakes`, which is `pub(crate)`
+/// upstream — `Stakes<T>` itself only derives `Serialize` from 4.0 onward. The bincode
+/// layout is identical to `Stakes<T>`.
+#[derive(Clone, Debug, Deserialize)]
+pub struct DeserializableStakes<T> {
+    pub vote_accounts: VoteAccounts,
+    pub stake_delegations: Vec<(Pubkey, T)>,
+    pub unused: u64,
+    pub epoch: Epoch,
+    pub stake_history: StakeHistory,
+}
+
+/// Mirror of solana-runtime's `epoch_stakes::DeserializableEpochStakes` (`pub(crate)`).
+#[derive(Clone, Debug, Deserialize)]
+pub struct DeserializableEpochStakes {
+    pub vote_accounts: VoteAccounts,
+    pub stake_delegations: Vec<(Pubkey, solana_stake_interface::state::Stake)>,
+    pub unused: u64,
+    pub epoch: Epoch,
+    pub stake_history: StakeHistory,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct NodeVoteAccounts {
+    pub vote_accounts: Vec<Pubkey>,
+    pub total_stake: u64,
+}
+
+/// Mirror of solana-runtime's `epoch_stakes::DeserializableVersionedEpochStakes`
+/// (`pub(crate)`); `VersionedEpochStakes` only derives `Serialize` from 4.0 onward.
+#[derive(Clone, Debug, Deserialize)]
+pub enum DeserializableVersionedEpochStakes {
+    Current {
+        stakes: DeserializableEpochStakes,
+        total_stake: u64,
+        node_id_to_vote_accounts: HashMap<Pubkey, NodeVoteAccounts>,
+        epoch_authorized_voters: HashMap<Pubkey, Pubkey>,
+    },
+}
+
+impl DeserializableVersionedEpochStakes {
+    pub fn vote_accounts(&self) -> &VoteAccounts {
+        let Self::Current { stakes, .. } = self;
+        &stakes.vote_accounts
+    }
+}
 
 // Serializable version of AccountStorageEntry for snapshot format
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
@@ -25,7 +74,8 @@ pub struct SerializableAccountStorageEntry {
 #[allow(deprecated)]
 pub struct DeserializableVersionedBank {
     pub blockhash_queue: BlockhashQueue,
-    pub ancestors: AncestorsForSerialization,
+    // Agave dropped the `AncestorsForSerialization` alias in 4.0; it was always this map.
+    pub ancestors: HashMap<Slot, usize>,
     pub hash: solana_hash::Hash,
     pub parent_hash: solana_hash::Hash,
     pub parent_slot: Slot,
@@ -52,7 +102,7 @@ pub struct DeserializableVersionedBank {
     pub rent_collector: solana_runtime::rent_collector::RentCollector,
     pub epoch_schedule: solana_epoch_schedule::EpochSchedule,
     pub inflation: solana_inflation::Inflation,
-    pub stakes: solana_runtime::stakes::Stakes<solana_stake_interface::state::Delegation>,
+    pub stakes: DeserializableStakes<solana_stake_interface::state::Delegation>,
     #[allow(dead_code)]
     pub unused_accounts: UnusedAccounts,
     pub unused_epoch_stakes: HashMap<Epoch, ()>,
@@ -86,7 +136,7 @@ pub struct ExtraFields {
     #[serde(deserialize_with = "default_on_eof")]
     pub obsolete_epoch_accounts_hash: Option<[u8; 32]>,
     #[serde(deserialize_with = "default_on_eof")]
-    pub versioned_epoch_stakes: HashMap<u64, solana_runtime::epoch_stakes::VersionedEpochStakes>,
+    pub versioned_epoch_stakes: HashMap<u64, DeserializableVersionedEpochStakes>,
 }
 
 #[derive(Default, Clone, PartialEq, Eq, Debug, Deserialize)]

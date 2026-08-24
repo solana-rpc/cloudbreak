@@ -212,6 +212,7 @@ fn build_status(
             node_pubkey: node_pubkey.to_string(),
             activated_stake,
             commission,
+            inflation_rewards_commission_bps: Some(vote_state.inflation_rewards_commission_bps),
             epoch_vote_account: in_epoch_set,
             epoch_credits,
             last_vote,

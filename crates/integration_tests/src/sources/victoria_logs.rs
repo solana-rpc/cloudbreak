@@ -80,6 +80,9 @@ pub fn get_body_query(
         RequestType::GetTokenSupply => format!(
             "query={time_filter}rpc_call:=\"getTokenSupply\" AND pool_dedicated:~\"liquid\" | limit {limit}"
         ),
+        RequestType::GetTokenLargestAccounts => format!(
+            "query={time_filter}rpc_call:=\"getTokenLargestAccounts\" AND pool_dedicated:~\"liquid\" | limit {limit}"
+        ),
         RequestType::SimulateTransaction => format!(
             "query={time_filter}rpc_call:=\"simulateTransaction\"{simulate_pool_filter} AND body:* | limit {limit}"
         ),
@@ -192,9 +195,9 @@ pub async fn get_requests(
             // the response encoding parameter. Verify using the actual parsed field.
             //
             // Methods without an encoding field (`getBalance`, `getTokenAccountBalance`,
-            // `getTokenSupply`) report `"none"` from `extract_encoding_from_request` —
-            // for those the encoding filter is treated as a no-op (the request passes
-            // through).
+            // `getTokenSupply`, `getTokenLargestAccounts`) report `"none"` from
+            // `extract_encoding_from_request` — for those the encoding filter is
+            // treated as a no-op (the request passes through).
             if let Some(target_encoding) = encoding {
                 let actual_encoding = utils::extract_encoding_from_request(&body, request_type);
                 if actual_encoding != "none" {

@@ -69,7 +69,7 @@ solana-svm = { workspace = true }
 solana-svm-callback = { workspace = true }
 agave-precompiles = { workspace = true }
 solana-program-runtime = { workspace = true }
-agave-syscalls = { workspace = true }
+solana-syscalls = { workspace = true }
 solana-builtins = { workspace = true }
 solana-bpf-loader-program = { workspace = true }
 agave-feature-set = { workspace = true }

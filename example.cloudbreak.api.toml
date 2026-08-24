@@ -13,14 +13,21 @@ api-queries-timeout = 20
 [metrics]
 host = "0.0.0.0"
 port = 8875
-# Header used to identify the subscription for per-subscription metrics.
+# Header used to identify the subscription for per-subscription metrics. Also
+# recorded as the `subscription_id` field on the `json_encoding` trace span.
 # subscription-id-key = "x-subscription-id"
+# Header carrying the caller's request ID, recorded as the `request_id` field on
+# the `json_encoding` trace span so spans can be matched to the upstream request
+# logs. Never used as a metric label.
+# request-id-key = "x-request-id"
 # Optional per-client-IP egress bandwidth metrics (peak gauge + throughput
 # histogram). Off by default.
 # client-ip-bandwidth-enabled = false
-# Header used to group the per-client-IP bandwidth metrics. When unset (or when
-# a request lacks the header) all bandwidth folds into a single "unconfigured"
-# label. Set it to a trusted ingress header (e.g. "x-forwarded-for") to group by client IP.
+# Header used to group the per-client-IP bandwidth metrics, also recorded as the
+# `client_ip` field on the `json_encoding` trace span. When unset (or when a
+# request lacks the header) the bandwidth folds into a single "unconfigured"
+# label and the span field reports "unconfigured" — no request header is read.
+# Set it to a trusted ingress header (e.g. "x-forwarded-for") to group by client IP.
 # client-ip-key = "x-forwarded-for"
 
 [query-tracker-client]
