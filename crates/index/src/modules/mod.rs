@@ -9,6 +9,8 @@ pub mod grpc;
 pub mod hash_checker;
 pub mod health;
 pub mod lt_hash;
+pub mod non_circulating;
+pub mod non_circulating_lists;
 pub mod panic_handler;
 pub mod save_block;
 pub mod self_healing;

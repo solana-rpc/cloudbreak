@@ -1,6 +1,7 @@
 # The buffer size for queuing finalize slot events
 finalize-slot-buffer-size = 1000
 accounts-owner-map-enabled = false
+supply-tracker-enabled = false
 
 [snapshot]
 accounts-file-concurency = 32

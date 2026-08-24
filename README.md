@@ -21,6 +21,8 @@ The API server exposes the following JSON-RPC methods:
 | `getVersion`                 | Returns the cluster version, Agave-compatible (`{"solana-core": "<string>"}`). See note below for the composite-string format Cloudbreak uses.              |
 | `getGenesisHash`             | Returns the cluster genesis hash as a base58 string.                                                                                                       |
 | `getVoteAccounts`            | Returns the cluster's `current` and `delinquent` vote accounts with per-voter activated stake, commission, last vote, and recent epoch credits. Optional; only available when the Vote and Stake programs are indexed. See [Vote Accounts](#vote-accounts-getvoteaccounts). |
+| `simulateTransaction`        | Simulates a transaction against indexed account state at the requested slot and returns logs, compute units, return data, requested account state, and balance changes. Supports `sigVerify`, `replaceRecentBlockhash`, `accounts`, `innerInstructions`, and `minContextSlot`. Optional; only available on a full unfiltered index. See [Simulate Transaction](#simulate-transaction-simulatetransaction). |
+| `getSupply`                  | Returns the total and circulating supply in lamports plus the non-circulating account list. Optional; only available on a full unfiltered index with `supply-tracker-enabled = true` on the indexer. See [Supply](#supply-getsupply). |
 
 Only **confirmed** and **finalized** commitment levels are fully supported. By default, requests with `processed` commitment return an error. This can be overridden via the `processed-commitment` configuration option (see [API Configuration](#api-server-cloudbreakapitoml)).
 
@@ -703,6 +705,18 @@ A snapshot captures stake at a single point in time, but activated stake drifts 
 
 The recomputer detects drift by comparing the total activated stake across runs. It recomputes every 60 s and treats an epoch as converged once the total is unchanged for three consecutive polls and the indexed `EpochRewards` sysvar reports that reward distribution has finished. If that sysvar is not indexed, it converges on stability alone after roughly 30 minutes. After converging it keeps recomputing on a slower 600 s heartbeat, returning to the 60 s cadence if a late reward write or a healed ingestion gap moves the total again.
 
+### Simulate Transaction (`simulateTransaction`)
+
+`simulateTransaction` is optional and only served on a **full, unfiltered index** (empty `[programs]` include and exclude lists). Simulation must be able to load any account a transaction touches program, lookup-table, sysvar, and feature-gate accounts included so a filtered index cannot serve it. Cloudbreak checks this at startup, if the index is filtered, the method returns a `simulateTransaction is not supported on this node` error.
+
+The transaction is executed read-only against the indexed account state at the requested slot, nothing is committed. Cloudbreak reconstructs the cluster's actually-activated feature set at that slot from the on-chain feature accounts (rather than enabling all features), so compute-unit accounting and execution behaviour match mainnet. `replaceRecentBlockhash` substitutes the latest recorded blockhash before execution and reports it with its `lastValidBlockHeight`, `sigVerify` verifies signatures, `accounts` returns post-simulation state for the requested addresses, `innerInstructions` includes decoded inner instructions.
+
+### Supply (`getSupply`)
+
+`getSupply` is optional and only served on a **full, unfiltered index** (empty `[programs]` include and exclude lists), with `supply-tracker-enabled = true` set on the indexer. The indexer seeds the total supply from the snapshot bank's `capitalization` on every (re)start. While the snapshot is ingesting, accounts touched by live blocks are recorded in a small in-memory touched-account map; once the snapshot pass completes, those touches are reconciled against the startup-slot balances read back from the database and the tracker goes live. From then on it advances the total per confirmed block by reading each updated account's previous lamports from the database (owner-routed via the account owner map) and summing the resulting deltas — no full account→lamports map is kept in memory. One `supply` row carrying the total and the non-circulating lamports is persisted per confirmed block (pruned to the last 128 slots), and a background recomputer derives the non-circulating set from Agave's pinned non-circulating account and withdraw-authority lists plus locked stake accounts, refreshing on the same converge-then-heartbeat cadence as the epoch-stakes recomputer.
+
+The API serves from a polled cache. Requests return a node-unhealthy error until the bootstrap pass has completed and the non-circulating set has been computed. On a detected slot gap the tracker keeps applying block deltas but stops publishing totals until every gap slot has been repaired (requests fail as node-unhealthy in the meantime); a failed account write or a failed delta query marks it stale, and it stays fail-closed until the indexer restarts. For `finalized` commitment the response picks the newest persisted total at or below the finalized slot; `confirmed` returns the newest total. `context.slot` is the slot of the served row; the non-circulating account list may lag it by up to the recomputer heartbeat.
+
 ### Snapshot on Indexer Startup
 
 When the `[snapshot]` section (with `[snapshot.tracker_endpoint]`) is present in the indexer config, the indexer queries the cluster tracker, downloads the latest covering snapshot pair from the source the tracker reports, and processes the archives before beginning gRPC streaming. This provides fast bootstrapping of account state. Omit the entire `[snapshot]` section to skip this.
@@ -903,13 +917,14 @@ cp example.cloudbreak.integration_tests.toml cloudbreak.integration_tests.toml
 cargo run --bin integration_tests -- benchmark gpa
 cargo run --bin integration_tests -- benchmark gtabo
 cargo run --bin integration_tests -- benchmark gtabd
+cargo run --bin integration_tests -- benchmark simulate-transaction
 ```
 
 ### Commands
 
 | Command            | Description                                                                                                                          |
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `benchmark <type>` | Main command. Load test with optional dual-endpoint comparison. Types: `gpa`, `gtabo`, `gtabd`, `gpa-token-owner`, `gpa-token-mint`. |
+| `benchmark <type>` | Main command. Load test with optional dual-endpoint comparison. Types: `gpa`, `gtabo`, `gtabd`, `gpa-token-owner`, `gpa-token-mint`, `simulate-transaction`. |
 | `compare`          | (Legacy) Full pubkey set comparison between two endpoints with transaction history checks.                                           |
 | `get-slot`         | (Legacy) Polls `getSlot` on rpc1 every 100ms.                                                                                        |
 

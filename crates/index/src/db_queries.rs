@@ -8,20 +8,29 @@ use std::{
     time::Duration,
 };
 
-use cloudbreak_core::{IndexConfig, modules::account_owner_map::AccountOwnerMap};
-use cloudbreak_entity::{accounts, slots};
+use rust_decimal::{Decimal, prelude::ToPrimitive};
+use solana_pubkey::Pubkey;
 use sea_orm::{
     ActiveValue::Set,
     ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait,
     QueryFilter, Statement, Value,
     prelude::Expr,
-    sea_query::{Alias, OnConflict},
+    sea_query::{Alias, ArrayType, OnConflict},
 };
 use tokio::{
     task::JoinHandle,
     time::{Instant, timeout},
 };
 use yellowstone_grpc_proto::{geyser::CommitmentLevel, prelude::UnixTimestamp};
+use cloudbreak_core::{
+    IndexConfig,
+    modules::{
+        account_owner_map::AccountOwnerMap,
+        supply_tracker::{NonCirculatingBalance, SUPPLY_RING_SLOTS, SupplyCommit},
+    },
+};
+use cloudbreak_entity::{accounts, slots};
+use cloudbreak_snapshot::{bytea_array, owner_pubkey_arrays, parse_pubkey, pubkey_bytea_array};
 
 use crate::metrics;
 
@@ -63,16 +72,20 @@ pub fn insert_closed_accounts(
     slot: u64,
     config: &IndexConfig,
     accounts_owner_map: AccountOwnerMap,
-) -> Option<JoinHandle<()>> {
+    defer_map_removals: bool,
+) -> Option<JoinHandle<bool>> {
     let query_timeout = Duration::from_secs(config.database.save_block_queries_timeout);
 
     let handle = tokio::spawn(async move {
         let _guard = metrics::TokioTaskCounterGuard::new("insert_closed_accounts");
 
         let start_time = Instant::now();
+        let mut inserted = true;
 
         if accounts_owner_map.is_enabled() {
-            let result = accounts_owner_map.save_closed_accounts(pubkeys, slot).await;
+            let result = accounts_owner_map
+                .save_closed_accounts(pubkeys, slot, defer_map_removals)
+                .await;
             match result {
                 Ok(res) => {
                     tracing::debug!("saved {} closed accounts", res.rows_affected());
@@ -80,6 +93,7 @@ pub fn insert_closed_accounts(
                 Err(e) => {
                     tracing::error!(target: "save_closed_accounts_with_map", "failed to save closed accounts with map: {}", e);
                     metrics::increment_db_errors();
+                    inserted = false;
                 }
             }
         } else {
@@ -131,6 +145,7 @@ pub fn insert_closed_accounts(
                             e
                         );
                         metrics::increment_db_errors();
+                        inserted = false;
                     }
                 }
             }
@@ -138,6 +153,8 @@ pub fn insert_closed_accounts(
 
         metrics::INSERT_CLOSED_ACCOUNTS_PER_SLOT_HISTOGRAM
             .observe(start_time.elapsed().as_micros() as f64 / 1000.0);
+
+        inserted
     });
 
     Some(handle)
@@ -354,6 +371,10 @@ pub async fn insert_recent_blockhash(
     config: &IndexConfig,
 ) {
     if blockhash.is_empty() {
+        tracing::warn!(
+            "insert_recent_blockhash: empty blockhash for slot {}. Expected only for snapshot-repaired self-healing blocks",
+            slot
+        );
         return;
     }
 
@@ -392,6 +413,184 @@ pub async fn insert_recent_blockhash(
         tracing::error!("insert_recent_blockhash: failed for slot {}: {}", slot, e);
         metrics::increment_db_errors();
     }
+}
+
+pub async fn upsert_supply_row(
+    db: &DatabaseConnection,
+    commit: &SupplyCommit,
+    config: &IndexConfig,
+) {
+    let query_timeout = Duration::from_secs(config.database.save_block_queries_timeout);
+    let supply = Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "WITH upsert AS ( \
+            INSERT INTO supply (slot, total, non_circulating_lamports) VALUES ($1, $2, $3) \
+            ON CONFLICT (slot) DO UPDATE SET \
+                total = EXCLUDED.total, \
+                non_circulating_lamports = EXCLUDED.non_circulating_lamports, \
+                updated_at = now() \
+         ) \
+         DELETE FROM supply WHERE slot < $4",
+        [
+            Value::from(commit.slot as i64),
+            Value::from(Decimal::from(commit.total)),
+            Value::from(commit.non_circulating.map(Decimal::from)),
+            Value::from(commit.slot.saturating_sub(SUPPLY_RING_SLOTS) as i64),
+        ],
+    );
+    let result = timeout(query_timeout, db.execute(supply))
+        .await
+        .unwrap_or_else(|elapsed| {
+            tracing::error!("upsert_supply_row timeout ERROR: {}", elapsed);
+            Err(sea_orm::DbErr::RecordNotInserted)
+        });
+
+    if let Err(e) = result {
+        tracing::error!("upsert_supply_row failed for slot {}: {}", commit.slot, e);
+        metrics::SUPPLY_QUERY_ERRORS.inc();
+    }
+}
+
+pub async fn upsert_non_circulating_accounts(
+    db: &DatabaseConnection,
+    slot: u64,
+    accounts: &[Pubkey],
+) {
+    let result = db
+        .execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "INSERT INTO non_circulating_accounts (id, slot, accounts, updated_at) \
+             VALUES (1, $1, $2, now()) \
+             ON CONFLICT (id) DO UPDATE SET \
+                slot = EXCLUDED.slot, \
+                accounts = EXCLUDED.accounts, \
+                updated_at = now()",
+            [Value::from(slot as i64), pubkey_bytea_array(accounts)],
+        ))
+        .await;
+    if let Err(e) = result {
+        tracing::error!("upsert_non_circulating_accounts failed for slot {}: {}", slot, e);
+        metrics::SUPPLY_QUERY_ERRORS.inc();
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BlockSupplyDelta {
+    pub block_delta: i128,
+    pub routed_misses: u64,
+}
+
+const LATEST_ACCOUNT_ROW_SQL: &str = r#"
+            SELECT lamports, slot FROM (
+                SELECT lamports, slot FROM accounts
+                WHERE owner = v.owner AND pubkey = v.pubkey
+                UNION ALL
+                SELECT lamports, slot FROM snapshot_accounts
+                WHERE owner = v.owner AND pubkey = v.pubkey
+            ) u
+            ORDER BY slot DESC
+            LIMIT 1
+"#;
+
+fn numeric_array(items: Vec<u64>) -> Value {
+    Value::Array(
+        ArrayType::Decimal,
+        Some(Box::new(
+            items
+                .into_iter()
+                .map(|value| Value::Decimal(Some(Box::new(Decimal::from(value)))))
+                .collect(),
+        )),
+    )
+}
+
+pub async fn fetch_block_supply_delta(
+    db: &DatabaseConnection,
+    owners: Vec<Vec<u8>>,
+    pubkeys: Vec<Vec<u8>>,
+    new_lamports: Vec<u64>,
+    slot: u64,
+    config: &IndexConfig,
+) -> Result<BlockSupplyDelta, sea_orm::DbErr> {
+    let query_timeout = Duration::from_secs(config.database.save_block_queries_timeout);
+
+    let query = db.query_one(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        format!(
+            r#"
+        SELECT
+            COALESCE(SUM(v.new_lamports - COALESCE(prev.lamports, 0))
+                     FILTER (WHERE prev.slot IS NULL OR prev.slot < $4), 0) AS block_delta,
+            COUNT(*) FILTER (WHERE prev.slot IS NULL)                       AS routed_misses
+        FROM unnest($1::bytea[], $2::bytea[], $3::numeric[]) AS v(owner, pubkey, new_lamports)
+        LEFT JOIN LATERAL ({LATEST_ACCOUNT_ROW_SQL}) prev ON true
+        "#
+        ),
+        [
+            bytea_array(owners),
+            bytea_array(pubkeys),
+            numeric_array(new_lamports),
+            Value::BigInt(Some(slot as i64)),
+        ],
+    ));
+
+    let row = timeout(query_timeout, query)
+        .await
+        .map_err(|elapsed| {
+            sea_orm::DbErr::Custom(format!("fetch_block_supply_delta timeout: {}", elapsed))
+        })??
+        .ok_or_else(|| {
+            sea_orm::DbErr::Custom("fetch_block_supply_delta returned no row".to_string())
+        })?;
+
+    let block_delta: Decimal = row.try_get("", "block_delta")?;
+    let routed_misses: i64 = row.try_get("", "routed_misses")?;
+    let block_delta = block_delta.to_i128().ok_or_else(|| {
+        sea_orm::DbErr::Custom(format!("block_delta {} does not fit in i128", block_delta))
+    })?;
+
+    Ok(BlockSupplyDelta {
+        block_delta,
+        routed_misses: routed_misses as u64,
+    })
+}
+
+pub async fn fetch_non_circulating_balances(
+    db: &DatabaseConnection,
+    members: &[(Pubkey, Pubkey)],
+) -> Result<Vec<NonCirculatingBalance>, sea_orm::DbErr> {
+    if members.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let (owners, pubkeys) = owner_pubkey_arrays(members);
+
+    let rows = db
+        .query_all(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            format!(
+                r#"
+            SELECT v.pubkey, latest.lamports, latest.slot
+            FROM unnest($1::bytea[], $2::bytea[]) AS v(owner, pubkey)
+            JOIN LATERAL ({LATEST_ACCOUNT_ROW_SQL}) latest ON true
+            "#
+            ),
+            [owners, pubkeys],
+        ))
+        .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            let pubkey = parse_pubkey(row.try_get("", "pubkey")?)?;
+            let lamports: i64 = row.try_get("", "lamports")?;
+            let slot: i64 = row.try_get("", "slot")?;
+            Ok(NonCirculatingBalance {
+                pubkey,
+                slot: slot as u64,
+                lamports: lamports as u64,
+            })
+        })
+        .collect()
 }
 
 /// The latest persisted slot for each commitment level, plus the finalized→confirmed lag.
@@ -444,7 +643,7 @@ pub async fn insert_accounts_chunk(
     chunk: Vec<accounts::ActiveModel>,
     byte_size: usize,
     config: &IndexConfig,
-) {
+) -> bool {
     let query_timeout = Duration::from_secs(config.database.save_block_queries_timeout);
 
     let start_time = Instant::now();
@@ -461,17 +660,23 @@ pub async fn insert_accounts_chunk(
         Err(sea_orm::DbErr::RecordNotInserted)
     });
 
-    match result {
-        Ok(res) => tracing::debug!("upsert_accounts_batched: {}", res),
+    let inserted = match result {
+        Ok(res) => {
+            tracing::debug!("upsert_accounts_batched: {}", res);
+            true
+        }
         Err(e) => {
             tracing::error!("upsert_accounts_batched ERROR: {}", e);
             metrics::increment_db_errors();
+            false
         }
-    }
+    };
 
     let elapsed = start_time.elapsed().as_secs_f64();
     if elapsed > 0.250 {
         tracing::debug!(target: "slow_chunk", "slow chunk: len: {}, size: {}", chunk_len, byte_size);
     }
     metrics::record_chunk_processing(elapsed, "block");
+
+    inserted
 }

@@ -11,6 +11,7 @@ target_rps = 5.0
 max_in_flight = 100
 duration_secs = 100
 timeout_secs = 60
+# start_on_first_request = true  # Start the countdown when the first request is caught (use for simulateTransaction)
 # Optional bandwidth cap in Gbit/s, enforced against actual received rpc1 bytes.
 # Works together with target_rps: if throughput hits this limit below target_rps,
 # effective RPS is throttled so the average stays under the cap. Omit to disable.
@@ -33,6 +34,9 @@ path = "crates/integration_tests/gpa_benchmark_requests.json"
 # encoding = "jsonParsed"
 # pool_dedicated = "liquid"  # Value for the `pool_dedicated` VictoriaLogs filter; omit for no constraint
 # inject_context = true  # On no-context mismatch, re-sends with withContext:true and slot compensation before deciding
+# window_seconds = 30    # Trailing window in seconds; takes precedence over `minutes` (use for simulateTransaction: keeps replayed blockhashes fresh)
+# poll_interval_secs = 5 # How often the background fetcher re-queries VictoriaLogs
+# replay_once = true     # Send each req_id exactly once instead of cycling the pool (recommended for simulateTransaction)
 
 # Example of mismatch_dir source (re-run previously mismatched requests)
 # [source]
