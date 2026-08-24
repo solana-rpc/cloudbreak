@@ -4,10 +4,10 @@
  */
 
 use anyhow::{Context, Result};
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement};
-use solana_lattice_hash::lt_hash::LtHash;
 use cloudbreak_core::AccountSelectorConfig;
 use cloudbreak_snapshot::lt_hash::lt_hash_account;
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement};
+use solana_lattice_hash::lt_hash::LtHash;
 
 fn build_owner_filter(programs: &AccountSelectorConfig) -> String {
     let program_owners: Vec<Vec<u8>> = programs
@@ -79,9 +79,7 @@ async fn query_accounts_batch(
         .query_all(Statement::from_string(DbBackend::Postgres, sql))
         .await
         .with_context(|| format!("Failed to query accounts batch prefix=0x{:04x}", prefix));
-    txn.commit()
-        .await
-        .context("Failed to commit transaction")?;
+    txn.commit().await.context("Failed to commit transaction")?;
     result
 }
 

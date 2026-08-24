@@ -167,7 +167,12 @@ impl GpaProcessor {
 
                 Ok(MaybeJsonAccount::Fresh(keyed))
             }
-            Self::Cached { cached_query, .. } => match cached_query {
+            Self::Cached {
+                cache,
+                cached_query,
+                normalized_query,
+                ..
+            } => match cached_query {
                 Some(cached_query) => GpaCache::process_row(
                     row,
                     encoding,
@@ -176,6 +181,8 @@ impl GpaProcessor {
                     encode_span,
                     additional_mint_data,
                     cached_query,
+                    cache,
+                    normalized_query.as_ref(),
                 ),
                 // If the query is not cached, also process it normally
                 None => {
@@ -480,6 +487,8 @@ impl GpaCache {
         encode_span: &tracing::Span,
         additional_mint_data: Option<AccountAdditionalDataV3>,
         cached_query: &CachedQuery,
+        cache: &Arc<RwLock<GpaCache>>,
+        normalized_query: Option<&NormalizedQuery>,
     ) -> Result<MaybeJsonAccount, RpcError> {
         encode_span.in_scope(|| {
             // We use owner field to detect if this is a row returning data or not (which means it's a cached row)
@@ -511,6 +520,21 @@ impl GpaCache {
                     let bytes = cached_query.accounts.get(&pubkey).ok_or_else(|| {
                         // If the account was returned as cached from DB, should be in cache, so error if not
                         tracing::error!(target: "gpa_cache", "Account {} not found in cached query", pubkey);
+
+                        // The cached query is internally inconsistent: evict it so
+                        // the next request rebuilds it from scratch, and flag the
+                        // failure with a dedicated status on the request counter.
+                        if let Some(normalized_query) = normalized_query {
+                            cache
+                                .write()
+                                .expect("gpa cache rwlock poisoned")
+                                .remove_query(normalized_query);
+                        }
+
+                        metrics::CLOUDBREAK_API_REQUESTS_TOTAL
+                            .with_label_values(&["gPA", "cacheError"])
+                            .inc();
+
                         RpcError::InternalError
                     })?;
 
@@ -547,6 +571,32 @@ impl GpaCache {
             .entry(slot)
             .or_default()
             .push(normalized_query);
+    }
+
+    /// Removes a single query from the cache, fixing up `size`, `pinned_size`
+    /// and the per-slot bucket accounting.
+    ///
+    /// Used to self-heal when a cached query is found to be internally
+    /// inconsistent (an account the DB reported as cached is missing from the
+    /// in-memory `CachedQuery`), so a subsequent request re-populates it fresh.
+    pub fn remove_query(&mut self, query: &NormalizedQuery) {
+        let Some(removed) = self.queries.remove(query) else {
+            return;
+        };
+
+        self.size = self.size.saturating_sub(removed.size);
+        if self.is_pinned_size(removed.size) {
+            self.pinned_size = self.pinned_size.saturating_sub(removed.size);
+        }
+
+        if let Some(bucket) = self.queries_for_slot.get_mut(&removed.slot) {
+            bucket.retain(|q| q != query);
+            if bucket.is_empty() {
+                self.queries_for_slot.remove(&removed.slot);
+            }
+        }
+
+        self.update_size_metrics();
     }
 
     /// it will delete the oldes queries until reach the `bytes_to_free` target.

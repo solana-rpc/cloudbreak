@@ -33,7 +33,7 @@ pub async fn get_supply(
             target: "get_supply",
             "non-circulating accounts not computed yet; returning node unhealthy"
         );
-        return Err(RpcError::NodeUnhealthy);
+        return Err(state.node_unhealthy());
     };
 
     let finalized_slot = match state
@@ -62,7 +62,7 @@ pub async fn get_supply(
             "no cached supply row for {:?} commitment; returning node unhealthy",
             commitment
         );
-        return Err(RpcError::NodeUnhealthy);
+        return Err(state.node_unhealthy());
     };
     let Some(non_circulating) = row.non_circulating else {
         tracing::warn!(
@@ -70,7 +70,7 @@ pub async fn get_supply(
             "supply row at slot {} has no non-circulating lamports yet; returning node unhealthy",
             row.slot
         );
-        return Err(RpcError::NodeUnhealthy);
+        return Err(state.node_unhealthy());
     };
     if finalized_slot.saturating_sub(row.slot) > MAX_SUPPLY_STALENESS_SLOTS {
         tracing::warn!(
@@ -80,7 +80,7 @@ pub async fn get_supply(
             MAX_SUPPLY_STALENESS_SLOTS,
             finalized_slot
         );
-        return Err(RpcError::NodeUnhealthy);
+        return Err(state.node_unhealthy());
     }
 
     let non_circulating_accounts = if config.exclude_non_circulating_accounts_list {

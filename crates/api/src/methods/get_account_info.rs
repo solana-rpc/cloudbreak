@@ -6,7 +6,6 @@
 use std::sync::Arc;
 
 use rust_decimal::prelude::ToPrimitive;
-use sea_orm::EntityTrait;
 use sea_orm::sqlx::Row;
 use sea_orm::sqlx::{self};
 use solana_account::AccountSharedData;
@@ -19,7 +18,6 @@ use solana_rpc_client_api::config::RpcAccountInfoConfig;
 use solana_rpc_client_api::response::{Response as RpcResponse, RpcResponseContext};
 use tokio::time::timeout;
 use tracing::Instrument;
-use cloudbreak_entity::slots;
 
 use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
@@ -49,26 +47,7 @@ pub async fn get_account_info(
         .transpose()?
         .unwrap_or(CommitmentLevel::Finalized);
 
-    // If the slot syncronizer is enabled, use the cached slot data; otherwise query the database.
-    // (Mirrors get_program_accounts at program.rs:84-104.)
-    let (latest_slot, block_time) = match &state.slot_syncronizer_data {
-        Some(data) => {
-            let data = data.read().expect("Failed to read slot syncronizer data");
-            (
-                data.get_slot_for_commitment(commitment),
-                data.get_block_time_for_commitment(commitment),
-            )
-        }
-        None => {
-            let slot_model = slots::Entity::find_by_id(commitment as i32)
-                .one(&state.database)
-                .instrument(tracing::info_span!("slot_db"))
-                .await?;
-
-            let model = slot_model.ok_or(RpcError::InternalError)?;
-            (model.slot as u64, model.block_time)
-        }
-    };
+    let (latest_slot, block_time) = state.latest_slot_and_block_time(commitment).await?;
 
     if let Some(min_context_slot) = config.min_context_slot
         && latest_slot < min_context_slot

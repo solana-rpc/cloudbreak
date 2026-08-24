@@ -4,5 +4,8 @@
  */
 
 pub mod account_owner_map;
+pub mod index_identity;
+pub mod query_tracker_api;
 pub mod rpc_filter_type;
+pub mod service_health;
 pub mod supply_tracker;

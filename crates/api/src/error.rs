@@ -30,7 +30,13 @@ pub enum RpcError {
     #[error("Processed commitment level is not supported")]
     ProcessedCommitmentNotSupported,
     #[error("Node is unhealthy")]
-    NodeUnhealthy,
+    NodeUnhealthy {
+        /// When `true`, this is surfaced as an HTTP `503 Service Unavailable`
+        /// response instead of a `200 OK` JSON-RPC error (see the
+        /// `unhealthy-response` config option). Decided at the error site from
+        /// [`CloudbreakRpcState::unhealthy_response`].
+        service_unavailable: bool,
+    },
     #[error(
         "Account {pubkey} is owned by {owner}, which is excluded from this indexer's program filter; cannot serve this account"
     )]
@@ -79,7 +85,7 @@ impl RpcError {
             RpcError::InvalidParamsWithMessage(_) => "INVALID_PARAMS_WITH_MESSAGE",
             RpcError::KeyExcludedFromSecondaryIndex { .. } => "KEY_EXCLUDED_FROM_SECONDARY_INDEX",
             RpcError::ProcessedCommitmentNotSupported => "PROCESSED_COMMITMENT_NOT_SUPPORTED",
-            RpcError::NodeUnhealthy => "NODE_UNHEALTHY",
+            RpcError::NodeUnhealthy { .. } => "NODE_UNHEALTHY",
             RpcError::AccountOwnerExcluded { .. } => "ACCOUNT_OWNER_EXCLUDED",
             RpcError::AccountNotFound { .. } => "Invalid param: could not find account",
             RpcError::NotATokenAccount { .. } => "Invalid param: not a Token account",
@@ -100,7 +106,7 @@ impl RpcError {
             RpcError::InvalidParamsWithMessage(_) => -32602,
             RpcError::KeyExcludedFromSecondaryIndex { .. } => -32010,
             RpcError::ProcessedCommitmentNotSupported => -32003,
-            RpcError::NodeUnhealthy => -32005,
+            RpcError::NodeUnhealthy { .. } => -32005,
             RpcError::AccountOwnerExcluded { .. } => -32010,
             RpcError::AccountNotFound { .. } => -32602,
             RpcError::NotATokenAccount { .. } => -32602,

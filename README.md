@@ -77,7 +77,7 @@ The **cluster tracker** is a [Blockdaemon `solcluster tracker`](https://github.c
 | `crates/api/`               | `cloudbreak-api`           | HTTP JSON-RPC server (Hyper). Serves `getProgramAccounts`, `getTokenAccountsByOwner`, `getTokenAccountsByDelegate`, `getTokenAccountsByMint`, `getAccountInfo`, `getMultipleAccounts`, `getBalance`, `getTokenAccountBalance`, `getSlot`, `getHealth`, `getVersion`, `getGenesisHash`, and (when the Vote and Stake programs are indexed) `getVoteAccounts`. Streams `getProgramAccounts` and `getTokenAccountsByMint` responses as chunked JSON-RPC body frames, applies per-request `statement_timeout` and a total request timeout, supports batch requests with bounded concurrency, optionally caches results in memory (`[gpa-cache]`), and reports query usage to the query tracker.                                                                   |
 | `crates/index/`             | `cloudbreak-index`         | Live indexer. Subscribes to Yellowstone gRPC, applies program filters, writes account/slot state to Postgres. Includes finalize-slot pipeline, self-healing for slot gaps. Uses the `snapshot` crate to optionally load a full snapshot on startup for fast bootstrapping.                                                                                 |
 | `crates/snapshot/`          | `cloudbreak-snapshot`      | Batch loads Solana full and incremental snapshots. Queries a cluster tracker (`/v1/snapshots`) to find a covering snapshot pair, downloads the archives from the source reported by the tracker, unpacks them, reads Solana `AccountsFile` entries, bulk-upserts into Postgres, handles deduplication, optional partition clustering, and index creation. |
-| `crates/query-tracker/`     | `cloudbreak-query-tracker` | JSON-RPC sidecar service (jsonrpsee). Counts `getProgramAccounts`-shaped queries, maintains a priority queue, and optionally drives automatic `CREATE INDEX` on Postgres based on query frequency. Includes periodic query count resets.                                                                                                                   |
+| `crates/query-tracker/`     | `cloudbreak-query-tracker` | HTTP sidecar service (Hyper). Records `getProgramAccounts`-shaped demand in a durable `index_patterns` table, ranks candidates by a configurable priority mode, and optionally drives automatic `CREATE INDEX`/eviction on Postgres, reconciling API demand against Postgres `idx_scan` supply. Fully restartable; exposes `/track`, `/debug/*`, `/metrics`, `/health` on a single port.                                                                                                                   |
 | `crates/core/`              | `cloudbreak-core`          | Shared library. Contains all configuration struct definitions (TOML deserialization), database connection helpers, the `AccountOwnerMap` abstraction, and the `AccountSelectorConfig` (include/exclude program filter logic synced to DB).                                                                                                                 |
 | `crates/entity/`            | `cloudbreak-entity`        | SeaORM entity definitions for Postgres tables: `accounts`, `snapshot_accounts`, `slots`, `service_health`. Also defines the `CommitmentLevel` enum and account conversion types. (The `environment_info` table is accessed via raw SQL in `cloudbreak-core`, not as a SeaORM entity.)                                                                       |
 | `crates/migration/`         | `cloudbreak-migration`     | Schema evolution via `sea-orm-migration`. Defines `accounts`/`snapshot_accounts` DDL helpers with TOML-configurable owner partitioning (none / HASH / LIST / LIST+HASH) and per-index toggles, plus bs58 encode/decode PL/pgSQL functions, the `service_health` table, and the `environment_info` table (program filter + Solana version). See [`crates/migration/README.md`](crates/migration/README.md).                                                                                                                |
@@ -179,6 +179,16 @@ cargo run -p cloudbreak-migration -- fresh     # Drop all, reapply
 cargo run -p cloudbreak-migration -- refresh   # Rollback all, reapply
 ```
 
+> **⚠️ The database is ephemeral, and each run expects a clean, empty schema.** The main
+> data tables (`accounts`, `snapshot_accounts`, and their partitions) are created as Postgres
+> **`UNLOGGED`** tables — they trade crash-durability for write throughput, so a Postgres
+> crash or restart **truncates** them. Cloudbreak is designed around this: the indexer
+> rebuilds state from the snapshot + live gRPC stream, it does **not** treat the database as
+> durable storage. Because of that, **do not reuse a dirty database between runs** — start each
+> run against a freshly-created, empty schema. Reset with `cargo run -p cloudbreak-migration --
+> fresh` (drop all + reapply) or `refresh` (rollback all + reapply), or drop and recreate the
+> database, rather than pointing a new run at leftover tables from a previous one.
+
 See [`crates/migration/README.md`](crates/migration/README.md) for the full config reference (partitioning shapes, per-index toggles, env vars, and CLI flags).
 
 ##### Table Partitioning & Indexes
@@ -230,7 +240,7 @@ cargo run -p cloudbreak -- --config ./cloudbreak.query-tracker.toml query-tracke
 **First startup notes:**
 
 - If `[snapshot]` is configured, the indexer will download a full Solana snapshot on first start. This can be **very large** (100+ GB for mainnet) and take significant time. With the default `tracker-config.yml` (which uses the public, rate-limited `https://api.mainnet.solana.com` endpoint), the download can also be throttled, so allow extra time or point `tracker-config.yml` at your own snapshot source — see [Cluster Tracker](#cluster-tracker). For a lighter local setup, either remove the `[snapshot]` section to skip snapshot loading entirely (the indexer will begin from live gRPC data only), or index a small program like `Stake11111111111111111111111111111111111111`.
-- **The correct, healthy steady state requires the snapshot to be loaded.** Until the indexer finishes snapshot processing, the database holds only the partial data streamed in live from gRPC, and the `service_health` row stays unhealthy — so `getHealth` will return an error. This is expected: `getSlot` and `getProgramAccounts` work immediately as data flows in, but `getHealth` is intentionally the last thing to clear. **Running without `[snapshot]` is only meant for a quick smoke test of the full setup, or for iterating on a code change that doesn't need a complete dataset** — in that mode `getHealth` will *never* clear, by design. See [Troubleshooting: `getHealth` returns `INTERNAL_ERROR`](#gethealth-returns-internal_error) for details.
+- **The correct, healthy steady state requires the snapshot to be loaded.** When `[snapshot]` is configured, the indexer stays unhealthy until snapshot processing finishes — the database holds only the partial data streamed in live from gRPC until then, and the `service_health` row (and `getHealth`) stays unhealthy. This is expected: `getSlot` works immediately as data flows in, but health is intentionally the last thing to clear, and while it is unhealthy the slot-gated account methods (`getAccountInfo`, `getMultipleAccounts`, `getProgramAccounts`, the token methods, `simulateTransaction`) return `NODE_UNHEALTHY`. **Running without `[snapshot]` is only meant for a quick smoke test of the full setup, or for iterating on a code change that doesn't need a complete dataset** — in that mode there is no startup snapshot to wait on, so the node reports **healthy** as soon as it begins processing blocks and serves those account methods against the partial live dataset (do **not** treat a no-snapshot node as a source of complete state). See [Troubleshooting: `getHealth` returns `INTERNAL_ERROR`](#gethealth-returns-internal_error) for details.
 - The API example config has `[tracing] enabled = true`, which sends traces to the Tempo instance from Docker Compose. If you're not running the compose stack, set `enabled = false` or remove the `[tracing]` section to avoid connection errors in logs.
 
 #### Manual PostgreSQL Setup (Alternative)
@@ -324,9 +334,10 @@ If you want to run a tracker outside Compose, point `endpoint` at it.
 
 When this section is present, the indexer downloads and processes snapshots on startup for fast bootstrapping.
 
-| Key                        | Type    | Default | Description                                                     |
-| -------------------------- | ------- | ------- | --------------------------------------------------------------- |
-| `accounts-file-concurency` | `usize` | (none)  | Max number of `AccountsFile` entries to process simultaneously. |
+| Key                             | Type    | Default | Description                                                                                                                                                                                                             |
+| ------------------------------- | ------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `accounts-file-concurency`      | `usize` | (none)  | Max number of `AccountsFile` entries to process simultaneously.                                                                                                                                                       |
+| `gap-fill-max-snapshot-retries` | `u32`   | `10`    | Max consecutive gap-filling iterations (~30 s each) allowed to fail fetching a covering snapshot pair from the tracker before the self-healing task gives up and fails the indexer. Resets on the first successful fetch. |
 
 #### `[snapshot.tracker_endpoint]` (optional)
 
@@ -372,6 +383,9 @@ Shared across all services. Controls the SeaORM/SQLx connection pool and query t
 | `chunk-size`           | `usize`  | `1000`            | Chunk size for subscription events.                                                  |
 | `max-chunk-bytes-data` | `usize`  | `2097152` (2 MiB) | Max bytes per data chunk.                                                            |
 | `max-grpc-errors`      | `usize`  | **required**      | Max gRPC errors before attempting reconnection (always reconnects on stream `None`). |
+| `reconnect-give-up`    | `Duration` | `"600s"`        | How long to keep retrying (re)connection/subscription before giving up and panicking. |
+| `reconnect-backoff`    | `Duration` | `"5s"`          | Delay between (re)connection/subscription attempts.                                  |
+| `reconnect-from-slot-retain` | `Duration` | `"300s"`  | How long a reconnection keeps replaying from the last received slot before dropping `from_slot` (the server may no longer have it buffered). |
 
 #### `[programs]`
 
@@ -386,11 +400,16 @@ Use either `include` or `exclude`, not both. If `include` is non-empty, `exclude
 
 #### `[metrics]`
 
-| Key                   | Type     | Default               | Description                             |
-| --------------------- | -------- | --------------------- | --------------------------------------- |
-| `host`                | `String` | `"0.0.0.0"`           | Prometheus metrics server bind address. |
-| `port`                | `u16`    | `8875`                | Prometheus metrics server port.         |
-| `subscription-id-key` | `String` | `"x-subscription-id"` | HTTP header name for subscription ID.   |
+| Key                           | Type             | Default               | Description                                                                                                                                                              |
+| ----------------------------- | ---------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `host`                        | `String`         | `"0.0.0.0"`           | Prometheus metrics server bind address.                                                                                                                                  |
+| `port`                        | `u16`            | `8875`                | Prometheus metrics server port.                                                                                                                                          |
+| `subscription-id-key`         | `String`         | `"x-subscription-id"` | HTTP header name for subscription ID. Labels the per-subscription metrics and is recorded on the `json_encoding` span.                                                    |
+| `request-id-key`              | `String`         | `"x-request-id"`      | HTTP header name for the caller's request ID. Recorded on the `json_encoding` span so traces can be correlated with upstream request logs; never used as a metric label.  |
+| `client-ip-bandwidth-enabled` | `bool`           | `false`               | Enable the per-client-IP egress bandwidth metrics (peak gauge + throughput histogram).                                                                                    |
+| `client-ip-key`               | `Option<String>` | (unset)               | HTTP header name carrying the client IP. Groups the bandwidth metrics and is recorded on the `json_encoding` span. When unset, or absent on a request, both report `unconfigured` instead of reading any client-settable/PII header. |
+
+The last three keys only take effect in the API server.
 
 ### API Server (`cloudbreak.api.toml`)
 
@@ -482,6 +501,23 @@ Example:
 processed-commitment = "use-confirmed"
 ```
 
+#### `unhealthy-response` (top-level, optional)
+
+Controls how the API responds to requests while the node is unhealthy (the `slots.health` flag is unset / the slot syncronizer reports unhealthy). This is a top-level key (not inside any section).
+
+| Value                | Description                                                                                                      |
+| -------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `"json-rpc-error"`   | **(default)** Return a `NODE_UNHEALTHY` JSON-RPC error (code `-32005`) with HTTP `200 OK`.                        |
+| `"http-unavailable"` | Return an HTTP `503 Service Unavailable` response instead.                                                        |
+
+> **Note:** `http-unavailable` only applies to single requests. Batch requests always return HTTP `200 OK` with per-item JSON-RPC errors, since an HTTP status cannot be expressed per batch item.
+
+Example:
+
+```toml
+unhealthy-response = "http-unavailable"
+```
+
 #### `[tracing]` (optional)
 
 OpenTelemetry tracing configuration. If this section is omitted, OTel is disabled and only `tracing-subscriber` is used.
@@ -504,34 +540,49 @@ OpenTelemetry tracing configuration. If this section is omitted, OTel is disable
 | Key               | Type     | Default     | Description                 |
 | ----------------- | -------- | ----------- | --------------------------- |
 | `host`            | `String` | `"0.0.0.0"` | Bind address.               |
-| `port`            | `u16`    | `4001`      | Listen port for JSON-RPC.   |
+| `port`            | `u16`    | `4001`      | Listen port for the single HTTP server, which serves both the functional endpoints (`/track`, `/debug/*`) and the operational endpoints (`/metrics`, `/health`). |
 | `max-connections` | `u32`    | `100`       | Max concurrent connections. |
 
 #### `[database]`
 
 Same as other services.
 
-#### `[metrics]`
-
-| Key    | Type     | Default     | Description                                              |
-| ------ | -------- | ----------- | -------------------------------------------------------- |
-| `host` | `String` | `"0.0.0.0"` | Metrics bind address.                                    |
-| `port` | `u16`    | `8876`      | Metrics port (note: different default from API/indexer). |
-
 #### `[query-tracker]`
 
-Controls the automatic database index creation behavior.
+Controls demand recording, automatic index creation, usage-based eviction and
+discrepancy detection. All state lives in the `index_patterns` table, so the
+service is fully restartable; these keys only tune behavior. Defaults reproduce
+the previous behavior.
 
-| Key                           | Type          | Default      | Description                                                                                                                               |
-| ----------------------------- | ------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `create-database-indexes`     | `bool`        | `false`      | Enable automatic `CREATE INDEX` based on query frequency.                                                                                 |
-| `index-generation-threshold`  | `u32`         | `10`         | Number of times a unique query must be seen before it becomes eligible for indexing.                                                      |
-| `index-creation-delay`        | `Duration`    | `"10s"`      | Delay between `CREATE INDEX` operations to avoid overloading the database.                                                                |
-| `query-counts-reset-interval` | `Duration`    | `"24h"`      | Interval at which the query count queue is cleared.                                                                                       |
-| `included-programs`           | `Vec<String>` | `[]`         | Only create indexes for these program pubkeys. Empty means all programs are eligible.                                                     |
-| `excluded-programs`           | `Vec<String>` | `[]`         | Never create indexes for these program pubkeys.                                                                                           |
-| `indexer-metrics`             | `String`      | **required** | `host:port` of the indexer's Prometheus metrics endpoint (e.g. `"localhost:8875"`). Used to check indexer health before creating indexes. |
-| `indexer-metrics-threshold`   | `u64`         | `5`          | The `cloudbreak_finalize_slot_handler_queue_size` metric threshold; index creation is paused when the indexer queue exceeds this value.    |
+| Key                             | Type          | Default      | Description                                                                                                                               |
+| ------------------------------- | ------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `create-database-indexes`       | `bool`        | `false`      | Enable automatic `CREATE INDEX` from recorded demand. When off, demand is still recorded.                                                 |
+| `index-generation-threshold`    | `u32`         | `10`         | Minimum demand count before a pattern becomes a creation candidate.                                                                       |
+| `index-creation-delay`          | `Duration`    | `"10s"`      | Poll interval of the creation loop.                                                                                                       |
+| `priority-mode`                 | `String` \| table | `"frequency"`| Ranking criterion shared by creation (highest first) and eviction (lowest first). Bare strings rank on lifetime totals: `frequency`, `cost`, `cost-per-hit`. `weighted` is a table that ranks on **recent windowed** activity and carries its own weights + measurement window: `priority-mode = { weighted = { demand-weight = 1.0, supply-weight = 0.0, failure-weight = 0.0, latency-weight = 0.0, rate-window = "1h" } }`. Score = `(avg_cost · gain) · (1 + demand-weight·demand + supply-weight·(supply/2) + failure-weight·failed)`, each count being the value in the last `rate-window` (default `1h`); supply is halved (a GPA scans both tables). `gain = 1 + latency-weight·ln((without-index-compensation-factor·without)/with)` scales `avg_cost` by the measured latency win from the index (neutral until the pattern has served requests both with and without the index). All weights default `0.0` = plain average cost-per-hit (no rate roll). |
+| `cost-eligibility-threshold-us` | `u64?`        | (none)       | Only patterns whose average cost-per-hit reaches this many µs are eligible.                                                               |
+| `included-programs`             | `Vec<String>` | `[]`         | Only create indexes for these program pubkeys. Empty means all programs are eligible.                                                     |
+| `excluded-programs`             | `Vec<String>` | `[]`         | Never create indexes for these program pubkeys.                                                                                           |
+| `indexer-metrics`               | `String`      | **required** | `host:port` of the indexer's Prometheus metrics endpoint. Used to defer DDL (create/drop) when the indexer is behind.                     |
+| `indexer-metrics-threshold`     | `u64`         | `5`          | `cloudbreak_finalize_slot_handler_queue_size` threshold above which DDL is deferred.                                                       |
+| `max-auto-indexes`              | `usize?`      | (none)       | Optional cap on total indexes on the `snapshot_accounts` table.                                                                          |
+| `index-eviction-enabled`        | `bool`        | `false`      | Enable usage-based eviction of idle auto-indexes.                                                                                         |
+| `use-supply-for-eviction`       | `bool`        | `false`      | When `true`, also require supply-idle (`last_seen_used` / no `idx_scan` growth) for eviction eligibility. Off = demand-idle + age-grace only. Enabling is more conservative but the eviction-pass supply refresh can collapse the candidates list for up to `index-min-idle` afterward on high-rotation DBs (mitigate with more frequent eviction passes). |
+| `index-eviction-interval`       | `Duration`    | `"1h"`       | How often the eviction pass runs.                                                                                                        |
+| `index-min-age-grace`           | `Duration`    | `"1h"`       | Minimum age before an index is eligible for eviction.                                                                                    |
+| `index-min-idle`                | `Duration`    | `"24h"`      | How long a pattern must be idle to be droppable. Demand-idle is always required; supply-idle only when `use-supply-for-eviction` is on. |
+| `eviction-fill-threshold`       | `f64`         | `0.9`        | Fill target as a fraction of `max-auto-indexes`: creation is unguarded below it, value-guarded in the buffer band above it, and eviction trims back down to it (needs `max-auto-indexes`).                                                        |
+| `value-guard-creation-bias`     | `f64`         | `1.0`        | Multiplier on a **creation candidate's** score in the creation-time value guard, tuning stickiness toward existing indexes (which carry `gain`/`idx_scan` signal new candidates lack). `> 1.0` builds new indexes more readily (less sticky), `< 1.0` favors incumbents (stickier), `1.0` compares as-is. Only consulted in the buffer band. |
+| `drop-lock-timeout`             | `Duration`    | `"5s"`       | `lock_timeout` for each `DROP INDEX`; on timeout the drop is skipped and retried next pass.                                              |
+| `drop-retries`                  | `u32`         | `1`          | Extra `DROP INDEX` attempts on lock timeout within a pass.                                                                               |
+| `index-regression-guard`        | `String`      | `"off"`      | What to do when an index measures *slower* than the pattern was without it. `off` ignores it; `warn` logs + reports the count via `query_tracker_regressed_indexes`; `evict` drops the pair and marks the pattern `rejected` (not rebuilt until proven slower without the index). Runs in the eviction pass (requires `index-eviction-enabled`) but **ignores the fill threshold**. |
+| `index-regression-ratio`        | `f64`         | `1.2`        | How many times slower *with* the index than without before it counts as a regression (`1.2` = ≥20% slower). Also the hysteresis a `rejected` pattern must clear before it is retried.  |
+| `index-regression-retry-delay`  | `Duration`    | `"6h"`       | How long a pattern rejected for a regression must stay rejected — accumulating fresh without-index samples — before it may be retried (and only if its without-index average has climbed past `index-regression-ratio ×` the with-index average recorded at rejection). Guards against rebuild churn. Detection needs no separate window: an index is judged once it is older than `index-min-age-grace`. |
+| `without-index-compensation-factor` | `f64`     | `1.0`        | Multiplier on the **without-index** average cost wherever it is compared to the with-index average — the `weighted` latency gain *and* the regression guard's detection/recovery. Compensates for pg settings that keep the two sides from being strictly comparable (e.g. a without-index GPA fans out across parallel workers, so its wall-clock looks cheap while it burns far more CPU/IO than a single-worker index scan). `> 1` inflates the measured without-index cost so the index earns proportional credit and is less likely to be judged a regression; `1.0` compares raw wall-clock as-is. |
+| `discrepancy-enabled`           | `bool`        | `true`       | Flag/metric when demand (API) and supply (`idx_scan`) diverge (e.g. Postgres ignoring an index).                                          |
+| `discrepancy-delta`             | `f64`         | `0.10`       | Relative gap between demand and supply beyond which a pattern is flagged.                                                                |
+| `explain-enabled`               | `bool`        | `false`      | Optional third signal: periodic `EXPLAIN` (plan only) sampling of each index, on both tables, using the stored `example_request` values. |
+| `explain-interval`              | `Duration`    | `"6h"`       | How often the EXPLAIN sampling pass runs when enabled.                                                                                   |
 
 ### Snapshot Processor (`cloudbreak.snapshot.toml`)
 
@@ -571,15 +622,34 @@ Same as other services.
 
 ## Automatic Database Index Creation
 
-The query tracker enables automatic creation of database indexes based on observed query patterns. This is how it works:
+The query tracker enables automatic creation of database indexes based on observed query patterns. All decision state is persisted in the durable `index_patterns` table, so the service is fully restartable and never loses recorded demand. This is how it works:
 
-1. The API server counts unique `getProgramAccounts`-shaped queries and reports them to the query tracker service.
-2. When a query pattern exceeds `index-generation-threshold` within a reset interval, it becomes eligible for indexing.
-3. A background task in the query tracker pops the highest-count query from the priority queue and runs `CREATE INDEX` on the database.
-4. Only one index is created at a time, with a configurable delay (`index-creation-delay`) between operations to avoid overloading the database.
-5. Before creating an index, the query tracker checks the indexer's `cloudbreak_finalize_slot_handler_queue_size` metric. If the queue size exceeds `indexer-metrics-threshold`, index creation is paused until the indexer catches up.
-6. The query count queue is cleared every `query-counts-reset-interval` to avoid stale patterns driving index creation.
+1. The API server reports `getProgramAccounts`-shaped query demand (request counts, cost, failures) to the query tracker at the `/track` endpoint, which folds it into each pattern's row in `index_patterns`.
+2. When a pattern's cumulative demand reaches `index-generation-threshold`, it becomes a creation candidate. Demand is cumulative and persisted — there is no reset interval.
+3. The creation loop wakes every `index-creation-delay`, ranks the candidates on read according to `priority-mode` (`frequency`, `cost`, `cost-per-hit`, or `weighted`), and builds the highest-priority one. Eviction uses the **same** ranking in reverse (drops the lowest), so "most worth building" and "least worth keeping" are two ends of one order. Indexes are always created as a **pair** on the `accounts` and `snapshot_accounts` tables.
+4. Only one index pair is created per tick, to avoid overloading the database.
+5. Before creating (or dropping) an index, the query tracker checks the indexer's `cloudbreak_finalize_slot_handler_queue_size` metric. If it exceeds `indexer-metrics-threshold`, DDL is deferred until the indexer catches up.
+6. If `max-auto-indexes` is set, creation is bounded by two sizes: the **fill target** `floor(eviction-fill-threshold × max-auto-indexes)` and the hard **cap** `max-auto-indexes`. Below the target the top candidate is built freely; in the buffer band `(target, cap]` a **creation-time value guard** (see below) only builds a candidate that out-values the index it would displace — unless nothing is reclaimable to displace, in which case it builds anyway up to the cap and lets eviction reclaim later; at the cap creation is **paused** until eviction reclaims the buffer. Candidates are kept queued in `index_patterns` with no loss of data.
 7. Use `included-programs` and `excluded-programs` to control which programs are eligible for automatic indexing.
+
+### Eviction and observability
+
+When `index-eviction-enabled` is set, a periodic pass (`index-eviction-interval`) reclaims index budget, but conservatively. An index pair is only ever dropped when **all** of these hold (any one failing defers the drop, never losing the pattern):
+
+- `track_counts` is on in Postgres — otherwise `idx_scan` is frozen and the whole pass is skipped, so stale stats can never drive a drop;
+- `max-auto-indexes` is set **and** the `snapshot_accounts` table is above the fill target (`eviction-fill-threshold`) — at or below the target nothing is dropped;
+- the pair is demand-idle for `index-min-idle` (and supply-idle too when `use-supply-for-eviction` is on) and older than `index-min-age-grace` — demand-idle alone stops a still-wanted index from being dropped and avoids the drop→rebuild churn loop;
+- the indexer is not under backpressure.
+
+When above the fill target (`eviction-fill-threshold`), eligible pairs are dropped in ascending `priority-mode` order (least worth keeping first) just until the table is back at the target. The trim is **unconditional** — the value trade-off already happened at creation (below), so eviction simply reclaims the buffer.
+
+**Value guard (at creation time).** The value trade-off lives at *creation*, not eviction: the fill target is the operating size, and the buffer band up to `max-auto-indexes` is entered only by indexes worth more than what they displace. When a new index would land in the buffer it is scored by `priority-mode` and compared against the index it would push out — which is **not** the single worst index. `over = current − target` indexes are already destined for the next trim, so the candidate competes with the first index that would *survive* that trim: the one at position `over` in eviction (ascending-score) order. Building the candidate raises the overflow to `over + 1`, the next trim drops positions `0..=over`, and the candidate keeps a lasting slot only if it out-scores that boundary index. *Example* (`max-auto-indexes = 200`, `eviction-fill-threshold = 0.7` ⇒ target 140): at `current = 140` (`over = 0`) the candidate must beat the single worst eligible index (a straight swap-the-worst); at `current = 176` (`over = 36`) the 36 worst are leaving anyway, so it must beat the 37th-worst to earn a durable slot. If it cannot beat that boundary, creation is deferred and the candidate stays queued. If nothing is currently reclaimable to displace (fewer eligible indexes than the overflow), the candidate is built **anyway** up to the hard cap — the cap is the real ceiling, and eviction reclaims later once indexes go idle, rather than stalling creation behind indexes that are not yet droppable. When eviction is disabled or no cap is set, the guard is inactive and creation is cap-only.
+
+**Stickiness (`value-guard-creation-bias`).** Both sides of the guard use the same `priority-mode` score, but a created index carries realized signal a fresh candidate cannot — its with-index latency `gain` and its `idx_scan` supply — which structurally favors incumbents. That is usually desirable (proven indexes should not yield to unproven ones), but `value-guard-creation-bias` tunes it: the factor multiplies the *candidate's* score in the comparison, so `> 1.0` lets new indexes win more easily (less sticky, more churn) and `< 1.0` favors incumbents (stickier); `1.0` (default) compares as-is. The guard inherits the mode's notion of value — lifetime-total modes let a once-hot idle index resist displacement, while `weighted` weighs recent windowed activity so decisions track current throughput.
+
+**Latency regression guard.** The tracker records each pattern's average query latency **with** the index versus **without** it (cost is routed into a with- or without-index bucket by the pattern's status at record time). When `index-eviction-enabled` is on and `index-regression-guard` is not `off`, the eviction pass — before the supply refresh, and **regardless of the fill threshold**, since a harmful index should go even when there is room — flags any created index that is slower with the index than without by more than `index-regression-ratio`, once the index is older than `index-min-age-grace` (long enough to have gathered with-index latency to compare against its frozen without-index baseline). In `warn` mode it logs and reports the current count via the `query_tracker_regressed_indexes` gauge; in `evict` mode it also drops the pair and marks the pattern `rejected` (so that gauge stays near zero and the count shows up under `query_tracker_patterns{status="rejected"}` instead). A `rejected` pattern is **not** rebuilt by demand alone — only after it has been rejected for at least `index-regression-retry-delay` (time spent gathering fresh without-index samples) *and* its without-index average since rejection has climbed past the with-index average captured at rejection (times `index-regression-ratio`) does the creation loop return it to `candidate`. Both the detection and the recovery comparison first scale the without-index average by `without-index-compensation-factor`, so a without-index scan whose wall-clock is deflated by parallel workers (fast in elapsed time, but far heavier in CPU/IO) is not mistaken for a cheaper alternative and does not push a genuinely useful index into a false regression. The same latency signal optionally feeds the `weighted` score via `latency-weight`, and the per-index averages are visible on `/debug/created`.
+
+Discrepancy detection (`discrepancy-enabled`) and `EXPLAIN` sampling (`explain-enabled`) are **observational only**: they flag/log when API demand and Postgres `idx_scan` diverge, or when the planner would not use an index, surfacing problems on `/debug/*` and `/metrics`. To keep the logs quiet, each pass emits **one summary line** instead of a message per index: the discrepancy pass reports `N checked — X ok, Y starved, Z over_scanned` (naming the worst offenders, `warn` when anything is starved), and the `EXPLAIN` pass reports the per-state counts plus the fully unused indexes with their `compensated_idx_scan` (`warn` when any index is unused or a probe errored). The `EXPLAIN` probe is built from the row's stored `example_request` — a real request captured on first sight — so its memcmp constants are realistic values the planner has statistics for (it falls back to zeros per column when no example is stored yet), and it runs on **both** physical tables (`accounts` and `snapshot_accounts`). Because those tables are partitioned, the probe matches the plan against the index's partition-tree members (the auto-named per-partition child indexes that `EXPLAIN` actually prints), not the partitioned parent's name — which is never scanned directly and would otherwise make every index look unused. Each pass folds the two per-table verdicts into one `explain_state` (`none` / `accounts_table` / `snapshot_accounts_table` / `both`), persists it to the pattern (surfaced on `/debug/created`, filterable via `filter=explain_incomplete`/`explain_none`/`explain_partial` for the detailed per-index view), and refreshes the `query_tracker_explain_state{state}` gauge with the per-state counts of the latest run. That example request is also surfaced as `example_request` on the `/debug/created` and `/debug/candidates` views (with `?example=true`) for documentation/sampling. They never create or drop anything and do not gate eviction. Note a served `getProgramAccounts` is a `UNION ALL` over `accounts` + `snapshot_accounts`, so it scans **both** indexes of a pair — raw `idx_scan` runs ~2× the request count. The tracker divides supply by that factor (`SCANS_PER_REQUEST = 2`) before comparing it to demand, so a healthy index sits near a 1:1 ratio.
 
 ## Self-Healing (Slot Gap Detection and Repair)
 
@@ -591,7 +661,7 @@ The indexer includes a self-healing mechanism that automatically detects and rep
 
 2. **Pause + mark unhealthy:** The instant a gap is confirmed, finalization is **paused** and the service is flagged **unhealthy** via the `service_health` table. Live finalized notifications keep buffering (bounded by `finalize-slot-buffer-size`, then back-pressuring the stream) but are not applied until the gap is repaired, preserving in-order finalization.
 
-3. **Gap filling via incremental snapshots:** Every 30 s a background task processes confirmed gaps by asking the cluster tracker for an incremental snapshot pair covering the newest missing slot, downloading it (into a timestamped directory), and processing **only the gap slots**. Repaired accounts are written to the database and enqueued for finalization directly (snapshot data is already finalized). Gap slots that have **no accounts in the snapshot** are empty/skipped slots: they are logged (target `self_healing_empty_slots`) and dropped from the list. If the tracker has no covering pair yet, the task retries on the next tick.
+3. **Gap filling via incremental snapshots:** Every 30 s a background task processes confirmed gaps by asking the cluster tracker for an incremental snapshot pair covering the newest missing slot, downloading it (into a timestamped directory), and processing **only the gap slots**. Repaired accounts are written to the database and enqueued for finalization directly (snapshot data is already finalized). Gap slots that have **no accounts in the snapshot** are empty/skipped slots: they are logged (target `self_healing_empty_slots`) and dropped from the list. If the tracker has no covering pair yet, the task retries on the next tick, up to `gap-fill-max-snapshot-retries` (default 10) consecutive attempts — past that the indexer gives up and exits with an error rather than staying unhealthy forever. The counter resets as soon as a snapshot pair is fetched successfully.
 
 4. **Missed finalized notifications:** A reconnect can also drop finalized notifications for slots just *below* a large gap. When finalizing a live slot the finalizer walks its ancestor chain (hash-checked) to finalize any ancestors whose notification was missed; additionally the slot just before each repaired gap (`gap_start - 1`) is seeded so its ancestors are caught even though repaired slots carry no chain data to bridge the walk.
 
@@ -671,9 +741,11 @@ Set `[gpa-cache]` in the API config to enable an in-memory cache for `getProgram
 
 Add a `[tracing]` section to any service config to enable OTLP trace export. When omitted, only standard `tracing-subscriber` logging is used.
 
+On the API server the `json_encoding` span additionally carries `request_id`, `subscription_id` and `client_ip`, read from the headers configured in `[metrics]` (`request-id-key`, `subscription-id-key`, `client-ip-key`). `request_id` is there to join a span to the corresponding upstream request log entry.
+
 ## HTTP Endpoints
 
-Each service exposes HTTP endpoints on its metrics port (or server port for the API). Below is a breakdown per service.
+Each service exposes HTTP endpoints on its metrics port (or server port for the API and query tracker). Below is a breakdown per service.
 
 ### API Server (default `:4000`)
 
@@ -694,12 +766,27 @@ Each service exposes HTTP endpoints on its metrics port (or server port for the 
 | `/debug/modules/self_healing` | GET    | Inspects self-healing gap state. Returns JSON with the DB chain tips and the still-missing slots grouped into gaps (each with `boundary_slot`, `start`/`end`, `len`, and `slots_behind_confirmed`). Supports `?detail=summary\|slots\|full` (`summary` returns only the `stats` counts, omitting the gap list), plus `?min_slot`, `?max_slot`, `?limit` to filter the gap view. See the rustdoc on `handle` in `crates/index/src/operational_endpoints/self_healing.rs`.                                                                                                                   |
 | `/debug/accounts_owner_map`   | GET    | Returns debug info about the in-memory account-to-owner map. Only populated when `accounts-owner-map-enabled = true` in the indexer config.                                                                                            |
 
-### Query Tracker (default metrics port `:8876`)
+### Query Tracker (default `:4001`)
 
-| Endpoint   | Method | Description                                 |
-| ---------- | ------ | ------------------------------------------- |
-| `/metrics` | GET    | Prometheus metrics.                         |
-| `/health`  | GET    | Returns `200 OK` if the service is running. |
+All endpoints — functional and operational — are served on the single server port.
+
+| Endpoint                 | Method | Description                                                                             |
+| ------------------------ | ------ | --------------------------------------------------------------------------------------- |
+| `/track`                 | POST   | Ingest a batch of observed `getProgramAccounts`-shaped demand (body is a `TrackBatch`). |
+| `/debug/candidates`      | GET    | The ranked creation queue, each candidate annotated with its priority score and the with/without-index latency behind it. |
+| `/debug/created`         | GET    | Currently active auto-created indexes with demand (API) vs. supply (compensated `idx_scan`), size, latency gain and `explain_state`. |
+| `/debug/discrepancies`   | GET    | Created indexes where demand and supply disagree (e.g. planner ignoring an index).      |
+| `/metrics`               | GET    | Prometheus metrics.                                                                     |
+| `/health`                | GET    | Returns `200 OK` if the service is running.                                             |
+
+The three `/debug/*` endpoints share query-string conventions. Latencies are rendered in **ms (2 dp)** (`*_ms`), index size in **MiB (2 dp)** (`index_mb`), and supply as `compensated_idx_scan` (raw `idx_scan ÷ 2`, since a served GPA scans both tables of the pair). Each row's `score` (the shared `priority-mode` ranking) is shown in **thousands, 1 dp** (e.g. `"37.2K"`) — the raw score derives from microsecond costs, so ÷ 1000 makes it proportional to the `*_ms` figures. Under the `weighted` mode the field also carries, in parentheses, the three factors whose product **is** the score — `avg` (mean cost/request in ms) × `gain` (latency multiplier, 1 = neutral) × `counts` (windowed demand/supply/failure volume multiplier, in K), e.g. `"37.2K (avg 12.34ms × gain 1.05 × counts 13.0K)"`. Every response repeats these notes in a top-level `docs` field. Every response is `{ "total", "count", "limit", "docs", "<items>": [...] }`. Common parameters:
+
+- `limit=N` — cap returned rows (default: all); `order=<key>` + `dir=asc|desc` — sort.
+- `example=true` / `pattern_id=true` (or `verbose=true` for both) — include the heavier fields, omitted by default.
+- Order keys: `/candidates` → `score` (default), `demand_count`, `avg_cost_ms`, `variety_estimate`; `/created` → `created_at` (default, newest first), `index_mb`, `demand_count`, `idx_scan`, `avg_cost_with_index_ms`, `with_without_idx_ratio`, `variety_estimate`; `/discrepancies` → `discrepancy_ratio` (default, `dir=asc` = most-starved first) with `min_ratio` / `max_ratio` bounds.
+- `/created` shows each index's `score` — the same shared `priority-mode` ranking value as `/debug/candidates` (creation builds highest, eviction drops lowest) — plus a human-readable `created_at`, and can be ordered by `score` in any view. It also accepts `min_ratio` / `max_ratio` bounds on `with_without_idx_ratio` (rows without both latency buckets are dropped when a bound is set); since `> 1` means the index helps, `max_ratio=1` surfaces indexes that are not helping. `filter=eviction_candidates` shows only the indexes the eviction pass would consider (past the idle + age-grace gates), ordered least-useful-first by default (`order=score`, ascending). The real drop still depends on the table being above the fill target at runtime — eviction only trims the buffer band back to the target.
+- `/created` also accepts `filter=explain_incomplete` (planner uses the index on neither or only one table), `filter=explain_none` (neither table), and `filter=explain_partial` (exactly one table) — the detailed per-index source of truth behind the `query_tracker_explain_state` gauge and the `EXPLAIN` summary log. Rows with no verdict yet (`explain-enabled` off) are excluded.
+- Unknown keys or malformed values return `400`. Example: `GET /debug/created?order=index_mb&limit=10&verbose=true`.
 
 ## Metrics Reference
 
@@ -711,8 +798,9 @@ All metrics are emitted in the Prometheus text exposition format on each service
 | --------------------------------------------------- | ----------------- | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `cloudbreak_api_requests_total`                      | Counter           | `method`, `status`     | Count of RPC method invocations grouped by outcome. `method` ∈ {`gPA`, `gTABO`, `gTABD`, `gTABM`, `gAI`, `getBalance`, `getMultipleAccounts`, `getTokenAccountBalance`, `http`}: `gPA` = `getProgramAccounts`, `gTABO` = `getTokenAccountsByOwner`, `gTABD` = `getTokenAccountsByDelegate`, `gTABM` = `getTokenAccountsByMint`, `gAI` = `getAccountInfo`, `http` is connection-level. `status` ∈ {`success`, `error`, `timeout`}: `error` is incremented on RPC-level failures (bad params, DB failure, stream-mid-error); `timeout` is incremented on `http` when the total `request-timeout` fires. The point-lookup methods (`gAI`, `getBalance`, `getMultipleAccounts`, `getTokenAccountBalance`) emit both `success` and `error`. The streaming methods (`gPA`, `gTABO`, `gTABD`, `gTABM`) emit `error` only — for their total throughput use `cloudbreak_api_request_duration_ms` instead. Note: `getSlot`, `getHealth`, `getVersion`, and `getGenesisHash` are not currently surfaced under this counter.                                                                                                                                                                          |
 | `cloudbreak_api_request_duration_ms`                 | Histogram         | `method`, `bytes`      | Per-stage request latency in milliseconds. `bytes` is the response-size bucket (`0-1KB`, `1-10KB`, `10-100KB`, `100KB-1MB`, `1MB-10MB`, `10MB-50MB`, `50MB-100MB`, `100MB-200MB`, `200MB-500MB`, `500MB+`). `method` values: `gpa` / `gpa_mint` (total in-handler time for `getProgramAccounts`, with `_mint` suffix when a token-mint filter is applied), `gpa_db` (Postgres query time), `gpa_db_first_row_time` (time-to-first-row), `gpa_encode` (account-encoding time), `gpa_json` (JSON serialization time); analogous `gtabo*` / `gtabd*` for the token-account methods; `gAI` / `getBalance` / `getMultipleAccounts` / `getTokenAccountBalance` (single observation per request — total handler + serialization time for the point-lookup methods); `http_with_transport` (end-to-end including body transport, label `bytes` reflects response size); `http_connection` (per-TCP-connection lifetime, label `bytes="0"`). |
-| `cloudbreak_api_requests_by_subscription_id`         | Counter           | `subscription_id_key`  | Per-client request counter, attributed via the HTTP header configured by `[metrics].subscription-id-key` (default `x-subscription-id`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `cloudbreak_api_data_fetched_by_subscription_id`     | Counter           | `subscription_id_key`  | Per-client cumulative response size in bytes (JSON-encoded payload).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `cloudbreak_api_requests_by_subscription_id`         | Counter           | `subscription_id_key`  | Per-client request counter, attributed via the HTTP header configured by `[metrics].subscription-id-key` (default `x-subscription-id`). Only the four heavy methods report here: `getProgramAccounts`, `getTokenAccountsByMint`, `getTokenAccountsByOwner`, `getTokenAccountsByDelegate` — the point-lookup methods (`getAccountInfo`, `getBalance`, …) are not counted. Requests with the header absent fold into `unknown-subscription-id`. Batch requests count once per batch entry. |
+| `cloudbreak_api_data_fetched_by_subscription_id`     | Counter           | `subscription_id_key`  | Per-client cumulative response size in bytes (JSON-encoded payload). Same method scope as `cloudbreak_api_requests_by_subscription_id`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `cloudbreak_api_duration_us_by_subscription_id`      | Counter           | `subscription_id_key`  | Per-client cumulative request handling time in **microseconds** — divide by 1000 for milliseconds. Measures handler entry through the last encoded JSON chunk (the same duration the `json_encoding` span reports as `total_wall_time`), excluding HTTP body transport. Same method scope as `cloudbreak_api_requests_by_subscription_id`, so dividing the two yields a mean latency over those methods only. |
 | `cloudbreak_api_inflight_requests`                   | Gauge             | `method`               | Currently in-flight requests per stage. Emitted values: `http_connection` (live TCP connections), `http` (active HTTP requests), `gpa`, `gtabo`, `gai`, `gma`, `getBalance`, `getTokenAccountBalance`. The special label `max` is set once at startup to `[server].max-connections`; plot against the live gauges to visualize saturation.                                                                                                                                                                                                                                                                                                                                                                                    |
 | `cloudbreak_api_batch_requests_total`                | Counter           | `batch_size`           | Counter incremented once per batch JSON-RPC request, bucketed by batch size: `1-5`, `6-10`, `11-20`, `21-50`, `51-100`, `100+`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `cloudbreak_api_cache_hit_percent`                   | Histogram         | `method`, `bytes`      | Per-request GPA cache hit percentage (0-100), bucketed for both ends so fully-cached (`100`) and fully-fresh (`0`) requests stand out. `method` matches the `getProgramAccounts`/token-account `method` labels used by `cloudbreak_api_request_duration_ms` and `bytes` is the same response-size bucket. Reports `0` when the cache is inactive or the response has no accounts. |
@@ -761,7 +849,22 @@ Snapshot metrics are emitted whenever snapshot processing runs — either embedd
 
 ### Query Tracker (`cloudbreak-query-tracker`)
 
-The query-tracker service exposes `/metrics` for protocol compatibility but does not currently register any service-specific metrics. The endpoint returns an empty Prometheus payload. Use `/health` for liveness probes.
+The query tracker exposes its metrics on `/metrics` (same port as `/track` and `/debug/*`). Aggregate gauges and the lifecycle counters are refreshed by the eviction pass; the per-index gauges are labelled with the human-readable index name so a dashboard can show demand (API) against supply (`idx_scan`) per active index. Use `/health` for liveness probes.
+
+| Metric                                          | Type        | Labels  | Description                                                                                                          |
+| ----------------------------------------------- | ----------- | ------- | ------------------------------------------------------------------------------------------------------------------ |
+| `query_tracker_snapshot_accounts_indexes_total` | IntGauge    | —       | Current number of indexes present on the capped `snapshot_accounts` table (the value the `max-auto-indexes` cap and `eviction-fill-threshold` are measured against). |
+| `query_tracker_patterns`                        | IntGaugeVec | `status` | Number of distinct index patterns tracked, partitioned by lifecycle `status` ∈ {`created`, `candidate`, `evicted`, `rejected`}. The total across all statuses is `sum(query_tracker_patterns)` (no `total` label, to avoid double-counting on aggregation). |
+| `query_tracker_discrepant_indexes`              | IntGauge    | —       | Number of created indexes where demand (API) and supply (`idx_scan`) currently diverge (see `discrepancy-enabled`). |
+| `query_tracker_index_created_total`             | IntCounter  | —       | Cumulative number of auto-index pairs created.                                                                     |
+| `query_tracker_index_evicted_total`             | IntCounter  | —       | Cumulative number of auto-index pairs evicted (idle eviction **and** regression drops).                            |
+| `query_tracker_index_create_failures_total`     | IntCounter  | —       | Cumulative number of failed auto-index creation attempts.                                                          |
+| `query_tracker_regressed_indexes`               | IntGauge    | —       | Created indexes **currently** slower with the index than without it (see `index-regression-guard`). Refreshed each eviction pass; 0 when the guard is off. Near zero in `evict` mode (drops move them to `status="rejected"`); reflects tolerated regressions in `warn` mode. |
+| `query_tracker_observations_total`              | IntCounter  | —       | Cumulative number of accepted demand observations ingested via `/track`.                                           |
+| `query_tracker_index_demand`                    | IntGaugeVec | `index` | Cumulative API demand (request count) per created index.                                                           |
+| `query_tracker_index_compensated_idx_scan`      | IntGaugeVec | `index` | Compensated Postgres `idx_scan` (supply, raw `idx_scan ÷ 2` since a served GPA scans both tables of the pair) per created index. Lines up ~1:1 with `query_tracker_index_demand` for a healthy index; the raw counter is never exported. |
+| `query_tracker_index_variety`                   | IntGaugeVec | `index` | Estimated distinct filter values served per created index (HyperLogLog variety estimate).                          |
+| `query_tracker_explain_state`                   | IntGaugeVec | `state` | Result of the **last** `EXPLAIN` sampling pass (see `explain-enabled`): created indexes in each planner-usage verdict `state` ∈ {`none`, `accounts_table`, `snapshot_accounts_table`, `both`}. A snapshot of the latest run, not cumulative; stays at zero when `explain-enabled` is off. Alert on `none`. |
 
 ## dbtools CLI
 

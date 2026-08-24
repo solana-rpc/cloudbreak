@@ -9,6 +9,8 @@ use std::{
     time::Duration,
 };
 
+use cloudbreak_core::SnapshotPgIndexesConfig;
+use cloudbreak_entity::snapshot_accounts::{self};
 use rust_decimal::Decimal;
 use sea_orm::{
     ActiveValue::Set, ConnectionTrait, DatabaseConnection, EntityTrait, Statement,
@@ -17,11 +19,7 @@ use sea_orm::{
 use solana_pubkey::Pubkey;
 use tokio::time::{Instant, timeout};
 use yellowstone_grpc_proto::geyser::SubscribeUpdateAccount;
-use cloudbreak_core::{
-    SnapshotPgIndexesConfig,
-    modules::supply_tracker::{SUPPLY_RING_SLOTS, SupplyCommit},
-};
-use cloudbreak_entity::snapshot_accounts::{self};
+use cloudbreak_core::modules::supply_tracker::{SUPPLY_RING_SLOTS, SupplyCommit};
 
 use crate::metrics;
 use crate::stake_data::SnapshotStakeData;
@@ -547,7 +545,7 @@ pub async fn persist_epoch_stakes(
 
     txn.commit().await?;
 
-    tracing::info!(
+    tracing::debug!(
         target: "persist_epoch_stakes",
         "persisted {} voters for epoch {} in {:.3}s",
         data.voters.len(),

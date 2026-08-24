@@ -14,7 +14,7 @@ use futures::StreamExt;
 use rust_decimal::prelude::ToPrimitive;
 use sea_orm::sqlx::postgres::PgRow;
 use sea_orm::sqlx::{self, Row};
-use sea_orm::{DatabaseConnection, EntityTrait};
+use sea_orm::DatabaseConnection;
 use serde::Deserialize;
 use serde::de::{self, Deserializer, Visitor};
 
@@ -41,7 +41,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{Instant, timeout};
 use tracing::Instrument;
-use cloudbreak_entity::slots;
 
 #[derive(Clone, Copy)]
 pub enum TokenQueryType {
@@ -202,27 +201,7 @@ pub async fn get_token_accounts_by_owner_or_delegate(
         .transpose()?
         .unwrap_or(CommitmentLevel::Finalized);
 
-    // If the slot syncronizer is enabled, use the cached slot data, otherwise query the database
-    let (latest_slot, block_time) = match &state.slot_syncronizer_data {
-        Some(data) => {
-            let data = data.read().expect("Failed to read slot syncronizer data");
-
-            (
-                data.get_slot_for_commitment(commitment),
-                data.get_block_time_for_commitment(commitment),
-            )
-        }
-        None => {
-            let slot_model = slots::Entity::find_by_id(commitment as i32)
-                .one(&state.database)
-                .instrument(tracing::info_span!("slot_db"))
-                .await?;
-
-            let model = slot_model.ok_or(RpcError::InternalError)?;
-
-            (model.slot as u64, model.block_time)
-        }
-    };
+    let (latest_slot, block_time) = state.latest_slot_and_block_time(commitment).await?;
 
     let (accounts_filters, program, filter_mint_data) = generate_filters_for_table(
         &filter,

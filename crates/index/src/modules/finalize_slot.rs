@@ -418,6 +418,7 @@ async fn finalize_slot(
         slot,
         updated_accounts.block_time,
         CommitmentLevel::Finalized,
+        updated_accounts_during_startup.health.is_healthy(),
         &db_clone,
         &config_clone,
     )
@@ -533,7 +534,7 @@ async fn finalize_slot(
 pub struct UpdatedAccountsDuringStartup {
     pub accounts: Arc<Mutex<HashSet<Vec<u8>>>>,
     pub snapshot_processing_state: Arc<Mutex<SnapshotProcessingState>>,
-    health: ServiceHealth,
+    pub health: ServiceHealth,
 }
 
 impl UpdatedAccountsDuringStartup {
@@ -555,6 +556,26 @@ impl UpdatedAccountsDuringStartup {
             .expect("Failed to lock snapshot_processing_state");
         *snapshot_processing_state == SnapshotProcessingState::NotStarted
             || *snapshot_processing_state == SnapshotProcessingState::Started
+    }
+
+    /// No-snapshot mode has no startup snapshot to load, so startup is "finished"
+    /// as soon as we begin processing blocks: advance the state machine straight to
+    /// `FinishedAndCleanedUp` and clear the `Startup` unhealthy reason so the node
+    /// reports healthy and slot-dependent reads are not gated. Idempotent — after
+    /// the first call the state guard makes it a cheap no-op.
+    pub async fn finish_startup_without_snapshot(&self) {
+        {
+            let mut snapshot_processing_state = self
+                .snapshot_processing_state
+                .lock()
+                .expect("Failed to lock snapshot_processing_state");
+            if *snapshot_processing_state != SnapshotProcessingState::NotStarted {
+                return;
+            }
+            *snapshot_processing_state = SnapshotProcessingState::FinishedAndCleanedUp;
+        }
+
+        self.health.remove_reason(HealthReason::Startup).await;
     }
 
     pub fn add_batch_to_cache_during_startup(&self, batch: Vec<Vec<u8>>) {

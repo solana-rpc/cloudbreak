@@ -3,35 +3,28 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-use jsonrpsee_types::{ErrorCode, ErrorObject};
+//! Error types for the query tracker, plus their mapping to HTTP status codes.
+
+use hyper::StatusCode;
 use sea_orm::DbErr;
 
 #[derive(thiserror::Error, Debug)]
 pub enum QueryTrackerError {
-    #[error("Database error: {0}")]
-    DatabaseError(#[from] DbErr),
-    #[error("Invalid pubkey: {0}")]
-    InvalidPubkey(String),
-    #[error("Internal error: {0}")]
-    InternalError(String),
-    #[error("Connection error: {0}")]
-    ConnectionError(String),
+    #[error("database error: {0}")]
+    Database(#[from] DbErr),
+    #[error("invalid request: {0}")]
+    BadRequest(String),
+    #[error("internal error: {0}")]
+    Internal(String),
 }
 
-impl From<QueryTrackerError> for ErrorObject<'static> {
-    fn from(err: QueryTrackerError) -> Self {
-        match err {
-            QueryTrackerError::DatabaseError(e) => {
-                ErrorObject::owned(ErrorCode::InternalError.code(), e.to_string(), None::<()>)
-            }
-            QueryTrackerError::InvalidPubkey(msg) => {
-                ErrorObject::owned(ErrorCode::InvalidParams.code(), msg, None::<()>)
-            }
-            QueryTrackerError::InternalError(msg) => {
-                ErrorObject::owned(ErrorCode::InternalError.code(), msg, None::<()>)
-            }
-            QueryTrackerError::ConnectionError(msg) => {
-                ErrorObject::owned(ErrorCode::InternalError.code(), msg, None::<()>)
+impl QueryTrackerError {
+    /// HTTP status this error maps to on the wire.
+    pub fn status(&self) -> StatusCode {
+        match self {
+            QueryTrackerError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            QueryTrackerError::Database(_) | QueryTrackerError::Internal(_) => {
+                StatusCode::INTERNAL_SERVER_ERROR
             }
         }
     }
