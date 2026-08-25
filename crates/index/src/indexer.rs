@@ -107,7 +107,7 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
     let indexer_state = IndexerState {
         buffer_channel_rx_len: Arc::new(Mutex::new(buffer_channel_rx.len())),
         snapshot_processing_state: snapshot_processing_state.clone(),
-        self_healing_state: SelfHealingState::new(&config, slot_finalizer.clone()),
+        self_healing_state: SelfHealingState::new(&config, slot_finalizer.clone(), snapshot_processing_state.clone()),
         slot_finalizer,
         updated_accounts_during_startup,
         finalize_slot_buffer_size: finalize_slot_buffer_size.clone(),

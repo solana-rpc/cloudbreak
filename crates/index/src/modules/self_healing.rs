@@ -38,15 +38,21 @@ pub struct SelfHealingState {
     /// [`SlotFinalizer::enqueue_gap_boundary`]).
     pub gap_boundaries: Arc<Mutex<BTreeSet<u64>>>,
     pub finalizer: SlotFinalizer,
+    pub snapshot_processing_state: Arc<Mutex<SnapshotProcessingState>>,
 }
 
 impl SelfHealingState {
-    pub fn new(_config: &IndexConfig, finalizer: SlotFinalizer) -> Self {
+    pub fn new(
+        _config: &IndexConfig,
+        finalizer: SlotFinalizer,
+        snapshot_processing_state: Arc<Mutex<SnapshotProcessingState>>,
+    ) -> Self {
         Self {
             last_slot_received: Arc::new(Mutex::new(0)),
             gaps_list: Arc::new(Mutex::new(Vec::new())),
             gap_boundaries: Arc::new(Mutex::new(BTreeSet::new())),
             finalizer,
+            snapshot_processing_state,
         }
     }
 
@@ -125,11 +131,18 @@ impl SelfHealingState {
                     .expect("Failed to lock gap_boundaries")
                     .insert(last_slot_received);
 
-                // Pause finalization and mark the service unhealthy immediately. `fill_gaps` resumes
-                // it once every slot in the gap has been repaired. NOTE: a gap discovered during
-                // startup pauses the very worker that completes startup; that is intentionally
-                // unsupported and `fill_gaps` fails fast in that case.
-                self.finalizer.pause().await;
+                // Pause finalization so the gap can be repaired before new slots are
+                // finalised. Skip the pause during startup: the finalizer is what drives
+                // startup to completion, so pausing it would deadlock. `fill_gaps` will
+                // wait until startup finishes before attempting the repair.
+                let startup_finished = *self
+                    .snapshot_processing_state
+                    .lock()
+                    .expect("Failed to lock snapshot_processing_state")
+                    == SnapshotProcessingState::FinishedAndCleanedUp;
+                if startup_finished {
+                    self.finalizer.pause().await;
+                }
             }
         }
 
@@ -193,23 +206,25 @@ impl SelfHealingState {
                     continue;
                 }
 
-                // We have confirmed gaps to repair. Finalization was already paused when the gap was
-                // discovered (in `check_slot_gap`). A confirmed gap is only expected after startup has
-                // finished: during startup the (now paused) finalizer worker is what completes startup,
-                // so a gap there can never be repaired. Fail fast instead of stalling forever.
+                // Wait for startup to finish before repairing gaps. The finalizer was not
+                // paused when the gap was detected during startup (see `check_slot_gap`),
+                // so startup can still complete; once it does, the next iteration repairs
+                // the queued gaps through the normal path.
                 let is_startup_finished = *indexer_state
                     .snapshot_processing_state
                     .lock()
                     .expect("Failed to lock snapshot_processing_state")
                     == SnapshotProcessingState::FinishedAndCleanedUp;
                 if !is_startup_finished {
-                    tracing::error!(
-                        "Confirmed slot gap detected before startup finished; cannot repair gaps during startup"
+                    tracing::info!(
+                        "Slot gap detected during startup; deferring repair until startup completes"
                     );
-                    panic!(
-                        "Confirmed slot gap detected before startup finished; cannot repair gaps during startup"
-                    );
+                    continue;
                 }
+
+                // Startup is finished — pause finalization now if it was not already paused
+                // (gaps detected during startup skipped the pause in `check_slot_gap`).
+                self.finalizer.pause().await;
 
                 let start_time = tokio::time::Instant::now();
                 tracing::info!(
