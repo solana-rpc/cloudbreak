@@ -502,7 +502,8 @@ pub fn unpack_compressed_snapshot<P: Into<PathBuf>>(
         };
 
         if size != file_size {
-            tracing::warn!("size mismatch for id: {} and slot: {}", id, slot);
+            // Since 4.2.1 this is expected to happen for all files marked as "obsolete"
+            tracing::debug!(target: "unpack_compressed_snapshot", "size mismatch for id: {} and slot: {}", id, slot);
         }
 
         account_file_data.push(AccountFileData {

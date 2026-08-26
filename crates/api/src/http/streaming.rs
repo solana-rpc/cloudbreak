@@ -226,10 +226,8 @@ pub async fn gpa_streaming_response_body(
         json_span.record("json_bytes", json_bytes as i64);
         json_span.record("total_wall_time", gpa_global_start_time.elapsed().as_millis() as i64);
 
-        // Commit the accumulated `(pubkey, bytes)` pairs as the new cached query.
-        let finalize_query_start_time = Instant::now();
+        // Hand the accumulated `(pubkey, bytes)` pairs to the background finalize thread
         json_span.in_scope(|| gpa_processor.finalize_query());
-        metrics::CLOUDBREAK_API_REQUEST_DURATION_MS.with_label_values(&["cache_finalize_query", gpa_processor.get_type()]).observe(finalize_query_start_time.elapsed().as_millis() as f64);
 
         // Close the JSON array
         yield Ok(Frame::data(Bytes::from(streaming_response_body_wrapper.end)));
@@ -310,10 +308,20 @@ fn drain_pending_into_cache(
         Vec::with_capacity(pending_fresh.len() + pending_cached.len());
     new_pairs.append(pending_cached);
     for (pk, range) in pending_fresh.drain(..) {
-        // `Bytes::slice` is O(1): pointer math + atomic refcount inc on
-        // the same allocation backing `frozen`. The slice keeps that
-        // allocation alive for as long as the cache entry holds it.
-        new_pairs.push((pk, frozen.slice(range)));
+        // Copy the freshly-serialized account into its own tight allocation
+        // instead of retaining a `frozen.slice(range)`. A slice would be O(1)
+        // but keeps the *entire* ~64 KB streaming chunk (`STREAM_BUFFER_PREALLOC`)
+        // alive for as long as the cache entry holds it, since `Bytes` frees the
+        // backing allocation only when its last view drops. Under sustained GPA
+        // caching where each refresh re-serializes only a few accounts, those
+        // few fresh accounts would each pin a whole chunk, so the resident cache
+        // grows far beyond the accounted `GpaCache::size` (which only counts
+        // `bytes.len()`). Copying costs one memcpy per newly-cached account but
+        // makes retained memory track the accounted size. Cache hits stay
+        // zero-copy: they reuse the compact `Bytes` already held in the entry
+        // (carried through `pending_cached` above), and the response body is
+        // still written from `frozen` directly, so this does not affect it.
+        new_pairs.push((pk, Bytes::copy_from_slice(&frozen[range])));
     }
 
     gpa_processor.update_new_accounts_for_query(new_pairs, cache_hits);
