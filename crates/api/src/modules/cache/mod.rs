@@ -349,10 +349,12 @@ impl GpaProcessor {
 #[derive(Debug, Clone)]
 pub struct CachedQuery {
     /// JSON-encoded account bytes keyed by pubkey. Stored as `Bytes` so that
-    /// on a future cache hit we can append the slice directly into the next
-    /// response's `BytesMut` (just a memcpy) with no re-serialization, and so
-    /// that fresh slices coming out of the streaming pipeline share storage
-    /// with the response chunks they were carved out of.
+    /// on a future cache hit we can append it directly into the next response's
+    /// `BytesMut` (just a memcpy) with no re-serialization. Each `Bytes` owns a
+    /// tight, per-account allocation: freshly-serialized accounts are copied out
+    /// of the shared streaming chunk when inserted (see `drain_pending_into_cache`
+    /// in `http::streaming`) so a cache entry never pins a whole ~64 KB chunk,
+    /// which keeps retained memory in line with the accounted [`Self::size`].
     pub accounts: Arc<HashMap<Pubkey, Bytes>>,
     /// Slot for which the cached query was served.
     pub slot: u64,

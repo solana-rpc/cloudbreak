@@ -310,10 +310,20 @@ fn drain_pending_into_cache(
         Vec::with_capacity(pending_fresh.len() + pending_cached.len());
     new_pairs.append(pending_cached);
     for (pk, range) in pending_fresh.drain(..) {
-        // `Bytes::slice` is O(1): pointer math + atomic refcount inc on
-        // the same allocation backing `frozen`. The slice keeps that
-        // allocation alive for as long as the cache entry holds it.
-        new_pairs.push((pk, frozen.slice(range)));
+        // Copy the freshly-serialized account into its own tight allocation
+        // instead of retaining a `frozen.slice(range)`. A slice would be O(1)
+        // but keeps the *entire* ~64 KB streaming chunk (`STREAM_BUFFER_PREALLOC`)
+        // alive for as long as the cache entry holds it, since `Bytes` frees the
+        // backing allocation only when its last view drops. Under sustained GPA
+        // caching where each refresh re-serializes only a few accounts, those
+        // few fresh accounts would each pin a whole chunk, so the resident cache
+        // grows far beyond the accounted `GpaCache::size` (which only counts
+        // `bytes.len()`). Copying costs one memcpy per newly-cached account but
+        // makes retained memory track the accounted size. Cache hits stay
+        // zero-copy: they reuse the compact `Bytes` already held in the entry
+        // (carried through `pending_cached` above), and the response body is
+        // still written from `frozen` directly, so this does not affect it.
+        new_pairs.push((pk, Bytes::copy_from_slice(&frozen[range])));
     }
 
     gpa_processor.update_new_accounts_for_query(new_pairs, cache_hits);
