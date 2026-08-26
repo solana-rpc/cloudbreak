@@ -158,6 +158,58 @@ lazy_static::lazy_static! {
         ),
         &["used"],
     ).unwrap();
+
+    /// Queries accepted for caching that are queued on, or running on, the
+    /// blocking pool. Expected to sit near 0; a sustained value means insertion
+    /// is falling behind the requests producing it, which delays entries becoming
+    /// visible and therefore lowers the hit rate.
+    pub static ref CLOUDBREAK_GPA_CACHE_FINALIZE_INFLIGHT_JOBS: IntGauge = IntGauge::new(
+        "cloudbreak_gpa_cache_finalize_inflight_jobs",
+        "GPA queries currently queued or running on the blocking pool waiting to be inserted into the cache"
+    ).unwrap();
+
+    /// Payload bytes held by the in-flight finalize jobs above. This memory is
+    /// resident but not yet accounted in `cloudbreak_gpa_cache_size_bytes`, so it
+    /// is the amount by which that gauge under-reports the cache's real footprint.
+    pub static ref CLOUDBREAK_GPA_CACHE_FINALIZE_INFLIGHT_BYTES: IntGauge = IntGauge::new(
+        "cloudbreak_gpa_cache_finalize_inflight_bytes",
+        "Payload bytes of GPA queries currently queued or running on the blocking pool waiting to be inserted into the cache"
+    ).unwrap();
+
+    /// Queries that reached the finalize job but were not inserted, labelled by
+    /// `reason`: `stale_slot` (a newer version of the query was already cached by
+    /// the time the job ran) or `cleanup_failed` (could not free enough space).
+    /// A non-trivial `stale_slot` rate means finalize is running too far behind
+    /// the requests that produced it.
+    pub static ref CLOUDBREAK_GPA_CACHE_FINALIZE_SKIPPED_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new(
+            "cloudbreak_gpa_cache_finalize_skipped_total",
+            "GPA queries dropped by the finalize job without being cached, labelled by reason"
+        ),
+        &["reason"],
+    ).unwrap();
+}
+
+/// Tracks a GPA cache insertion while it is queued on, or running on, the
+/// blocking pool. Follows the same guard pattern as [`InFlightRequestGuard`] so
+/// the gauges are corrected even if the job panics.
+pub struct FinalizeInFlightGuard {
+    bytes: i64,
+}
+
+impl FinalizeInFlightGuard {
+    pub fn new(bytes: i64) -> Self {
+        CLOUDBREAK_GPA_CACHE_FINALIZE_INFLIGHT_JOBS.inc();
+        CLOUDBREAK_GPA_CACHE_FINALIZE_INFLIGHT_BYTES.add(bytes);
+        Self { bytes }
+    }
+}
+
+impl Drop for FinalizeInFlightGuard {
+    fn drop(&mut self) {
+        CLOUDBREAK_GPA_CACHE_FINALIZE_INFLIGHT_JOBS.dec();
+        CLOUDBREAK_GPA_CACHE_FINALIZE_INFLIGHT_BYTES.sub(self.bytes);
+    }
 }
 
 /// We use a guard to increment the in-flight requests metric when a request starts and
@@ -241,6 +293,9 @@ pub fn setup_metrics(config: &ApiConfig) -> anyhow::Result<()> {
         register!(CLOUDBREAK_GPA_CACHE_MAX_BYTES);
         register!(CLOUDBREAK_GPA_CACHE_EVICTIONS_TOTAL);
         register!(CLOUDBREAK_GPA_CACHE_EVICTED_BYTES_TOTAL);
+        register!(CLOUDBREAK_GPA_CACHE_FINALIZE_INFLIGHT_JOBS);
+        register!(CLOUDBREAK_GPA_CACHE_FINALIZE_INFLIGHT_BYTES);
+        register!(CLOUDBREAK_GPA_CACHE_FINALIZE_SKIPPED_TOTAL);
 
         // Per-client-IP egress bandwidth (peak gauge + throughput histogram).
         // Optional, off by default: registers its collectors and starts the 1s

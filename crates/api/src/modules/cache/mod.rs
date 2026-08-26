@@ -21,12 +21,189 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
-use tokio::time::Instant;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::error::RpcError;
 use crate::methods::program;
 use crate::methods::program::GpaDbQueryInput;
 use crate::metrics;
+
+/// A query that has been accepted for caching, carrying everything needed to
+/// install it. Built on the request path, executed on the blocking pool by
+/// [`FinalizeJob::run`].
+struct FinalizeJob {
+    cache: Arc<RwLock<GpaCache>>,
+    normalized_query: NormalizedQuery,
+    accounts: Vec<(Pubkey, Bytes)>,
+    query_bytes: u64,
+    slot: u64,
+    cache_hits: u64,
+    /// The entry this request read from, if any. Carried so that the worker —
+    /// not the request — holds the last reference to the map it is about to
+    /// replace, and therefore pays to free it. See [`FinalizeJob::run`].
+    previous_query: Option<CachedQuery>,
+    /// Trace context of the request that produced this query, so the worker's
+    /// span still hangs off the originating trace.
+    parent_cx: opentelemetry::Context,
+}
+
+impl FinalizeJob {
+    /// Hands the insertion to the blocking pool and returns immediately.
+    ///
+    /// Installing a query is `O(accounts)`: building the account map, taking the
+    /// cache write lock, and deallocating the version being replaced. The client
+    /// is not waiting on any of it, so none of it belongs on the request path.
+    /// The join handle is dropped on purpose — there is nothing to await, and
+    /// losing an insertion is harmless because the next request repopulates it.
+    fn spawn(self) {
+        let inflight = metrics::FinalizeInFlightGuard::new(self.query_bytes as i64);
+
+        tokio::task::spawn_blocking(move || {
+            let started = std::time::Instant::now();
+
+            self.run();
+
+            // Timed out here so every exit path in `run` is counted.
+            metrics::CLOUDBREAK_API_REQUEST_DURATION_MS
+                .with_label_values(&["cache_finalize_query", "cached"])
+                .observe(started.elapsed().as_micros() as f64);
+
+            // Also what moves the guard into the closure: without this the guard
+            // would drop as soon as `spawn` returns and the gauges would report
+            // nothing as in flight.
+            drop(inflight);
+        });
+    }
+
+    /// Installs the query in the cache. Runs on the blocking pool, never on a
+    /// request.
+    ///
+    /// The declaration order of `new_entry`, `replaced` and `cache_guard` is
+    /// load-bearing: Rust drops locals in reverse order, so the write lock is
+    /// always released before any account map is deallocated, on every exit path
+    /// including the early returns.
+    fn run(self) {
+        let start_time = std::time::Instant::now();
+        let Self {
+            cache,
+            normalized_query,
+            accounts,
+            query_bytes,
+            slot,
+            cache_hits,
+            previous_query,
+            parent_cx,
+        } = self;
+
+        let span = tracing::info_span!(
+            "gpa_cache_finalize_query",
+            cache_hits = cache_hits as i64,
+            query_bytes = query_bytes as i64,
+            query_accounts = accounts.len() as i64,
+            wall_time = tracing::field::Empty,
+            locked_micros = tracing::field::Empty,
+        );
+        // Must happen before `enter()`: `set_parent` rejects a span that has
+        // already been started. Errors only mean there is no OpenTelemetry layer
+        // or the span was filtered out, in which case there is no trace to attach
+        // to anyway, so they are ignored (as in the crate's own examples).
+        let _ = span.set_parent(parent_cx);
+        let _span_guard = span.enter();
+
+        let new_entry = CachedQuery {
+            accounts: Arc::new(accounts.into_iter().collect()),
+            slot,
+            size: query_bytes,
+            cache_hits,
+        };
+
+        // Versions of this query that are no longer reachable from the cache.
+        // `previous_query` goes in first so this job holds the last reference to
+        // the map being replaced.
+        let mut replaced: Vec<CachedQuery> = Vec::new();
+        replaced.extend(previous_query);
+
+        let start_locked_time = std::time::Instant::now();
+        let mut cache_guard = cache.write().expect("can't lock gpa cache rwlock");
+        let lock_held_start = std::time::Instant::now();
+
+        // This runs behind the request that produced the query, so a newer
+        // version may already be cached. Installing an older snapshot would be
+        // internally consistent but would force the next request to refresh more
+        // accounts, so discard this one instead.
+        if cache_guard
+            .queries
+            .get(&normalized_query)
+            .is_some_and(|current| current.slot >= slot)
+        {
+            metrics::CLOUDBREAK_GPA_CACHE_FINALIZE_SKIPPED_TOTAL
+                .with_label_values(&["stale_slot"])
+                .inc();
+            return;
+        }
+
+        // Cleanup cache if needed
+        if let Some(bytes_freed) = cache_guard.cleanup_old_queries(query_bytes, &mut replaced)
+            && bytes_freed < query_bytes
+        {
+            tracing::error!(target: "gpa_cache", "Failed to cleanup old queries, not enough bytes freed {}", query_bytes - bytes_freed);
+            metrics::CLOUDBREAK_GPA_CACHE_FINALIZE_SKIPPED_TOTAL
+                .with_label_values(&["cleanup_failed"])
+                .inc();
+            return;
+        }
+
+        // Insert the query into the main map (replacing the older query if existed)
+        let older_query = cache_guard
+            .queries
+            .insert(normalized_query.clone(), new_entry);
+
+        // Update map size, crediting back the bytes of the query we just
+        // replaced (if any) so the counter tracks what is actually held.
+        cache_guard.size += query_bytes;
+        if let Some(older_query) = &older_query {
+            cache_guard.size = cache_guard.size.saturating_sub(older_query.size);
+        }
+
+        // Mirror the same accounting for pinned bytes: credit the new query if
+        // it is pinned, and credit back the replaced query if it was pinned.
+        if cache_guard.is_pinned_size(query_bytes) {
+            cache_guard.pinned_size += query_bytes;
+        }
+        if let Some(older_query) = &older_query
+            && cache_guard.is_pinned_size(older_query.size)
+        {
+            cache_guard.pinned_size = cache_guard.pinned_size.saturating_sub(older_query.size);
+        }
+
+        cache_guard.insert_query_for_slot(
+            normalized_query,
+            slot,
+            older_query.as_ref().map(|q| q.slot),
+        );
+        replaced.extend(older_query);
+
+        cache_guard.update_size_metrics();
+
+        // `finalize_query_locked` spans lock acquisition plus the critical
+        // section, so it also reflects time spent queueing behind other
+        // writers. `finalize_query_held` isolates the critical section itself.
+        let locked_micros = start_locked_time.elapsed().as_micros() as i64;
+        let held_micros = lock_held_start.elapsed().as_micros() as i64;
+        metrics::CLOUDBREAK_API_REQUEST_DURATION_MS
+            .with_label_values(&["finalize_query_locked", "cached"])
+            .observe(locked_micros as f64);
+        metrics::CLOUDBREAK_API_REQUEST_DURATION_MS
+            .with_label_values(&["finalize_query_held", "cached"])
+            .observe(held_micros as f64);
+
+        drop(cache_guard);
+        drop(replaced);
+
+        span.record("wall_time", start_time.elapsed().as_millis() as i64);
+        span.record("locked_micros", locked_micros);
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct GpaCache {
@@ -225,124 +402,68 @@ impl GpaProcessor {
         }
     }
 
-    /// Commit the accumulated `(pubkey, bytes)` pairs as the new `CachedQuery`
+    /// Hand the accumulated `(pubkey, bytes)` pairs to the background finalize
+    /// thread, which commits them as the new `CachedQuery`.
     ///
     /// If the GpaProcessor is `Standard`, this is a no-op.
     ///
-    /// It will only add the query to the cache if the query is larger than the
-    /// `config.min_bytes_per_query`.
-    ///
-    /// If the insertion gets the cache size above the `config.max_total_bytes`,
-    /// it will trigger the cache cleanup of oldest queries to ensure the cache
-    /// size stays within the configured limit .
+    /// Only queries larger than `config.min_bytes_per_query` are cached, and that
+    /// is decided here rather than on the worker: the overwhelming majority of
+    /// queries fall below the threshold, and rejecting them costs a single pass
+    /// over the accumulated pairs. Everything expensive — building the account
+    /// map, taking the cache write lock, cleaning up old queries to stay within
+    /// `config.max_total_bytes`, and freeing the replaced version — happens on
+    /// the blocking pool, off the request path. See [`FinalizeJob::run`].
     pub fn finalize_query(&mut self) {
-        let start_time = Instant::now();
         let Self::Cached {
             cache,
+            cached_query,
             normalized_query,
             new_accounts_for_query,
             new_slot,
             cache_hits,
-            cached_query: _,
         } = self
         else {
             return;
         };
-
-        let finalize_query_span = tracing::info_span!(
-            "gpa_cache_finalize_query",
-            cache_hits = tracing::field::Empty,
-            query_bytes = tracing::field::Empty,
-            query_accounts = tracing::field::Empty,
-            wall_time = tracing::field::Empty,
-            locked_micros = tracing::field::Empty,
-        );
 
         let Some(normalized_query) = normalized_query.take() else {
             tracing::error!(target: "gpa_cache", "No normalized query found");
             return;
         };
 
-        let new_accounts_for_query = std::mem::take(
+        let accounts = std::mem::take(
             &mut *new_accounts_for_query
                 .lock()
                 .expect("new_accounts_for_query mutex poisoned"),
         );
 
-        let mut query_bytes = 0;
-        let new_accounts_for_query_len = new_accounts_for_query.len();
-        let accounts: HashMap<Pubkey, Bytes> = new_accounts_for_query
-            .into_iter()
-            .map(|(pubkey, bytes)| {
-                query_bytes += bytes.len() as u64;
-                (pubkey, bytes)
-            })
-            .collect();
+        // Summing the encoded lengths is a cheap linear pass with no allocation,
+        // unlike building the map, so the threshold is checked first. The config
+        // is immutable after startup, so a read lock is enough and never blocks
+        // other readers.
+        let query_bytes: u64 = accounts.iter().map(|(_, bytes)| bytes.len() as u64).sum();
+        let min_bytes_per_query = cache
+            .read()
+            .expect("gpa cache rwlock poisoned")
+            .config
+            .min_bytes_per_query as u64;
 
-        let new_entry = CachedQuery {
-            accounts: Arc::new(accounts),
+        if query_bytes < min_bytes_per_query {
+            return;
+        }
+
+        FinalizeJob {
+            cache: cache.clone(),
+            normalized_query,
+            accounts,
+            query_bytes,
             slot: *new_slot,
-            size: query_bytes,
             cache_hits: *cache_hits,
-        };
-
-        finalize_query_span.record("query_bytes", query_bytes as i64);
-        finalize_query_span.record("cache_hits", *cache_hits as i64);
-        finalize_query_span.record("query_accounts", new_accounts_for_query_len as i64);
-
-        let start_locked_time = Instant::now();
-        let mut cache_guard = cache.write().expect("can't lock gpa cache rwlock");
-
-        // If query is smaller than the min_bytes_per_query, don't cache it
-        if query_bytes < cache_guard.config.min_bytes_per_query as u64 {
-            finalize_query_span.record("wall_time", start_time.elapsed().as_millis() as i64);
-            return;
+            previous_query: cached_query.take(),
+            parent_cx: tracing::Span::current().context(),
         }
-
-        // Cleanup cache if needed
-        if let Some(bytes_freed) = cache_guard.cleanup_old_queries(query_bytes)
-            && bytes_freed < query_bytes
-        {
-            tracing::error!(target: "gpa_cache", "Failed to cleanup old queries, not enough bytes freed {}", query_bytes - bytes_freed);
-            finalize_query_span.record("wall_time", start_time.elapsed().as_millis() as i64);
-            return;
-        }
-
-        // Insert the query into the main map (replacing the older query if existed)
-        let older_query = cache_guard
-            .queries
-            .insert(normalized_query.clone(), new_entry);
-
-        // Update map size, crediting back the bytes of the query we just
-        // replaced (if any) so the counter tracks what is actually held.
-        cache_guard.size += query_bytes;
-        if let Some(older_query) = &older_query {
-            cache_guard.size = cache_guard.size.saturating_sub(older_query.size);
-        }
-
-        // Mirror the same accounting for pinned bytes: credit the new query if
-        // it is pinned, and credit back the replaced query if it was pinned.
-        if cache_guard.is_pinned_size(query_bytes) {
-            cache_guard.pinned_size += query_bytes;
-        }
-        if let Some(older_query) = &older_query
-            && cache_guard.is_pinned_size(older_query.size)
-        {
-            cache_guard.pinned_size = cache_guard.pinned_size.saturating_sub(older_query.size);
-        }
-
-        cache_guard.insert_query_for_slot(normalized_query.clone(), *new_slot, older_query);
-
-        cache_guard.update_size_metrics();
-        metrics::CLOUDBREAK_API_REQUEST_DURATION_MS
-            .with_label_values(&["finalize_query_locked", "cached"])
-            .observe(start_locked_time.elapsed().as_micros() as f64);
-
-        finalize_query_span.record("wall_time", start_time.elapsed().as_millis() as i64);
-        finalize_query_span.record(
-            "locked_micros",
-            start_locked_time.elapsed().as_micros() as i64,
-        );
+        .spawn();
     }
 }
 
@@ -550,21 +671,23 @@ impl GpaCache {
     }
 
     /// It will first remove the query from the `queries_for_slot` bucket if it exists.
+    ///
+    /// Takes the replaced entry's slot rather than the entry itself so the caller
+    /// retains ownership and can deallocate it after dropping the write lock.
     pub fn insert_query_for_slot(
         &mut self,
         normalized_query: NormalizedQuery,
         slot: u64,
-        older_query: Option<CachedQuery>,
+        older_slot: Option<u64>,
     ) {
         // Remove old version of the query
-        if let Some(prev) = older_query {
-            let prev_slot = prev.slot;
-            if let Some(queries_list) = self.queries_for_slot.get_mut(&prev_slot) {
-                queries_list.retain(|q| q != &normalized_query);
-                // If there is no more queries for the slot, remove the slot from the map
-                if queries_list.is_empty() {
-                    self.queries_for_slot.remove(&prev_slot);
-                }
+        if let Some(prev_slot) = older_slot
+            && let Some(queries_list) = self.queries_for_slot.get_mut(&prev_slot)
+        {
+            queries_list.retain(|q| q != &normalized_query);
+            // If there is no more queries for the slot, remove the slot from the map
+            if queries_list.is_empty() {
+                self.queries_for_slot.remove(&prev_slot);
             }
         }
 
@@ -614,7 +737,14 @@ impl GpaCache {
     /// usage drops back under the cap. Because of pinning, cleanup may still free
     /// less than requested when the oldest slots hold mostly pinned queries that
     /// are within the cap.
-    pub fn cleanup_old_queries(&mut self, mut bytes_to_free: u64) -> Option<u64> {
+    ///
+    /// Evicted entries are appended to `evicted` rather than dropped here, so the
+    /// caller can deallocate them once the write lock is released.
+    pub fn cleanup_old_queries(
+        &mut self,
+        mut bytes_to_free: u64,
+        evicted: &mut Vec<CachedQuery>,
+    ) -> Option<u64> {
         let mut bytes_freed: u64 = 0;
 
         let available_bytes = match (self.config.max_total_bytes as u64).checked_sub(self.size) {
@@ -699,6 +829,8 @@ impl GpaCache {
                     crate::metrics::CLOUDBREAK_GPA_CACHE_EVICTED_BYTES_TOTAL
                         .with_label_values(&[used])
                         .inc_by(cached.size);
+
+                    evicted.push(cached);
                 }
                 false
             });
