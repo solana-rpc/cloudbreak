@@ -305,11 +305,6 @@ lazy_static::lazy_static! {
     )
     .expect("Failed to create supply stale gauge");
 
-    pub static ref SUPPLY_ROUTED_MISSES: IntCounter = IntCounter::new(
-        "cloudbreak_supply_routed_misses", "Owner-routed supply prev-reads that found no previous row"
-    )
-    .expect("Failed to create supply routed misses counter");
-
     pub static ref SUPPLY_QUERY_ERRORS: IntCounter = IntCounter::new(
         "cloudbreak_supply_query_errors", "Supply prev-read delta queries that failed or timed out"
     )
@@ -455,7 +450,6 @@ pub fn register_collectors() {
         register!(SUPPLY_TOTAL_LAMPORTS);
         register!(SUPPLY_SLOT);
         register!(SUPPLY_STALE);
-        register!(SUPPLY_ROUTED_MISSES);
         register!(SUPPLY_QUERY_ERRORS);
     });
 }

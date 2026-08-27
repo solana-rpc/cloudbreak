@@ -22,6 +22,7 @@ use tokio::{
 };
 use yellowstone_grpc_proto::geyser::CommitmentLevel;
 use yellowstone_grpc_proto::geyser::SubscribeUpdateBlock;
+use cloudbreak_core::modules::account_owner_map::AccountOwnerMap;
 use cloudbreak_core::modules::supply_tracker::SupplyTracker;
 
 use crate::indexer::{AccountsReceivedPerBlock, IndexerState};
@@ -29,7 +30,7 @@ use crate::modules::snapshot::SnapshotProcessingState;
 use crate::{db_queries, metrics, modules};
 
 struct PendingSupplyAccount {
-    owner: Option<Pubkey>,
+    owner: Pubkey,
     lamports: u64,
     write_version: u64,
 }
@@ -103,8 +104,8 @@ pub async fn save_block(
     // Create the chunks for updating the "accounts" table
     let system_program_id = [0u8; 32].to_vec();
     for account in block.accounts {
+        let pubkey = Pubkey::try_from(account.pubkey.as_slice()).unwrap();
         if largest_enabled {
-            let pubkey = Pubkey::try_from(account.pubkey.as_slice()).unwrap();
             let is_token_owner = account.owner.as_slice() == TOKEN_PROGRAM_ID.as_ref()
                 || account.owner.as_slice() == TOKEN_2022_PROGRAM_ID.as_ref();
             let token = if is_token_owner
@@ -136,18 +137,18 @@ pub async fn save_block(
             }
         }
 
-        supply_tracker.observe_account(&account.pubkey, slot, account.lamports);
+        supply_tracker.observe_account(pubkey, slot, account.lamports);
 
         if supply_enabled {
-            let pubkey = Pubkey::try_from(account.pubkey.as_slice()).unwrap();
             let pending = pending_supply_accounts
                 .entry(pubkey)
                 .or_insert_with(|| PendingSupplyAccount {
-                    owner: accounts_owner_map.get_owner(&pubkey),
+                    owner: Pubkey::try_from(account.owner.as_slice()).unwrap(),
                     lamports: account.lamports,
                     write_version: account.write_version,
                 });
             if account.write_version > pending.write_version {
+                pending.owner = Pubkey::try_from(account.owner.as_slice()).unwrap();
                 pending.lamports = account.lamports;
                 pending.write_version = account.write_version;
             }
@@ -156,13 +157,13 @@ pub async fn save_block(
         // If the account is being closed we still add it to the hashmap for cleanup
         //  but we don't add it to the "accounts" table in a normal fashion, instead we added using [`db_queries::insert_closed_accounts`]
         if account.lamports == 0 {
-            closed_accounts_for_slot.push(account.pubkey.clone());
+            closed_accounts_for_slot.push(account.pubkey);
 
             if !account.data.is_empty() || account.owner != system_program_id {
                 tracing::warn!(
                     target: "save_block_closed_account",
                     "Account is being closed with data or owner not being the system program id. Pubkey: {}, owner: {}, data LEN: {}, lamports: {}",
-                    Pubkey::try_from(account.pubkey.as_slice()).unwrap(),
+                    pubkey,
                     Pubkey::try_from(account.owner.as_slice()).unwrap(),
                     account.data.len(),
                     account.lamports
@@ -198,7 +199,7 @@ pub async fn save_block(
 
         let resurrects_gap_closed_account = is_repaired
             && supply_tracker
-                .gap_close_floor(&Pubkey::try_from(account.pubkey.as_slice()).unwrap())
+                .gap_close_floor(&pubkey)
                 .is_some_and(|closed_slot| closed_slot >= slot);
         if !resurrects_gap_closed_account {
             accounts_owner_map.upsert_account(&account.pubkey, &account.owner, slot);
@@ -210,7 +211,7 @@ pub async fn save_block(
         updated_accounts_for_slot.push(account.pubkey.clone());
 
         current_chunk.push(accounts::ActiveModel {
-            pubkey: Set(account.pubkey.clone()),
+            pubkey: Set(account.pubkey),
             owner: Set(account.owner),
             lamports: Set(account.lamports as i64),
             slot: Set(slot as i64),
@@ -246,15 +247,19 @@ pub async fn save_block(
     let defer_map_removals = supply_tracker.is_gap_filling();
     let block_supply_delta = if supply_tracker.is_tracking_deltas() {
         compute_block_supply_delta(
-            db,
-            &config,
+            &accounts_owner_map,
             &supply_tracker,
             pending_supply_accounts,
             slot,
             is_repaired,
         )
-        .await
     } else {
+        accounts_owner_map.merge_lamports(
+            pending_supply_accounts
+                .iter()
+                .map(|(pubkey, pending)| (*pubkey, pending.owner, pending.lamports)),
+            slot,
+        );
         supply_tracker.record_startup_touches(
             slot,
             pending_supply_accounts
@@ -466,18 +471,14 @@ pub(crate) async fn persist_largest_outcome(
     metrics::LARGEST_ACCOUNTS_STALE_MINTS.set(largest_accounts.stale_count() as i64);
 }
 
-async fn compute_block_supply_delta(
-    db: &DatabaseConnection,
-    config: &IndexConfig,
+fn compute_block_supply_delta(
+    accounts_owner_map: &AccountOwnerMap,
     supply_tracker: &SupplyTracker,
     pending_accounts: HashMap<Pubkey, PendingSupplyAccount>,
     slot: u64,
     is_repaired: bool,
 ) -> Option<i128> {
-    let mut block_delta: i128 = 0;
-    let mut owners = Vec::new();
-    let mut pubkeys = Vec::new();
-    let mut new_lamports = Vec::new();
+    let mut routed = Vec::with_capacity(pending_accounts.len());
     for (pubkey, pending) in pending_accounts {
         let zero_prev = supply_tracker.take_zero_prev(&pubkey);
         if is_repaired
@@ -488,47 +489,8 @@ async fn compute_block_supply_delta(
         {
             continue;
         }
-        match pending.owner {
-            Some(owner) if !zero_prev => {
-                owners.push(owner.to_bytes().to_vec());
-                pubkeys.push(pubkey.to_bytes().to_vec());
-                new_lamports.push(pending.lamports);
-            }
-            _ => block_delta += pending.lamports as i128,
-        }
+        routed.push((pubkey, pending.owner, pending.lamports, zero_prev));
     }
 
-    if pubkeys.is_empty() {
-        return Some(block_delta);
-    }
-
-    match db_queries::fetch_block_supply_delta(db, owners, pubkeys, new_lamports, slot, config)
-        .await
-    {
-        Ok(result) => {
-            if result.routed_misses > 0 {
-                metrics::SUPPLY_ROUTED_MISSES.inc_by(result.routed_misses);
-                tracing::warn!(
-                    target: "supply_tracker",
-                    "owner-routed prev-read found no previous row for {} accounts in slot {}",
-                    result.routed_misses,
-                    slot
-                );
-            }
-            Some(block_delta + result.block_delta)
-        }
-        Err(e) => {
-            metrics::SUPPLY_QUERY_ERRORS.inc();
-            tracing::error!(
-                target: "supply_tracker",
-                "block supply delta query failed for slot {}, marking supply stale: {}",
-                slot,
-                e
-            );
-            if supply_tracker.mark_stale() {
-                metrics::SUPPLY_STALE.set(1);
-            }
-            None
-        }
-    }
+    Some(accounts_owner_map.count_supply_deltas(routed, slot))
 }

@@ -8,14 +8,14 @@ use std::{
     time::Duration,
 };
 
-use rust_decimal::{Decimal, prelude::ToPrimitive};
+use rust_decimal::Decimal;
 use solana_pubkey::Pubkey;
 use sea_orm::{
     ActiveValue::Set,
     ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait,
     QueryFilter, Statement, Value,
     prelude::Expr,
-    sea_query::{Alias, ArrayType, OnConflict},
+    sea_query::{Alias, OnConflict},
 };
 use tokio::{
     task::JoinHandle,
@@ -30,7 +30,7 @@ use cloudbreak_core::{
     },
 };
 use cloudbreak_entity::{accounts, slots};
-use cloudbreak_snapshot::{bytea_array, owner_pubkey_arrays, parse_pubkey, pubkey_bytea_array};
+use cloudbreak_snapshot::{owner_pubkey_arrays, parse_pubkey, pubkey_bytea_array};
 
 use crate::metrics;
 
@@ -474,12 +474,6 @@ pub async fn upsert_non_circulating_accounts(
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct BlockSupplyDelta {
-    pub block_delta: i128,
-    pub routed_misses: u64,
-}
-
 const LATEST_ACCOUNT_ROW_SQL: &str = r#"
             SELECT lamports, slot FROM (
                 SELECT lamports, slot FROM accounts
@@ -491,69 +485,6 @@ const LATEST_ACCOUNT_ROW_SQL: &str = r#"
             ORDER BY slot DESC
             LIMIT 1
 "#;
-
-fn numeric_array(items: Vec<u64>) -> Value {
-    Value::Array(
-        ArrayType::Decimal,
-        Some(Box::new(
-            items
-                .into_iter()
-                .map(|value| Value::Decimal(Some(Box::new(Decimal::from(value)))))
-                .collect(),
-        )),
-    )
-}
-
-pub async fn fetch_block_supply_delta(
-    db: &DatabaseConnection,
-    owners: Vec<Vec<u8>>,
-    pubkeys: Vec<Vec<u8>>,
-    new_lamports: Vec<u64>,
-    slot: u64,
-    config: &IndexConfig,
-) -> Result<BlockSupplyDelta, sea_orm::DbErr> {
-    let query_timeout = Duration::from_secs(config.database.save_block_queries_timeout);
-
-    let query = db.query_one(Statement::from_sql_and_values(
-        DatabaseBackend::Postgres,
-        format!(
-            r#"
-        SELECT
-            COALESCE(SUM(v.new_lamports - COALESCE(prev.lamports, 0))
-                     FILTER (WHERE prev.slot IS NULL OR prev.slot < $4), 0) AS block_delta,
-            COUNT(*) FILTER (WHERE prev.slot IS NULL)                       AS routed_misses
-        FROM unnest($1::bytea[], $2::bytea[], $3::numeric[]) AS v(owner, pubkey, new_lamports)
-        LEFT JOIN LATERAL ({LATEST_ACCOUNT_ROW_SQL}) prev ON true
-        "#
-        ),
-        [
-            bytea_array(owners),
-            bytea_array(pubkeys),
-            numeric_array(new_lamports),
-            Value::BigInt(Some(slot as i64)),
-        ],
-    ));
-
-    let row = timeout(query_timeout, query)
-        .await
-        .map_err(|elapsed| {
-            sea_orm::DbErr::Custom(format!("fetch_block_supply_delta timeout: {}", elapsed))
-        })??
-        .ok_or_else(|| {
-            sea_orm::DbErr::Custom("fetch_block_supply_delta returned no row".to_string())
-        })?;
-
-    let block_delta: Decimal = row.try_get("", "block_delta")?;
-    let routed_misses: i64 = row.try_get("", "routed_misses")?;
-    let block_delta = block_delta.to_i128().ok_or_else(|| {
-        sea_orm::DbErr::Custom(format!("block_delta {} does not fit in i128", block_delta))
-    })?;
-
-    Ok(BlockSupplyDelta {
-        block_delta,
-        routed_misses: routed_misses as u64,
-    })
-}
 
 pub async fn fetch_non_circulating_balances(
     db: &DatabaseConnection,

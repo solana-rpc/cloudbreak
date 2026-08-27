@@ -20,7 +20,7 @@
 use sea_orm::{ConnectionTrait, DatabaseConnection, ExecResult, Statement, Value};
 use solana_pubkey::Pubkey;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, hash_map::Entry},
     sync::{Arc, Mutex, OnceLock, RwLock},
     time::Duration,
 };
@@ -57,6 +57,8 @@ pub struct ChangedOwner {
 pub struct AccountOwnerItem {
     pub owner: Pubkey,
     pub slot: u64,
+    pub lamports: u64,
+    pub lamports_slot: u64,
 }
 
 impl AccountOwnerMap {
@@ -77,6 +79,15 @@ impl AccountOwnerMap {
 
     pub fn is_enabled(&self) -> bool {
         self.accounts.is_some()
+    }
+
+    pub fn reserve(&self, additional: usize) {
+        if let Some(accounts) = &self.accounts {
+            accounts
+                .write()
+                .expect("Failed to write accounts")
+                .reserve(additional);
+        }
     }
 
     /// Inserts the account or updates the owner if the account already exists
@@ -110,19 +121,159 @@ impl AccountOwnerMap {
                             owner: existing_owner,
                         });
 
-                    accounts
+                    if let Some(item) = accounts
                         .write()
                         .expect("Failed to write accounts")
-                        .insert(pubkey, AccountOwnerItem { owner, slot });
+                        .get_mut(&pubkey)
+                    {
+                        item.owner = owner;
+                        item.slot = slot;
+                    }
                 }
             } else {
                 // If the account doesn't exist, insert it
-                accounts
-                    .write()
-                    .expect("Failed to write accounts")
-                    .insert(pubkey, AccountOwnerItem { owner, slot });
+                accounts.write().expect("Failed to write accounts").insert(
+                    pubkey,
+                    AccountOwnerItem {
+                        owner,
+                        slot,
+                        lamports: 0,
+                        lamports_slot: 0,
+                    },
+                );
             }
         }
+    }
+
+    pub fn upsert_account_with_lamports(
+        &self,
+        pubkey: &Vec<u8>,
+        owner: &Vec<u8>,
+        slot: u64,
+        lamports: u64,
+    ) {
+        if let Some(accounts) = &self.accounts {
+            let pubkey = Pubkey::try_from(pubkey.as_slice()).unwrap();
+            let owner = Pubkey::try_from(owner.as_slice()).unwrap();
+
+            let changed_owner = {
+                let mut guard = accounts.write().expect("Failed to write accounts");
+                match guard.entry(pubkey) {
+                    Entry::Occupied(mut occupied) => {
+                        let item = occupied.get_mut();
+                        let previous_owner = (item.owner != owner && item.slot < slot).then(|| {
+                            let previous_owner = item.owner;
+                            item.owner = owner;
+                            item.slot = slot;
+                            previous_owner
+                        });
+                        if slot > item.lamports_slot {
+                            item.lamports = lamports;
+                            item.lamports_slot = slot;
+                        }
+                        previous_owner
+                    }
+                    Entry::Vacant(vacant) => {
+                        vacant.insert(AccountOwnerItem {
+                            owner,
+                            slot,
+                            lamports,
+                            lamports_slot: slot,
+                        });
+                        None
+                    }
+                }
+            };
+
+            if let Some(previous_owner) = changed_owner {
+                self.changed_owners
+                    .lock()
+                    .expect("Failed to lock changed_owners")
+                    .entry(slot)
+                    .or_default()
+                    .push(ChangedOwner {
+                        pubkey,
+                        owner: previous_owner,
+                    });
+            }
+        }
+    }
+
+    pub fn merge_lamports(
+        &self,
+        pendings: impl IntoIterator<Item = (Pubkey, Pubkey, u64)>,
+        slot: u64,
+    ) {
+        if let Some(accounts) = &self.accounts {
+            let mut guard = accounts.write().expect("Failed to write accounts");
+            for (pubkey, owner, lamports) in pendings {
+                match guard.entry(pubkey) {
+                    Entry::Occupied(mut occupied) => {
+                        let item = occupied.get_mut();
+                        if slot > item.lamports_slot {
+                            item.lamports = lamports;
+                            item.lamports_slot = slot;
+                        }
+                    }
+                    Entry::Vacant(vacant) => {
+                        if lamports != 0 {
+                            vacant.insert(AccountOwnerItem {
+                                owner,
+                                slot,
+                                lamports,
+                                lamports_slot: slot,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn count_supply_deltas(
+        &self,
+        pendings: impl IntoIterator<Item = (Pubkey, Pubkey, u64, bool)>,
+        slot: u64,
+    ) -> i128 {
+        let mut block_delta: i128 = 0;
+        match &self.accounts {
+            Some(accounts) => {
+                let mut guard = accounts.write().expect("Failed to write accounts");
+                for (pubkey, owner, lamports, zero_prev) in pendings {
+                    match guard.entry(pubkey) {
+                        Entry::Occupied(mut occupied) => {
+                            let item = occupied.get_mut();
+                            if zero_prev || item.lamports_slot == 0 {
+                                block_delta += lamports as i128;
+                            } else if item.lamports_slot < slot {
+                                block_delta += lamports as i128 - item.lamports as i128;
+                            }
+                            if slot > item.lamports_slot {
+                                item.lamports = lamports;
+                                item.lamports_slot = slot;
+                            }
+                        }
+                        Entry::Vacant(vacant) => {
+                            block_delta += lamports as i128;
+                            if lamports != 0 {
+                                vacant.insert(AccountOwnerItem {
+                                    owner,
+                                    slot,
+                                    lamports,
+                                    lamports_slot: slot,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            None => {
+                for (_, _, lamports, _) in pendings {
+                    block_delta += lamports as i128;
+                }
+            }
+        }
+        block_delta
     }
 
     /// For accounts present in the map, saves the mock "closed account" mask into the DB using
@@ -295,5 +446,125 @@ impl AccountOwnerMap {
             }
             None => "AccountOwnerMap: not initialized".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn map() -> AccountOwnerMap {
+        AccountOwnerMap {
+            accounts: Some(Arc::new(RwLock::new(HashMap::new()))),
+            ..AccountOwnerMap::default()
+        }
+    }
+
+    fn pk(byte: u8) -> Pubkey {
+        Pubkey::new_from_array([byte; 32])
+    }
+
+    #[test]
+    fn count_supply_deltas_follows_slot_guard() {
+        let map = map();
+        let owner = pk(9);
+        assert_eq!(
+            map.count_supply_deltas(vec![(pk(1), owner, 100, false)], 10),
+            100
+        );
+        assert_eq!(
+            map.count_supply_deltas(vec![(pk(1), owner, 150, false)], 12),
+            50
+        );
+        assert_eq!(
+            map.count_supply_deltas(vec![(pk(1), owner, 999, false)], 12),
+            0
+        );
+        assert_eq!(
+            map.count_supply_deltas(vec![(pk(1), owner, 40, false)], 11),
+            0
+        );
+        assert_eq!(
+            map.count_supply_deltas(vec![(pk(1), owner, 150, false)], 13),
+            0
+        );
+        assert_eq!(
+            map.count_supply_deltas(vec![(pk(1), owner, 500, false)], 12),
+            0
+        );
+        assert_eq!(
+            map.count_supply_deltas(vec![(pk(1), owner, 175, false)], 14),
+            25
+        );
+    }
+
+    #[test]
+    fn count_supply_deltas_counts_shell_and_absent() {
+        let map = map();
+        map.upsert_account(&pk(2).to_bytes().to_vec(), &pk(9).to_bytes().to_vec(), 20);
+        assert_eq!(
+            map.count_supply_deltas(vec![(pk(2), pk(9), 70, false)], 20),
+            70
+        );
+        assert_eq!(
+            map.count_supply_deltas(vec![(pk(3), pk(9), 30, false)], 20),
+            30
+        );
+        assert_eq!(
+            map.count_supply_deltas(vec![(pk(3), pk(9), 45, false)], 21),
+            15
+        );
+        assert_eq!(
+            map.count_supply_deltas(vec![(pk(4), pk(9), 0, false)], 22),
+            0
+        );
+        assert_eq!(
+            map.count_supply_deltas(vec![(pk(4), pk(9), 25, false)], 23),
+            25
+        );
+    }
+
+    #[test]
+    fn zero_prev_forces_full_count() {
+        let map = map();
+        assert_eq!(
+            map.count_supply_deltas(vec![(pk(5), pk(9), 100, false)], 30),
+            100
+        );
+        assert_eq!(
+            map.count_supply_deltas(vec![(pk(5), pk(9), 100, true)], 31),
+            100
+        );
+        assert_eq!(
+            map.count_supply_deltas(vec![(pk(5), pk(9), 130, false)], 32),
+            30
+        );
+    }
+
+    #[test]
+    fn seed_and_bootstrap_merges_keep_newest_lamports_slot() {
+        let map = map();
+        map.upsert_account_with_lamports(
+            &pk(6).to_bytes().to_vec(),
+            &pk(9).to_bytes().to_vec(),
+            50,
+            500,
+        );
+        map.upsert_account_with_lamports(
+            &pk(6).to_bytes().to_vec(),
+            &pk(9).to_bytes().to_vec(),
+            40,
+            400,
+        );
+        assert_eq!(
+            map.count_supply_deltas(vec![(pk(6), pk(9), 600, false)], 60),
+            100
+        );
+        map.merge_lamports(vec![(pk(7), pk(9), 700)], 70);
+        map.merge_lamports(vec![(pk(7), pk(9), 100)], 65);
+        assert_eq!(
+            map.count_supply_deltas(vec![(pk(7), pk(9), 800, false)], 71),
+            100
+        );
     }
 }

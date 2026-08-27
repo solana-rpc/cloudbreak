@@ -47,6 +47,10 @@ pub use db_queries::{
 
 const DB_ACCOUNTS_BATCH_SIZE: usize = 200;
 
+const MIN_STORED_ACCOUNT_BYTES: usize = 136;
+
+const MAX_OWNER_MAP_RESERVE_ACCOUNTS: usize = 1_700_000_000;
+
 /// Download and save into postgres the snapshot data for the received slot (getting all snapshots files
 ///  needed until data to that slot is available)
 /// If slot is not provided it will just download the latest available full and incremental snapshots
@@ -320,6 +324,7 @@ fn download_and_process_snapshot(
         process_downloaded_snapshot(
             &db_clone,
             snapshot_data,
+            snapshot_type,
             config,
             accounts_owner_map,
             largest_accounts,
@@ -335,6 +340,7 @@ fn download_and_process_snapshot(
 async fn process_downloaded_snapshot(
     database: &DatabaseConnection,
     snapshot_data: SnapshotData,
+    snapshot_type: SnapshotType,
     config: SnapshotConfig,
     accounts_owner_map: AccountOwnerMap,
     largest_accounts: LargestAccountsTracker,
@@ -376,6 +382,15 @@ async fn process_downloaded_snapshot(
         .iter()
         .map(|p| p.0)
         .collect::<Vec<_>>();
+
+    if snapshot_type == SnapshotType::Full
+        && programs_include.is_empty()
+        && programs_exclude.is_empty()
+    {
+        let total_bytes: usize = solana_snapshot.iter().map(|file| file.size).sum();
+        accounts_owner_map
+            .reserve((total_bytes / MIN_STORED_ACCOUNT_BYTES).min(MAX_OWNER_MAP_RESERVE_ACCOUNTS));
+    }
 
     let total_accounts_files_count = solana_snapshot.len();
     let accounts_files_processed = Arc::new(Mutex::new(0));
@@ -502,7 +517,12 @@ async fn process_downloaded_snapshot(
 
                     // Add non closed accounts to the accounts owner map (if enabled)
                     if account.lamports > 0 {
-                        accounts_owner_map.upsert_account(&pubkey, &owner, account_file_slot);
+                        accounts_owner_map.upsert_account_with_lamports(
+                            &pubkey,
+                            &owner,
+                            account_file_slot,
+                            account.lamports,
+                        );
                     }
 
                     let account_update = SubscribeUpdateAccount {

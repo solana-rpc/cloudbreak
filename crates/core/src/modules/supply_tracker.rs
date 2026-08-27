@@ -108,9 +108,8 @@ impl SupplyTracker {
         inner.non_circulating_read().is_member(pubkey)
     }
 
-    pub fn observe_account(&self, pubkey: &[u8], slot: u64, lamports: u64) {
+    pub fn observe_account(&self, pubkey: Pubkey, slot: u64, lamports: u64) {
         let Some(inner) = &self.0 else { return };
-        let pubkey = Pubkey::try_from(pubkey).unwrap();
         if !inner.non_circulating_read().is_member(&pubkey) {
             return;
         }

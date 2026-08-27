@@ -105,6 +105,7 @@ struct Entry {
 #[derive(Default)]
 struct MintTop {
     entries: HashMap<Pubkey, Entry>,
+    cached_min: Option<(Pubkey, u64)>,
     dropped_floor: u64,
     stale: bool,
     last_record: Vec<(Pubkey, u64)>,
@@ -123,6 +124,10 @@ impl MintTop {
             .iter()
             .min_by_key(|(pubkey, entry)| (entry.amount, *pubkey))
             .map(|(pubkey, entry)| (*pubkey, entry.amount))
+    }
+
+    fn refresh_cached_min(&mut self) {
+        self.cached_min = self.min_entry();
     }
 
     fn compute_top(&self) -> ComputedTop {
@@ -199,6 +204,9 @@ impl TrackerState {
         };
         if (slot, write_version) > (entry.slot, entry.write_version) {
             top.entries.remove(&pubkey);
+            if top.cached_min.is_some_and(|(min_pubkey, _)| min_pubkey == pubkey) {
+                top.refresh_cached_min();
+            }
             if !is_sentinel(&mint) {
                 self.member_index.remove(&pubkey);
             }
@@ -235,6 +243,16 @@ impl TrackerState {
                     slot,
                     write_version,
                 };
+                match top.cached_min {
+                    Some((min_pubkey, min_amount)) => {
+                        if min_pubkey == pubkey {
+                            top.refresh_cached_min();
+                        } else if (amount, pubkey) < (min_amount, min_pubkey) {
+                            top.cached_min = Some((pubkey, amount));
+                        }
+                    }
+                    None => top.cached_min = Some((pubkey, amount)),
+                }
                 touched.insert(mint);
             }
             return;
@@ -246,8 +264,9 @@ impl TrackerState {
             }
             return;
         }
+        let mut min_evicted = false;
         if !bootstrapping && top.entries.len() >= k {
-            let (min_pubkey, min_amount) = top.min_entry().expect("non-empty full map");
+            let (min_pubkey, min_amount) = top.cached_min.expect("non-empty full map");
             if amount <= min_amount {
                 if amount > top.dropped_floor {
                     top.dropped_floor = amount;
@@ -256,6 +275,7 @@ impl TrackerState {
                 return;
             }
             top.entries.remove(&min_pubkey);
+            min_evicted = true;
             if !is_sentinel(&mint) {
                 self.member_index.remove(&min_pubkey);
             }
@@ -269,6 +289,18 @@ impl TrackerState {
                 write_version,
             },
         );
+        if min_evicted {
+            top.refresh_cached_min();
+        } else {
+            match top.cached_min {
+                Some((min_pubkey, min_amount)) => {
+                    if (amount, pubkey) < (min_amount, min_pubkey) {
+                        top.cached_min = Some((pubkey, amount));
+                    }
+                }
+                None => top.cached_min = Some((pubkey, amount)),
+            }
+        }
         if !is_sentinel(&mint) {
             self.member_index.insert(pubkey, mint);
         }
@@ -301,6 +333,7 @@ impl TrackerState {
                 member_index.remove(&pubkey);
             }
         }
+        top.refresh_cached_min();
     }
 
     fn emit(&mut self, mint: Pubkey, slot: u64, outcome: &mut BlockOutcome) {
