@@ -129,6 +129,8 @@ pub async fn run(
     db_queries::clean_up_closed_accounts(&database).await?;
     db_queries::create_database_indexes(&database, &config.pg_indexes).await?;
 
+    accounts_owner_map.remove_zero_lamport_entries();
+
     finish_largest_accounts_bootstrap(&database, &largest_accounts).await;
     finish_supply_bootstrap(&database, &accounts_owner_map, &supply_tracker).await;
 
@@ -515,15 +517,12 @@ async fn process_downloaded_snapshot(
                     let pubkey = account.pubkey.to_bytes().to_vec();
                     let owner = account.owner.to_bytes().to_vec();
 
-                    // Add non closed accounts to the accounts owner map (if enabled)
-                    if account.lamports > 0 {
-                        accounts_owner_map.upsert_account_with_lamports(
-                            &pubkey,
-                            &owner,
-                            account_file_slot,
-                            account.lamports,
-                        );
-                    }
+                    accounts_owner_map.upsert_account_with_lamports(
+                        &pubkey,
+                        &owner,
+                        account_file_slot,
+                        account.lamports,
+                    );
 
                     let account_update = SubscribeUpdateAccount {
                         account: Some(SubscribeUpdateAccountInfo {

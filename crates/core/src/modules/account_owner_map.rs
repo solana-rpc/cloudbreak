@@ -90,6 +90,15 @@ impl AccountOwnerMap {
         }
     }
 
+    pub fn remove_zero_lamport_entries(&self) {
+        if let Some(accounts) = &self.accounts {
+            accounts
+                .write()
+                .expect("Failed to write accounts")
+                .retain(|_, item| item.lamports > 0 || item.lamports_slot == 0);
+        }
+    }
+
     /// Inserts the account or updates the owner if the account already exists
     ///
     /// Note: if module is disabled, this will be a no-op
