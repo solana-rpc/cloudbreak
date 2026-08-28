@@ -29,12 +29,15 @@ use crate::methods::token::{
 };
 use crate::{db_query, methods, metrics};
 
+const MAX_REQUEST_BODY_SIZE: usize = 50 * (1 << 10);
+
 pub async fn handle_rpc_request(
     req: Request<Incoming>,
     state: Arc<CloudbreakRpcState>,
     ctx: &Arc<RequestContext>,
 ) -> HttpHandlerResponse {
-    let body = match http_body_util::BodyExt::collect(req.into_body()).await {
+    let limited_body = http_body_util::Limited::new(req.into_body(), MAX_REQUEST_BODY_SIZE);
+    let body = match http_body_util::BodyExt::collect(limited_body).await {
         Ok(collected) => collected.to_bytes(),
         Err(e) => {
             return make_error_response(
