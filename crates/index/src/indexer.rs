@@ -363,5 +363,8 @@ pub async fn process_update(
 pub struct AccountsReceivedPerBlock {
     pub block_time: Option<UnixTimestamp>,
     pub accounts: Vec<Vec<u8>>,
+    pub accounts_owners: Vec<Vec<u8>>,
     pub closed_accounts: Vec<Vec<u8>>,
+    pub closed_cleanup_pubkeys: Vec<Vec<u8>>,
+    pub closed_cleanup_owners: Vec<Vec<u8>>,
 }

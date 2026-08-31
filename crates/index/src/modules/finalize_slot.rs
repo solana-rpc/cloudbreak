@@ -434,19 +434,30 @@ async fn finalize_slot(
     //  they are completely new to our db)
     let new_accounts_in_slot = Arc::new(Mutex::new(0));
 
-    let batches = updated_accounts
-        .accounts
-        .chunks(SLOT_FINALIZE_BATCH_SIZE)
-        .map(|batch| batch.to_vec())
-        .collect::<Vec<_>>();
+    let owner_routed = updated_accounts.accounts_owners.len() == updated_accounts.accounts.len();
+    let batches = if owner_routed {
+        updated_accounts
+            .accounts
+            .chunks(SLOT_FINALIZE_BATCH_SIZE)
+            .zip(updated_accounts.accounts_owners.chunks(SLOT_FINALIZE_BATCH_SIZE))
+            .map(|(batch, owners)| (batch.to_vec(), owners.to_vec()))
+            .collect::<Vec<_>>()
+    } else {
+        updated_accounts
+            .accounts
+            .chunks(SLOT_FINALIZE_BATCH_SIZE)
+            .map(|batch| (batch.to_vec(), Vec::new()))
+            .collect::<Vec<_>>()
+    };
 
     let mut join_set = JoinSet::new();
 
     updated_accounts_during_startup.cleanup_stored_accounts_once(&db, slot, config);
 
-    for batch in batches {
+    for (batch, owner_batch) in batches {
         let db_clone = db.clone();
         let batch_clone = batch.clone();
+        let owner_batch_clone = owner_batch.clone();
         let new_accounts_in_slot_clone = new_accounts_in_slot.clone();
         let updated_accounts_during_startup = updated_accounts_during_startup.clone();
         let config_clone = config.clone();
@@ -456,6 +467,7 @@ async fn finalize_slot(
             db_queries::cleanup_accounts(
                 &db_clone,
                 batch_clone,
+                owner_batch_clone,
                 slot,
                 "accounts",
                 new_accounts_in_slot_clone,
@@ -483,6 +495,7 @@ async fn finalize_slot(
             db_queries::cleanup_accounts(
                 &db_clone,
                 batch,
+                owner_batch,
                 slot,
                 "snapshot_accounts",
                 dummy_new_accounts_in_slot,
@@ -495,14 +508,35 @@ async fn finalize_slot(
 
     let _ = prune_slot_tx.send(slot);
 
-    let closed_accounts = updated_accounts.closed_accounts.clone();
+    let closed_owner_routed = !updated_accounts.closed_cleanup_owners.is_empty()
+        && updated_accounts.closed_cleanup_owners.len()
+            == updated_accounts.closed_cleanup_pubkeys.len();
+
+    let (closed_pubkeys, closed_owners) = if closed_owner_routed {
+        (
+            updated_accounts.closed_cleanup_pubkeys.clone(),
+            updated_accounts.closed_cleanup_owners.clone(),
+        )
+    } else {
+        (updated_accounts.closed_accounts.clone(), Vec::new())
+    };
+
     let db_clone = db.clone();
     let config_clone = config.clone();
+    let closed_pubkeys_clone = closed_pubkeys.clone();
+    let closed_owners_clone = closed_owners.clone();
     join_set.spawn(async move {
         // Updated accounts doesn't include the closed accounts, instead this query will delete the closed accounts inserted
         //  and any previous version of the accounts, so it's safe to execute concurrently with the cleanup_accounts tasks
         // because there is not overlap between the accounts sets
-        db_queries::cleanup_closed_accounts(&db_clone, closed_accounts, slot, &config_clone).await;
+        db_queries::cleanup_closed_accounts(
+            &db_clone,
+            closed_pubkeys_clone,
+            closed_owners_clone,
+            slot,
+            &config_clone,
+        )
+        .await;
     });
 
     // If we are in startup, we just save the closed accounts to delete them after the snapshot is processed
@@ -515,7 +549,8 @@ async fn finalize_slot(
             // Closed accounts are not included in the updated accounts, so we need to cleanup them separately
             db_queries::cleanup_accounts(
                 &db,
-                updated_accounts.closed_accounts,
+                closed_pubkeys,
+                closed_owners,
                 slot,
                 "snapshot_accounts",
                 Arc::new(Mutex::new(0)),
@@ -676,6 +711,7 @@ impl UpdatedAccountsDuringStartup {
                     db_queries::cleanup_accounts(
                         &db,
                         batch,
+                        Vec::new(),
                         slot,
                         "snapshot_accounts",
                         Arc::new(Mutex::new(0)),

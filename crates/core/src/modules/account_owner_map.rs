@@ -285,6 +285,37 @@ impl AccountOwnerMap {
         block_delta
     }
 
+    pub fn closed_cleanup_pairs(
+        &self,
+        closed_accounts: &[Vec<u8>],
+        slot: u64,
+    ) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let mut pubkeys = Vec::new();
+        let mut owners = Vec::new();
+        if let Some(accounts) = &self.accounts {
+            let map = accounts.read().expect("Failed to read accounts");
+            for pubkey_bytes in closed_accounts {
+                let pubkey = Pubkey::try_from(pubkey_bytes.as_slice()).unwrap();
+                if let Some(item) = map.get(&pubkey) {
+                    pubkeys.push(pubkey_bytes.clone());
+                    owners.push(item.owner.to_bytes().to_vec());
+                }
+            }
+        }
+        if let Some(changed) = self
+            .changed_owners
+            .lock()
+            .expect("Failed to lock changed_owners")
+            .get(&slot)
+        {
+            for ChangedOwner { pubkey, owner } in changed {
+                pubkeys.push(pubkey.to_bytes().to_vec());
+                owners.push(owner.to_bytes().to_vec());
+            }
+        }
+        (pubkeys, owners)
+    }
+
     /// For accounts present in the map, saves the mock "closed account" mask into the DB using
     /// the previous owner and the new slot.
     ///

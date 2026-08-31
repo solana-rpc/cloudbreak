@@ -79,7 +79,9 @@ pub async fn save_block(
     let mut current_chunk_bytes = 0;
 
     let mut updated_accounts_for_slot = Vec::new();
+    let mut updated_accounts_owners_for_slot = Vec::new();
     let mut closed_accounts_for_slot = Vec::new();
+    let capture_owners = accounts_owner_map.is_enabled();
 
     metrics::record_new_accounts_in_slot(block.accounts.len(), "block_accounts_total");
 
@@ -209,6 +211,9 @@ pub async fn save_block(
         current_chunk_bytes += account.data.len();
 
         updated_accounts_for_slot.push(account.pubkey.clone());
+        if capture_owners {
+            updated_accounts_owners_for_slot.push(account.owner.clone());
+        }
 
         current_chunk.push(accounts::ActiveModel {
             pubkey: Set(account.pubkey),
@@ -271,6 +276,12 @@ pub async fn save_block(
 
     let closed_account_for_slot_len = closed_accounts_for_slot.len();
 
+    let (closed_cleanup_pubkeys, closed_cleanup_owners) = if capture_owners {
+        accounts_owner_map.closed_cleanup_pairs(&closed_accounts_for_slot, slot)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
     // We delay the closed accounts insertion until the snapshot is processed to avoid reads while
     // the `snapshot_accounts` table still doesn't have indexes
     let snapshot_processing_state: SnapshotProcessingState = {
@@ -303,7 +314,10 @@ pub async fn save_block(
         AccountsReceivedPerBlock {
             block_time: block.block_time,
             accounts: updated_accounts_for_slot,
+            accounts_owners: updated_accounts_owners_for_slot,
             closed_accounts: closed_accounts_for_slot,
+            closed_cleanup_pubkeys,
+            closed_cleanup_owners,
         },
         block.blockhash.clone(),
         block.parent_slot,

@@ -164,33 +164,56 @@ pub fn insert_closed_accounts(
 pub async fn cleanup_closed_accounts(
     db: &DatabaseConnection,
     pubkeys: Vec<Vec<u8>>,
+    owners: Vec<Vec<u8>>,
     slot: u64,
     config: &IndexConfig,
 ) {
     let query_timeout = Duration::from_secs(config.database.finalize_slot_queries_timeout);
 
     let start_time = Instant::now();
-    let cleanup_closed_accounts_sql = include_str!("db/closedAccountscleanup.sql");
 
     if pubkeys.is_empty() {
         return;
     }
 
-    let query = db.execute(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        cleanup_closed_accounts_sql,
+    let owner_routed = !owners.is_empty() && owners.len() == pubkeys.len();
+    let cleanup_closed_accounts_sql = if owner_routed {
+        include_str!("db/cleanupClosedWithOwner.sql")
+    } else {
+        include_str!("db/closedAccountscleanup.sql")
+    };
+
+    let pubkeys_value = Value::Array(
+        sea_orm::sea_query::ArrayType::Bytes,
+        Some(Box::new(
+            pubkeys
+                .into_iter()
+                .map(|pubkey| Value::Bytes(Some(Box::new(pubkey))))
+                .collect(),
+        )),
+    );
+    let params = if owner_routed {
         vec![
+            Value::BigInt(Some(slot as i64)),
+            pubkeys_value,
             Value::Array(
                 sea_orm::sea_query::ArrayType::Bytes,
                 Some(Box::new(
-                    pubkeys
+                    owners
                         .into_iter()
-                        .map(|pubkey| Value::Bytes(Some(Box::new(pubkey))))
+                        .map(|owner| Value::Bytes(Some(Box::new(owner))))
                         .collect(),
                 )),
             ),
-            Value::BigInt(Some(slot as i64)),
-        ],
+        ]
+    } else {
+        vec![pubkeys_value, Value::BigInt(Some(slot as i64))]
+    };
+
+    let query = db.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        cleanup_closed_accounts_sql,
+        params,
     ));
 
     let result = timeout(query_timeout, query)
@@ -230,6 +253,7 @@ pub async fn cleanup_closed_accounts(
 pub async fn cleanup_accounts(
     db: &DatabaseConnection,
     pubkeys: Vec<Vec<u8>>,
+    owners: Vec<Vec<u8>>,
     slot: u64,
     table_name: &str,
     new_accounts_in_slot: Arc<Mutex<usize>>,
@@ -238,25 +262,43 @@ pub async fn cleanup_accounts(
 ) {
     let start_time = Instant::now();
     let pubkeys_len = pubkeys.len();
-    let cleanup_sql = include_str!("db/cleanup.sql");
+    let owner_routed = !owners.is_empty() && owners.len() == pubkeys.len();
+    let cleanup_sql = if owner_routed {
+        include_str!("db/cleanupWithOwner.sql")
+    } else {
+        include_str!("db/cleanup.sql")
+    };
     let cleanup_sql = cleanup_sql.replace("accounts_table_name", table_name);
     let query_timeout = Duration::from_secs(config.database.finalize_slot_queries_timeout);
+
+    let mut params = vec![
+        Value::BigInt(Some(slot as i64)),
+        Value::Array(
+            sea_orm::sea_query::ArrayType::Bytes,
+            Some(Box::new(
+                pubkeys
+                    .into_iter()
+                    .map(|pubkey| Value::Bytes(Some(Box::new(pubkey))))
+                    .collect(),
+            )),
+        ),
+    ];
+    if owner_routed {
+        params.push(Value::Array(
+            sea_orm::sea_query::ArrayType::Bytes,
+            Some(Box::new(
+                owners
+                    .into_iter()
+                    .map(|owner| Value::Bytes(Some(Box::new(owner))))
+                    .collect(),
+            )),
+        ));
+    }
 
     let query = db.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         cleanup_sql,
-        vec![
-            Value::BigInt(Some(slot as i64)),
-            Value::Array(
-                sea_orm::sea_query::ArrayType::Bytes,
-                Some(Box::new(
-                    pubkeys
-                        .into_iter()
-                        .map(|pubkey| Value::Bytes(Some(Box::new(pubkey))))
-                        .collect(),
-                )),
-            ),
-        ],
+        params,
     ));
 
     let result = timeout(query_timeout, query)
