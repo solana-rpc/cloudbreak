@@ -29,10 +29,11 @@ use solana_stake_interface::state::StakeStateV2;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::metrics::TokioTaskCounterGuard;
+use crate::metrics::{SUPPLY_QUERY_ERRORS, TokioTaskCounterGuard};
 use crate::modules::account_owner_map::AccountOwnerMap;
 use crate::modules::largest_accounts::{LargestAccountsTracker, persist_largest_outcome};
 use crate::modules::service_health::is_healthy;
+use crate::modules::supply_tracker::SupplyTracker;
 use crate::{IndexConfig, STAKE_PROGRAM_ID};
 use lists::{NON_CIRCULATING_ACCOUNTS, WITHDRAW_AUTHORITY};
 
@@ -120,11 +121,12 @@ pub fn spawn_non_circulating_recomputer(
     non_circulating: NonCirculatingTracker,
     accounts_owner_map: AccountOwnerMap,
     largest_accounts: LargestAccountsTracker,
+    supply_tracker: SupplyTracker,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let _guard = TokioTaskCounterGuard::new("non_circulating_recomputer");
 
-        if !non_circulating.is_enabled() {
+        if !non_circulating.is_enabled() && !supply_tracker.is_enabled() {
             return;
         }
 
@@ -188,6 +190,10 @@ pub fn spawn_non_circulating_recomputer(
             last_recompute = Some(Instant::now());
             next_lockup_expiry = next_expiry;
             let member_set: HashSet<Pubkey> = accounts.iter().copied().collect();
+            if supply_tracker.is_enabled() {
+                upsert_non_circulating_accounts(&db, slot, &accounts).await;
+                supply_tracker.set_non_circulating_accounts(accounts.clone(), balances.clone());
+            }
             non_circulating.set_members(accounts);
             if let Some(outcome) =
                 largest_accounts.seed_class_sentinels(slot, &member_set, &balances)
@@ -321,6 +327,35 @@ async fn fetch_non_circulating_balances(
             })
         })
         .collect()
+}
+
+/// Persists the current non-circulating member list so the API can serve
+/// `excludeNonCirculatingAccountsList = false` requests.
+async fn upsert_non_circulating_accounts(db: &DatabaseConnection, slot: u64, accounts: &[Pubkey]) {
+    let account_bytes = accounts
+        .iter()
+        .map(|pubkey| pubkey.to_bytes().to_vec())
+        .collect();
+    let result = db
+        .execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "INSERT INTO non_circulating_accounts (id, slot, accounts, updated_at) \
+             VALUES (1, $1, $2, now()) \
+             ON CONFLICT (id) DO UPDATE SET \
+                slot = EXCLUDED.slot, \
+                accounts = EXCLUDED.accounts, \
+                updated_at = now()",
+            [Value::from(slot as i64), bytea_array(account_bytes)],
+        ))
+        .await;
+    if let Err(e) = result {
+        tracing::error!(
+            "upsert_non_circulating_accounts failed for slot {}: {}",
+            slot,
+            e
+        );
+        SUPPLY_QUERY_ERRORS.inc();
+    }
 }
 
 fn bytea_array(items: Vec<Vec<u8>>) -> Value {

@@ -374,9 +374,16 @@ pub async fn download_snapshot_file(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct SnapshotBankInfo {
+    pub capitalization: u64,
+    pub slot: u64,
+}
+
 pub struct UnpackedSnapshot {
     pub account_files: Vec<AccountFileData>,
     pub stake_data: crate::stake_data::SnapshotStakeData,
+    pub bank_info: SnapshotBankInfo,
 }
 
 pub fn unpack_compressed_snapshot<P: Into<PathBuf>>(
@@ -436,6 +443,10 @@ pub fn unpack_compressed_snapshot<P: Into<PathBuf>>(
 
     let stake_data =
         crate::stake_data::extract_stake_data(&bank_fields, &extra_fields.versioned_epoch_stakes);
+    let bank_info = SnapshotBankInfo {
+        capitalization: bank_fields.capitalization,
+        slot: bank_fields.slot,
+    };
     tracing::info!(
         target: "unpack_compressed_snapshot",
         "Extracted stake data: epoch={}, voters={}, in_epoch_set={}",
@@ -522,6 +533,7 @@ pub fn unpack_compressed_snapshot<P: Into<PathBuf>>(
     Ok(UnpackedSnapshot {
         account_files: account_file_data,
         stake_data,
+        bank_info,
     })
 }
 
