@@ -48,6 +48,10 @@ pub enum RpcError {
     /// SPL Token / Token-2022 in token-account RPCs.
     #[error("Invalid param: not a Token account ({pubkey})")]
     NotATokenAccount { pubkey: String },
+    /// Matches Agave's response when the mint account exists but is not owned
+    /// by SPL Token / Token-2022 in mint-oriented RPCs.
+    #[error("Invalid param: not a Token mint ({mint})")]
+    NotATokenMint { mint: String },
     #[error("Invalid param: could not find mint ({mint})")]
     MintDataNotFound { mint: String },
 }
@@ -89,6 +93,7 @@ impl RpcError {
             RpcError::AccountOwnerExcluded { .. } => "ACCOUNT_OWNER_EXCLUDED",
             RpcError::AccountNotFound { .. } => "Invalid param: could not find account",
             RpcError::NotATokenAccount { .. } => "Invalid param: not a Token account",
+            RpcError::NotATokenMint { .. } => "Invalid param: not a Token mint",
             RpcError::MintDataNotFound { .. } => "Invalid param: could not find mint",
         }
     }
@@ -110,6 +115,7 @@ impl RpcError {
             RpcError::AccountOwnerExcluded { .. } => -32010,
             RpcError::AccountNotFound { .. } => -32602,
             RpcError::NotATokenAccount { .. } => -32602,
+            RpcError::NotATokenMint { .. } => -32602,
             RpcError::MintDataNotFound { .. } => -32602,
         }
     }

@@ -145,6 +145,12 @@ fn accounts_equal(account1: &JsonValue, account2: &JsonValue, encoding: &str) ->
 /// - `GetBalance` — `result.value` is a `u64`, compared directly.
 /// - `GetTokenAccountBalance` — `result.value` is a `UiTokenAmount` object,
 ///   compared directly.
+/// - `GetTokenSupply` — `result.value` is a `UiTokenAmount` object,
+///   compared directly.
+/// - `GetTokenLargestAccounts` — `result.value` is an array of
+///   `RpcTokenAccountBalance` objects ordered deterministically by both
+///   implementations (amount descending, pubkey-descending tie-break),
+///   compared directly.
 ///
 /// For zstd-compressed encodings, account data is decompressed before
 /// comparison to handle non-deterministic compression across implementations.
@@ -178,17 +184,21 @@ pub fn compare_responses(
             compare_multiple_accounts_responses(response1, response2, encoding)
         }
         RequestType::GetAccountInfo => compare_value_with_account(response1, response2, encoding),
-        RequestType::GetBalance | RequestType::GetTokenAccountBalance => {
-            compare_value_direct(response1, response2)
-        }
+        RequestType::GetBalance
+        | RequestType::GetTokenAccountBalance
+        | RequestType::GetTokenSupply
+        | RequestType::GetTokenLargestAccounts => compare_value_direct(response1, response2),
         RequestType::SimulateTransaction => compare_simulate_responses(response1, response2),
     };
 
     CompareResponsesResult::new_with_matching_context(matches, compare_context_result)
 }
 
-/// Compares two `result.value: u64 | object` responses by direct JSON equality.
-/// Used for `getBalance` (u64) and `getTokenAccountBalance` (UiTokenAmount).
+/// Compares two `result.value: u64 | object | array` responses by direct JSON
+/// equality. Used for `getBalance` (u64), `getTokenAccountBalance` /
+/// `getTokenSupply` (UiTokenAmount), and `getTokenLargestAccounts` (array of
+/// `RpcTokenAccountBalance`, deterministically ordered by amount descending
+/// with a pubkey-descending tie-break in both implementations).
 fn compare_value_direct(response1: &JsonValue, response2: &JsonValue) -> bool {
     let v1 = response1.get("result").and_then(|r| r.get("value"));
     let v2 = response2.get("result").and_then(|r| r.get("value"));

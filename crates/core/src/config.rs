@@ -223,6 +223,56 @@ impl EnvironmentInfo {
         })
     }
 
+    pub async fn upsert_largest_accounts_mints(
+        db: &DatabaseConnection,
+        mints: Option<Vec<Pubkey>>,
+    ) -> Result<()> {
+        let csv = mints.map(|mints| {
+            mints
+                .iter()
+                .map(|mint| mint.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        });
+
+        db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "INSERT INTO environment_info (id, largest_accounts_mints) VALUES (1, $1) \
+             ON CONFLICT (id) DO UPDATE SET largest_accounts_mints = EXCLUDED.largest_accounts_mints",
+            [csv.into()],
+        ))
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn load_largest_accounts_mints(
+        db: &DatabaseConnection,
+    ) -> Result<Option<Vec<Pubkey>>> {
+        let row = db
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT largest_accounts_mints FROM environment_info WHERE id = 1".to_string(),
+            ))
+            .await?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let csv: Option<String> = row.try_get("", "largest_accounts_mints")?;
+        let Some(csv) = csv else {
+            return Ok(None);
+        };
+        let mints = csv
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(Pubkey::from_str)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(Some(mints))
+    }
+
     pub async fn upsert_grpc_version(db: &DatabaseConnection, version: &str) -> Result<()> {
         db.execute(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
@@ -408,6 +458,36 @@ pub struct IndexConfig {
     #[serde(default)]
     #[serde(rename = "accounts-owner-map-enabled")]
     pub accounts_owner_map_enabled: bool,
+    #[serde(rename = "largest-accounts")]
+    pub largest_accounts: Option<LargestAccountsConfig>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct LargestAccountsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(rename = "tracked-mints", default)]
+    pub tracked_mints: Vec<PubkeyDef>,
+    #[serde(
+        rename = "accounts-per-mint",
+        default = "LargestAccountsConfig::default_accounts_per_mint"
+    )]
+    pub accounts_per_mint: usize,
+    #[serde(
+        rename = "prune-interval-slots",
+        default = "LargestAccountsConfig::default_prune_interval_slots"
+    )]
+    pub prune_interval_slots: u64,
+}
+
+impl LargestAccountsConfig {
+    const fn default_accounts_per_mint() -> usize {
+        100
+    }
+
+    const fn default_prune_interval_slots() -> u64 {
+        20
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -436,6 +516,12 @@ impl IndexConfig {
 
     fn default_finalize_slot_buffer_size() -> usize {
         1000
+    }
+
+    pub fn largest_accounts_enabled(&self) -> bool {
+        self.largest_accounts
+            .as_ref()
+            .is_some_and(|largest_accounts| largest_accounts.enabled)
     }
 }
 

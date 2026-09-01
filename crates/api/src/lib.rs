@@ -94,6 +94,18 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
     let simulation_supported = indexer_filter.supports_simulation();
     info!("simulateTransaction: supported: {}", simulation_supported);
 
+    let largest_accounts_mints = EnvironmentInfo::load_largest_accounts_mints(&database)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("Failed to load largest accounts mints: {:?}", e);
+            None
+        })
+        .map(|mints| Arc::new(mints.into_iter().collect::<std::collections::HashSet<_>>()));
+    info!(
+        "getLargestAccounts: supported: {}",
+        largest_accounts_mints.is_some()
+    );
+
     let vote_accounts_supported = indexer_filter.supports_vote_accounts();
     let stakes_cache: vote_accounts_cache::SharedStakesSnapshot = Arc::new(RwLock::new(Arc::new(
         vote_accounts_cache::StakesSnapshot::empty(),
@@ -144,6 +156,7 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
         stakes_cache,
         max_multiple_accounts,
         simulation_supported,
+        largest_accounts_mints,
     );
 
     info!("Server is starting...");

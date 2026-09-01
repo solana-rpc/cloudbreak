@@ -6,9 +6,11 @@
 use std::sync::{Once, OnceLock};
 
 use cloudbreak_core::IndexConfig;
-use prometheus::{
-    Counter, Histogram, HistogramOpts, HistogramVec, IntGauge, IntGaugeVec, Opts, Registry,
+pub use cloudbreak_core::metrics::{
+    CURRENT_TOKIO_TASKS, LARGEST_ACCOUNTS_DB_ERRORS, LARGEST_ACCOUNTS_STALE_MINTS,
+    TokioTaskCounterGuard,
 };
+use prometheus::{Counter, Histogram, HistogramOpts, HistogramVec, IntGauge, Registry};
 use tracing::error;
 
 pub static DB_ERRORS_THRESHOLD: OnceLock<f64> = OnceLock::new();
@@ -268,44 +270,10 @@ lazy_static::lazy_static! {
     )
     .expect("Failed to create insert closed accounts per slot histogram");
 
-    pub static ref CURRENT_TOKIO_TASKS: IntGaugeVec = IntGaugeVec::new(
-        Opts::new("cloudbreak_current_tokio_tasks", "Current number of Tokio tasks"),
-        &["task_type"],
-    )
-    .expect("Failed to create current tokio tasks histogram");
-
     pub static ref FINALIZE_SLOT_HANDLER_QUEUE_SIZE: IntGauge = IntGauge::new(
         "cloudbreak_finalize_slot_handler_queue_size", "Size of the finalize slot handler queue"
     )
     .expect("Failed to create finalize slot handler queue size gauge");
-}
-
-/// We use a guard to increment the current tokio tasks metric when a task is created and
-///  decrement it when the task is dropped. This way the counter is going to be decremented
-/// even in the case of panics.
-pub struct TokioTaskCounterGuard {
-    task_type: String,
-}
-
-impl TokioTaskCounterGuard {
-    pub fn new(task_type: &str) -> Self {
-        CURRENT_TOKIO_TASKS.with_label_values(&[task_type]).inc();
-        Self {
-            task_type: task_type.to_string(),
-        }
-    }
-
-    pub fn decrement(&self) {
-        CURRENT_TOKIO_TASKS
-            .with_label_values(&[&self.task_type])
-            .dec();
-    }
-}
-
-impl Drop for TokioTaskCounterGuard {
-    fn drop(&mut self) {
-        self.decrement();
-    }
 }
 
 pub fn record_block_processing(elapsed: f64, origin: &str) {
@@ -414,5 +382,7 @@ pub fn register_collectors() {
         register!(GRPC_TOTAL_UPDATES_RECEIVED);
         register!(GRPC_BUFFER_CHANNEL_SIZE_SENDER);
         register!(FINALIZE_SLOT_DELETED_ACCOUNTS);
+        register!(LARGEST_ACCOUNTS_DB_ERRORS);
+        register!(LARGEST_ACCOUNTS_STALE_MINTS);
     });
 }

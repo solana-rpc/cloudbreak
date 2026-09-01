@@ -111,6 +111,8 @@ pub fn extract_commitment_from_request(request: &JsonValue, request_type: Reques
         | RequestType::GetMultipleAccounts
         | RequestType::GetBalance
         | RequestType::GetTokenAccountBalance
+        | RequestType::GetTokenSupply
+        | RequestType::GetTokenLargestAccounts
         | RequestType::SimulateTransaction => 1,
         RequestType::Gtabo | RequestType::Gtabd => 2,
     };
@@ -131,7 +133,8 @@ pub fn extract_commitment_from_request(request: &JsonValue, request_type: Reques
 ///   `getMultipleAccounts`): the request's `encoding` if present, otherwise the
 ///   per-method Agave default.
 /// - For methods that don't carry an encoding at all (`getBalance`,
-///   `getTokenAccountBalance`): the sentinel string `"none"`.
+///   `getTokenAccountBalance`, `getTokenSupply`, `getTokenLargestAccounts`):
+///   the sentinel string `"none"`.
 ///
 /// Agave defaults followed here:
 /// - `getProgramAccounts` → `base58`
@@ -139,10 +142,14 @@ pub fn extract_commitment_from_request(request: &JsonValue, request_type: Reques
 /// - `getAccountInfo` → `binary` (deprecated base58 plain-string)
 /// - `getMultipleAccounts` → `base64`
 pub fn extract_encoding_from_request(request: &JsonValue, request_type: RequestType) -> String {
-    // getBalance / getTokenAccountBalance have no encoding concept.
+    // getBalance / getTokenAccountBalance / getTokenSupply / getTokenLargestAccounts
+    // have no encoding concept.
     if matches!(
         request_type,
-        RequestType::GetBalance | RequestType::GetTokenAccountBalance
+        RequestType::GetBalance
+            | RequestType::GetTokenAccountBalance
+            | RequestType::GetTokenSupply
+            | RequestType::GetTokenLargestAccounts
     ) {
         return "none".to_string();
     }
@@ -155,7 +162,12 @@ pub fn extract_encoding_from_request(request: &JsonValue, request_type: RequestT
         | RequestType::GetMultipleAccounts
         | RequestType::SimulateTransaction => 1,
         RequestType::Gtabo | RequestType::Gtabd => 2,
-        RequestType::GetBalance | RequestType::GetTokenAccountBalance => unreachable!(),
+        RequestType::GetBalance
+        | RequestType::GetTokenAccountBalance
+        | RequestType::GetTokenSupply
+        | RequestType::GetTokenLargestAccounts => {
+            unreachable!()
+        }
     };
     let encoding = request
         .get("params")
@@ -174,7 +186,10 @@ pub fn extract_encoding_from_request(request: &JsonValue, request_type: RequestT
             RequestType::GetAccountInfo => "binary".to_string(),
             RequestType::GetMultipleAccounts => "base64".to_string(),
             RequestType::SimulateTransaction => "base58".to_string(),
-            RequestType::GetBalance | RequestType::GetTokenAccountBalance => unreachable!(),
+            RequestType::GetBalance
+            | RequestType::GetTokenAccountBalance
+            | RequestType::GetTokenSupply
+            | RequestType::GetTokenLargestAccounts => unreachable!(),
         },
     }
 }
