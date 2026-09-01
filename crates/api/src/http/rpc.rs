@@ -476,6 +476,12 @@ async fn process_single_request(
             json_response
         }
         "getLargestAccounts" => {
+            // Disabled method: clean JSON-RPC "Method not found".
+            if !state.largest_accounts_enabled {
+                let err = RpcError::MethodNotFound;
+                return make_error_response(id, err.to_numeric_code(), err.to_string());
+            }
+
             let start_time = Instant::now();
 
             let config: Option<solana_rpc_client_api::config::RpcLargestAccountsConfig> =
@@ -513,6 +519,12 @@ async fn process_single_request(
             json_response
         }
         "getTokenLargestAccounts" => {
+            // Disabled method: clean JSON-RPC "Method not found".
+            if !state.token_largest_accounts_enabled {
+                let err = RpcError::MethodNotFound;
+                return make_error_response(id, err.to_numeric_code(), err.to_string());
+            }
+
             let start_time = Instant::now();
 
             let pubkey: String = match extract_param(&rpc_request.params, 0) {

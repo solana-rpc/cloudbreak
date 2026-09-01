@@ -132,7 +132,7 @@ pub fn spawn_non_circulating_recomputer(
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut last_recompute: Option<Instant> = None;
         let mut next_lockup_expiry: Option<i64> = None;
-        let mut class_sentinels_seeded = !largest_accounts.is_enabled();
+        let mut class_sentinels_seeded = false;
         loop {
             interval.tick().await;
 

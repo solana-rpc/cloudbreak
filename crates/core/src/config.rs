@@ -223,56 +223,6 @@ impl EnvironmentInfo {
         })
     }
 
-    pub async fn upsert_largest_accounts_mints(
-        db: &DatabaseConnection,
-        mints: Option<Vec<Pubkey>>,
-    ) -> Result<()> {
-        let csv = mints.map(|mints| {
-            mints
-                .iter()
-                .map(|mint| mint.to_string())
-                .collect::<Vec<_>>()
-                .join(",")
-        });
-
-        db.execute(Statement::from_sql_and_values(
-            DatabaseBackend::Postgres,
-            "INSERT INTO environment_info (id, largest_accounts_mints) VALUES (1, $1) \
-             ON CONFLICT (id) DO UPDATE SET largest_accounts_mints = EXCLUDED.largest_accounts_mints",
-            [csv.into()],
-        ))
-        .await?;
-
-        Ok(())
-    }
-
-    pub async fn load_largest_accounts_mints(
-        db: &DatabaseConnection,
-    ) -> Result<Option<Vec<Pubkey>>> {
-        let row = db
-            .query_one(Statement::from_string(
-                DatabaseBackend::Postgres,
-                "SELECT largest_accounts_mints FROM environment_info WHERE id = 1".to_string(),
-            ))
-            .await?;
-
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let csv: Option<String> = row.try_get("", "largest_accounts_mints")?;
-        let Some(csv) = csv else {
-            return Ok(None);
-        };
-        let mints = csv
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(Pubkey::from_str)
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-
-        Ok(Some(mints))
-    }
-
     pub async fn upsert_grpc_version(db: &DatabaseConnection, version: &str) -> Result<()> {
         db.execute(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
@@ -458,36 +408,69 @@ pub struct IndexConfig {
     #[serde(default)]
     #[serde(rename = "accounts-owner-map-enabled")]
     pub accounts_owner_map_enabled: bool,
+    /// The indexer maintains the `getLargestAccounts` sentinel tops when this
+    /// section is present with `enabled = true`.
     #[serde(rename = "largest-accounts")]
     pub largest_accounts: Option<LargestAccountsConfig>,
+    /// The indexer maintains per-mint `getTokenLargestAccounts` tops when this
+    /// section is present with `enabled = true`.
+    #[serde(rename = "token-largest-accounts")]
+    pub token_largest_accounts: Option<TokenLargestAccountsConfig>,
 }
 
+/// `[largest-accounts]` (getLargestAccounts): enables the
+/// SOL/circulating/non-circulating sentinel tops.
 #[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct LargestAccountsConfig {
+    /// Master switch; the section is inert unless `enabled = true`.
     #[serde(default)]
     pub enabled: bool,
-    #[serde(rename = "tracked-mints", default)]
-    pub tracked_mints: Vec<PubkeyDef>,
+    /// In-memory holders kept per sentinel top; only the top 20 are persisted,
+    /// the surplus absorbs evictions.
     #[serde(
         rename = "accounts-per-mint",
-        default = "LargestAccountsConfig::default_accounts_per_mint"
+        default = "default_largest_accounts_per_mint"
     )]
     pub accounts_per_mint: usize,
     #[serde(
         rename = "prune-interval-slots",
-        default = "LargestAccountsConfig::default_prune_interval_slots"
+        default = "default_largest_prune_interval_slots"
     )]
     pub prune_interval_slots: u64,
 }
 
-impl LargestAccountsConfig {
-    const fn default_accounts_per_mint() -> usize {
-        100
-    }
+/// `[token-largest-accounts]` (getTokenLargestAccounts): enables a per-mint
+/// top for each mint in `tracked-mints`.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct TokenLargestAccountsConfig {
+    /// Master switch; the section is inert unless `enabled = true`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Mint addresses to track.
+    #[serde(rename = "tracked-mints", default)]
+    pub tracked_mints: Vec<PubkeyDef>,
+    /// In-memory holders kept per mint; only the top 20 are persisted, the
+    /// surplus absorbs evictions.
+    #[serde(
+        rename = "accounts-per-mint",
+        default = "default_largest_accounts_per_mint"
+    )]
+    pub accounts_per_mint: usize,
+    #[serde(
+        rename = "prune-interval-slots",
+        default = "default_largest_prune_interval_slots"
+    )]
+    pub prune_interval_slots: u64,
+}
 
-    const fn default_prune_interval_slots() -> u64 {
-        20
-    }
+const fn default_largest_accounts_per_mint() -> usize {
+    100
+}
+
+const fn default_largest_prune_interval_slots() -> u64 {
+    20
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -518,10 +501,22 @@ impl IndexConfig {
         1000
     }
 
-    pub fn largest_accounts_enabled(&self) -> bool {
-        self.largest_accounts
-            .as_ref()
-            .is_some_and(|largest_accounts| largest_accounts.enabled)
+    /// Smallest configured prune interval among the enabled largest-accounts
+    /// sections; `None` when neither section is enabled.
+    pub fn largest_accounts_prune_interval_slots(&self) -> Option<u64> {
+        [
+            self.largest_accounts
+                .as_ref()
+                .filter(|config| config.enabled)
+                .map(|config| config.prune_interval_slots),
+            self.token_largest_accounts
+                .as_ref()
+                .filter(|config| config.enabled)
+                .map(|config| config.prune_interval_slots),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 }
 
@@ -708,6 +703,25 @@ pub struct ApiConfig {
     pub gpa_cache: Option<GpaCacheConfig>,
     #[serde(rename = "genesis-hash", default = "ApiConfig::default_genesis_hash")]
     pub genesis_hash: String,
+    /// The API serves `getLargestAccounts` when this section is present with
+    /// `enabled = true`. Must match the indexer's `[largest-accounts]` state
+    /// (the nodes are co-deployed).
+    #[serde(rename = "largest-accounts", default)]
+    pub largest_accounts: Option<MethodSection>,
+    /// The API serves `getTokenLargestAccounts` when this section is present
+    /// with `enabled = true`. Must match the indexer's
+    /// `[token-largest-accounts]` state.
+    #[serde(rename = "token-largest-accounts", default)]
+    pub token_largest_accounts: Option<MethodSection>,
+}
+
+/// Config section for an optional API method; the method is served only when
+/// the section is present with `enabled = true`.
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct MethodSection {
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// Config for the `cache` optional module for the API.

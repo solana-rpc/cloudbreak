@@ -59,36 +59,35 @@ port = 8875
 [programs]
 include = ["Stake11111111111111111111111111111111111111"]
 
-# Maintains persisted top-N holder sets serving getLargestAccounts and
-# getTokenLargestAccounts. When enabled, the native-SOL top (getLargestAccounts)
-# and the circulating/non-circulating class tops (its `filter` param) are always
-# maintained; token tops are kept only for the mints listed in tracked-mints.
-# Requires an empty [programs] filter, the [snapshot] section, and
-# accounts-owner-map-enabled = true (the filter routes balance lookups by owner).
-[largest-accounts]
-enabled = false
-# In-memory holders kept per mint; only the top 20 are persisted and served,
-# the surplus absorbs evictions
-accounts-per-mint = 100
-# Prune stale largest_accounts rows every N finalized slots, off the
-# finalize critical path
-prune-interval-slots = 20
-# Mint addresses to track for getTokenLargestAccounts
-tracked-mints = []
-# Real example — the highest-holder mints (getLargestAccounts' SOL / circulating /
-# non-circulating tops are always maintained when enabled; these only add
-# getTokenLargestAccounts for the listed mints):
+# getLargestAccounts (GLA) and getTokenLargestAccounts (GTLA) are enabled
+# independently. Each is on only when its section is present with enabled = true,
+# and the co-deployed API config must carry the same enabled sections. Both are
+# commented out below because this example filters [programs] to Stake, which
+# neither supports. Uncomment a section and meet its prerequisites to enable.
+
+# GLA: the native-SOL top plus the circulating and non-circulating class tops
+# (the filter param). Prerequisites: [programs] unfiltered (include = []), the
+# [snapshot] section, and accounts-owner-map-enabled = true.
+# [largest-accounts]
+# enabled = true
+# accounts-per-mint = 100      # in-memory holders per top, of which the top 20 are persisted and served
+# prune-interval-slots = 20    # prune stale rows every N finalized slots, off the finalize critical path
+
+# GTLA: one persisted top per mint in tracked-mints. Prerequisites: the token
+# programs (Tokenkeg / Token-2022) indexed, meaning [programs] unfiltered or an
+# include-list containing both, and the [snapshot] section. Does not need the
+# owner map or the non-circulating tracker.
+# [token-largest-accounts]
+# enabled = true
+# accounts-per-mint = 100
+# prune-interval-slots = 20
 # tracked-mints = [
 #     "kinXdEcpDQeHPEuQnqmUgtYykqKGVFq6CeVX5iAHJq6",  # KIN
 #     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
 #     "So11111111111111111111111111111111111111112",  # wSOL
 #     "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
-#     "CKaKtYvz6dKPyMvYq9Rh3UBrnNqYZAyd7iF4hJtjUvks",
-#     "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
-#     "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
-#     "2zMMhcVQEXDtdE6vsFS7S7D5oUodfJHE8vd1gnBouauv",
 #     "6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN",  # TRUMP
-#     "7atgF8KQo4wJrD5ATGX7t1V2zVvykPJbFfNeVf1icFv1",
+#     "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
 # ]
 
 # When set, the indexer runs in consistency-check mode: it indexes until the
