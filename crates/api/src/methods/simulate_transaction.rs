@@ -921,7 +921,7 @@ fn sysvar_account_ids() -> [Pubkey; 9] {
 fn programdata_addresses(accounts: &HashMap<Pubkey, (AccountSharedData, Slot)>) -> Vec<Pubkey> {
     let loader = solana_sdk_ids::bpf_loader_upgradeable::id();
     let mut out = Vec::new();
-    for (_key, (account, _)) in accounts {
+    for (account, _) in accounts.values() {
         if account.owner() != &loader {
             continue;
         }

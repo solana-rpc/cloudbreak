@@ -15,6 +15,10 @@ WITH all_versions AS (
     WHERE
         accounts.token_mint = $1
         AND accounts.slot <= $2
+        -- Match the partial token_mint index predicate so the scan is index-driven,
+        -- not a seq scan of every partition.
+        AND (accounts.owner = '\x06ddf6e1d765a193d9cbe146ceeb79ac1cb485ed5f5b37913a8cf5857eff00a9'::bytea      -- Tokenkeg  -- noqa: LT05
+             OR accounts.owner = '\x06ddf6e1ee758fde18425dbce46ccddab61afc4d83b90d27febdf928d8a18bfc'::bytea)  -- Token-2022  -- noqa: LT05
     UNION ALL
     SELECT
         snapshot_accounts.pubkey,
@@ -27,6 +31,8 @@ WITH all_versions AS (
     WHERE
         snapshot_accounts.token_mint = $1
         AND snapshot_accounts.slot <= $2
+        AND (snapshot_accounts.owner = '\x06ddf6e1d765a193d9cbe146ceeb79ac1cb485ed5f5b37913a8cf5857eff00a9'::bytea      -- Tokenkeg  -- noqa: LT05
+             OR snapshot_accounts.owner = '\x06ddf6e1ee758fde18425dbce46ccddab61afc4d83b90d27febdf928d8a18bfc'::bytea)  -- Token-2022  -- noqa: LT05
 ),
 
 latest_per_pubkey AS (
@@ -47,8 +53,6 @@ WHERE lamports > 0
   -- amount lives at bytes 64..71; require enough bytes so the get_byte() sort below
   -- can never read past the end (real token accounts are >= 82 bytes anyway).
   AND octet_length(data) >= 72
-  AND (owner = '\x06ddf6e1d765a193d9cbe146ceeb79ac1cb485ed5f5b37913a8cf5857eff00a9'::bytea      -- Tokenkeg  -- noqa: LT05
-       OR owner = '\x06ddf6e1ee758fde18425dbce46ccddab61afc4d83b90d27febdf928d8a18bfc'::bytea)  -- Token-2022  -- noqa: LT05
 -- Sort by balance: a little-endian u64 at bytes 64..71 reconstructed as numeric.
 -- Keep it numeric, not ::bigint (signed 64-bit, overflows above 2^63).
 ORDER BY (

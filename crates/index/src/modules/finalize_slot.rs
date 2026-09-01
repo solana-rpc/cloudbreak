@@ -8,7 +8,7 @@ use sea_orm::DatabaseConnection;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 use tokio::{task::JoinSet, time::Instant};
 use yellowstone_grpc_proto::geyser::CommitmentLevel;
 
@@ -90,6 +90,8 @@ pub struct SlotFinalizer {
     config: IndexConfig,
     updated_accounts_during_startup: UpdatedAccountsDuringStartup,
     health: ServiceHealth,
+    /// Latest finalized slot, watched by the largest-accounts pruner task.
+    prune_slot_tx: watch::Sender<u64>,
     /// Max number of pending live slots before `note_finalized` blocks (back-pressure bound).
     /// Bypassed by `enqueue_unbounded` and `enqueue_gap_boundary`(gap fill).
     pub bound: usize,
@@ -102,6 +104,7 @@ impl SlotFinalizer {
         config: IndexConfig,
         updated_accounts_during_startup: UpdatedAccountsDuringStartup,
         health: ServiceHealth,
+        prune_slot_tx: watch::Sender<u64>,
     ) -> Self {
         let bound = config.finalize_slot_buffer_size;
         let finalizer = Self {
@@ -112,6 +115,7 @@ impl SlotFinalizer {
             config,
             updated_accounts_during_startup,
             health,
+            prune_slot_tx,
             bound,
         };
 
@@ -314,6 +318,7 @@ impl SlotFinalizer {
                 self.db.clone(),
                 entry.accounts,
                 self.updated_accounts_during_startup.clone(),
+                &self.prune_slot_tx,
             )
             .await;
         }
@@ -407,6 +412,7 @@ async fn finalize_slot(
     db: DatabaseConnection,
     updated_accounts: AccountsReceivedPerBlock,
     updated_accounts_during_startup: UpdatedAccountsDuringStartup,
+    prune_slot_tx: &watch::Sender<u64>,
 ) {
     let start_time = Instant::now();
 
@@ -486,6 +492,8 @@ async fn finalize_slot(
             .await;
         });
     }
+
+    let _ = prune_slot_tx.send(slot);
 
     let closed_accounts = updated_accounts.closed_accounts.clone();
     let db_clone = db.clone();

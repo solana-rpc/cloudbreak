@@ -8,6 +8,7 @@ use std::sync::OnceLock;
 use anyhow::Result as AnyhowResult;
 
 mod config;
+pub mod metrics;
 pub mod modules;
 
 pub use config::*;

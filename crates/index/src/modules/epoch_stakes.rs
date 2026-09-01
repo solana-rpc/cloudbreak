@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use cloudbreak_core::modules::non_circulating::LATEST_BY_OWNER_SQL;
+use cloudbreak_core::modules::service_health::is_healthy;
 use cloudbreak_core::{IndexConfig, STAKE_PROGRAM_ID, VOTE_PROGRAM_ID};
 use cloudbreak_snapshot::persist_epoch_stakes;
 use cloudbreak_snapshot::stake_data::{SnapshotStakeData, VoterStakeRow};
@@ -40,20 +42,6 @@ const SYSVAR_OWNER_ID: Pubkey =
     Pubkey::from_str_const("Sysvar1111111111111111111111111111111111111");
 const EPOCH_REWARDS_SYSVAR_ID: Pubkey =
     Pubkey::from_str_const("SysvarEpochRewards1111111111111111111111111");
-
-/// Latest live state per account for a given owner, across the live and snapshot tables.
-const LATEST_BY_OWNER_SQL: &str = r#"
-WITH latest AS (
-    SELECT DISTINCT ON (pubkey) pubkey, data, lamports
-    FROM (
-        SELECT pubkey, slot, data, lamports FROM accounts WHERE owner = $1
-        UNION ALL
-        SELECT pubkey, slot, data, lamports FROM snapshot_accounts WHERE owner = $1
-    ) AS u
-    ORDER BY pubkey, slot DESC
-)
-SELECT pubkey, data FROM latest WHERE lamports > 0
-"#;
 
 /// Recomputes `epoch_stakes` from the indexed Stake accounts so `getVoteAccounts` reflects
 /// the current epoch's effective stake
@@ -173,19 +161,7 @@ pub fn spawn_epoch_stakes_recomputer(
     })
 }
 
-async fn is_healthy(db: &DatabaseConnection) -> bool {
-    db.query_one(Statement::from_string(
-        DatabaseBackend::Postgres,
-        "SELECT healthy FROM service_health WHERE id = 1".to_string(),
-    ))
-    .await
-    .ok()
-    .flatten()
-    .and_then(|row| row.try_get::<bool>("", "healthy").ok())
-    .unwrap_or(false)
-}
-
-async fn finalized_slot(db: &DatabaseConnection) -> Option<u64> {
+pub(crate) async fn finalized_slot(db: &DatabaseConnection) -> Option<u64> {
     db.query_one(Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
         "SELECT slot FROM slots WHERE commitment = $1",

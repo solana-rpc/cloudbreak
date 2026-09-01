@@ -211,6 +211,12 @@ impl AccountOwnerMap {
                 })
     }
 
+    pub fn get_owner(&self, pubkey: &Pubkey) -> Option<Pubkey> {
+        let accounts = self.accounts.as_ref()?;
+        let guard = accounts.read().expect("Failed to read accounts");
+        guard.get(pubkey).map(|item| item.owner)
+    }
+
     /// Checks if (in case this was a tracked account) the owner has changed since the last time
     ///  it was seen
     pub fn check_updated_account_owner(&self, pubkey: Pubkey, owner: Pubkey, slot: u64) -> bool {

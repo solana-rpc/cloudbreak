@@ -5,7 +5,11 @@
 
 use cloudbreak_core::{
     EnvironmentInfo, IndexConfig, Result as CloudbreakResult, TryLoadConfig,
-    modules::account_owner_map::AccountOwnerMap,
+    modules::{
+        account_owner_map::AccountOwnerMap,
+        largest_accounts::{self, LargestAccountsTracker},
+        non_circulating::{self, NonCirculatingTracker},
+    },
 };
 use sea_orm::{ConnectOptions, Database, DatabaseConnection};
 use std::{
@@ -49,6 +53,8 @@ pub struct IndexerState {
     pub finalize_slot_buffer_size: Arc<Mutex<usize>>,
     /// Used to track the accounts owner
     pub accounts_owner_map: AccountOwnerMap,
+    pub largest_accounts: LargestAccountsTracker,
+    pub non_circulating: NonCirculatingTracker,
 }
 
 pub async fn run(config: &str) -> CloudbreakResult<()> {
@@ -90,6 +96,19 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
         AccountOwnerMap::default()
     };
 
+    // Validates prerequisites, records tracked mints in environment_info, and clears
+    // stale largest_accounts rows. Disabled tracker when the feature is off.
+    let largest_accounts = LargestAccountsTracker::from_config(&db, &config).await;
+
+    // The non-circulating tracker powers the getLargestAccounts circulating/non-circulating
+    // filter. It is enabled with largest-accounts (which already requires a full index, the
+    // snapshot section, and the owner map).
+    let non_circulating = if largest_accounts.is_enabled() {
+        NonCirculatingTracker::new()
+    } else {
+        NonCirculatingTracker::default()
+    };
+
     // Service health is tracked as a set of reasons (Startup is set until the startup snapshot is
     // processed; GapFill is set while a gap fill is in progress).
     let health = ServiceHealth::new(db.clone());
@@ -97,11 +116,17 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
     let updated_accounts_during_startup =
         UpdatedAccountsDuringStartup::new(snapshot_processing_state.clone(), health.clone());
 
+    let (prune_slot_tx, prune_slot_rx) = tokio::sync::watch::channel(0u64);
+    if config.largest_accounts_enabled() {
+        largest_accounts::spawn_largest_accounts_pruner(db.clone(), config.clone(), prune_slot_rx);
+    }
+
     let slot_finalizer = SlotFinalizer::spawn(
         db.clone(),
         config.clone(),
         updated_accounts_during_startup.clone(),
         health.clone(),
+        prune_slot_tx,
     );
 
     let indexer_state = IndexerState {
@@ -112,6 +137,8 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
         updated_accounts_during_startup,
         finalize_slot_buffer_size: finalize_slot_buffer_size.clone(),
         accounts_owner_map,
+        largest_accounts,
+        non_circulating,
     };
 
     // Used for the hash-checker to signal the main loop to stop
@@ -150,6 +177,14 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
 
     let _epoch_stakes_handle =
         modules::epoch_stakes::spawn_epoch_stakes_recomputer(db.clone(), config.clone());
+
+    let _non_circulating_handle = non_circulating::spawn_non_circulating_recomputer(
+        db.clone(),
+        config.clone(),
+        indexer_state.non_circulating.clone(),
+        indexer_state.accounts_owner_map.clone(),
+        indexer_state.largest_accounts.clone(),
+    );
 
     operational_endpoints::self_healing::SELF_HEALING
         .set(indexer_state.self_healing_state.clone())

@@ -37,6 +37,8 @@ pub async fn save_block(
         buffer_channel_rx_len: _,
         finalize_slot_buffer_size,
         accounts_owner_map,
+        largest_accounts,
+        non_circulating,
     } = indexer_state;
 
     let start_time = Instant::now();
@@ -51,6 +53,7 @@ pub async fn save_block(
         &updated_accounts_during_startup,
         finalize_slot_buffer_size.clone(),
         accounts_owner_map.clone(),
+        largest_accounts.clone(),
     )
     .await;
 
@@ -77,19 +80,25 @@ pub async fn save_block(
         .map(|pubkey| pubkey.0.to_bytes().to_vec())
         .collect::<Vec<_>>();
 
+    // Fold the block's accounts into the largest-accounts tracker before the main loop
+    // consumes `block.accounts`. Returns empty when the feature is disabled.
+    let largest_pending = largest_accounts.build_block_pending(&block.accounts, &non_circulating);
+
     // Create the chunks for updating the "accounts" table
     let system_program_id = [0u8; 32].to_vec();
     for account in block.accounts {
+        let pubkey = Pubkey::try_from(account.pubkey.as_slice()).unwrap();
+
         // If the account is being closed we still add it to the hashmap for cleanup
         //  but we don't add it to the "accounts" table in a normal fashion, instead we added using [`db_queries::insert_closed_accounts`]
         if account.lamports == 0 {
-            closed_accounts_for_slot.push(account.pubkey.clone());
+            closed_accounts_for_slot.push(account.pubkey);
 
             if !account.data.is_empty() || account.owner != system_program_id {
                 tracing::warn!(
                     target: "save_block_closed_account",
                     "Account is being closed with data or owner not being the system program id. Pubkey: {}, owner: {}, data LEN: {}, lamports: {}",
-                    Pubkey::try_from(account.pubkey.as_slice()).unwrap(),
+                    pubkey,
                     Pubkey::try_from(account.owner.as_slice()).unwrap(),
                     account.data.len(),
                     account.lamports
@@ -131,7 +140,7 @@ pub async fn save_block(
         updated_accounts_for_slot.push(account.pubkey.clone());
 
         current_chunk.push(accounts::ActiveModel {
-            pubkey: Set(account.pubkey.clone()),
+            pubkey: Set(account.pubkey),
             owner: Set(account.owner),
             lamports: Set(account.lamports as i64),
             slot: Set(slot as i64),
@@ -226,6 +235,10 @@ pub async fn save_block(
     {
         tracing::error!(target: "save_block_closed_accounts_insert", "failed to insert closed accounts: {:?}", e);
     }
+
+    largest_accounts
+        .commit_block(slot, largest_pending, db, &config)
+        .await;
 
     // Wait until the chunk processing is finished to insert the slot (this ensures that gPA calls can only read from completed slots)
     db_queries::insert_slot(

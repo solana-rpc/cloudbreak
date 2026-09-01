@@ -16,6 +16,7 @@ use tracing::Instrument;
 
 use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
+use crate::methods::get_largest_accounts::fetch_largest_record;
 use crate::methods::token::parse_additional_mint_data;
 use crate::methods::{is_token_program, resolve_commitment};
 use crate::{db_query, metrics};
@@ -81,8 +82,8 @@ pub async fn get_token_largest_accounts(
         });
     }
     if !is_token_program(&owner) {
-        return Err(RpcError::NotATokenAccount {
-            pubkey: pubkey.to_string(),
+        return Err(RpcError::NotATokenMint {
+            mint: pubkey.to_string(),
         });
     }
     let data: Vec<u8> = mint_row.get("data");
@@ -93,6 +94,29 @@ pub async fn get_token_largest_accounts(
         .ok_or_else(|| RpcError::MintDataNotFound {
             mint: pubkey.to_string(),
         })?;
+
+    let tracked = state
+        .largest_accounts_mints
+        .as_ref()
+        .is_some_and(|mints| mints.contains(&pubkey));
+    if tracked {
+        let rows = fetch_largest_record(state, &pubkey, latest_slot).await?;
+        if !rows.is_empty() {
+            return Ok(RpcResponse {
+                context: RpcResponseContext {
+                    slot: latest_slot,
+                    api_version: None,
+                },
+                value: rows
+                    .into_iter()
+                    .map(|(address, amount)| RpcTokenAccountBalance {
+                        address: address.to_string(),
+                        amount: token_amount_to_ui_amount_v3(amount, additional_data),
+                    })
+                    .collect(),
+            });
+        }
+    }
 
     let sql_template = include_str!("../db/getTokenLargestAccounts.sql");
     let sql = sql_template.replace("$1", &mint_hex);

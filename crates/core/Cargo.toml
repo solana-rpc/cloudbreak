@@ -30,11 +30,16 @@ cloudbreak-entity = { workspace = true }
 yellowstone-grpc-proto = { workspace = true }
 solana-pubkey = { workspace = true }
 solana-program = { workspace = true }
+solana-stake-interface = { workspace = true, features = ["serde"] }
 solana-rpc-client-api = { workspace = true }
 rust_decimal = { workspace = true }
 tracing-subscriber = { workspace = true }
 blake3 = { workspace = true }
 hex = { workspace = true }
+futures = { workspace = true }
+bincode = { workspace = true }
+prometheus = { workspace = true }
+lazy_static = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

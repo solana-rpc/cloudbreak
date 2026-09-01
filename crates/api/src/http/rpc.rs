@@ -10,7 +10,9 @@ use hyper::body::Incoming;
 use hyper::{Request, StatusCode};
 use serde::Serialize;
 use solana_commitment_config::CommitmentConfig;
-use solana_rpc_client_api::config::{RpcAccountInfoConfig, RpcContextConfig, RpcSimulateTransactionConfig};
+use solana_rpc_client_api::config::{
+    RpcAccountInfoConfig, RpcContextConfig, RpcSimulateTransactionConfig,
+};
 use std::convert::Infallible;
 use std::sync::Arc;
 use tokio::time::Instant;
@@ -20,7 +22,7 @@ use crate::http::CloudbreakRpcState;
 use crate::http::server::{HttpHandlerResponse, ResponseBody};
 use crate::http::streaming::gpa_streaming_response_body;
 use crate::http::{
-    JsonRpcRequest, JsonRpcResponse, RequestContext, RpcRequestPayload, extract_param,
+    JsonRpcRequest, JsonRpcResponse, RequestContext, RpcRequestPayload, extract_optional_param, extract_param,
     http_status_for_error, make_error_response, make_error_response_with_status,
 };
 use crate::methods::slot::RpcGetSlotConfig;
@@ -467,6 +469,43 @@ async fn process_single_request(
             metrics::CLOUDBREAK_API_REQUEST_DURATION_MS
                 .with_label_values(&[
                     "getTokenSupply",
+                    metrics::bytes_bucket(json_response.0.len() as u64),
+                ])
+                .observe(start_time.elapsed().as_millis() as f64);
+
+            json_response
+        }
+        "getLargestAccounts" => {
+            let start_time = Instant::now();
+
+            let config: Option<solana_rpc_client_api::config::RpcLargestAccountsConfig> =
+                match extract_optional_param(&rpc_request.params, 0) {
+                    Ok(config) => config,
+                    Err(e) => return make_error_response(id, -32602, e),
+                };
+
+            let result = methods::get_largest_accounts::get_largest_accounts(state, config).await;
+
+            let status_label = match &result {
+                Ok(_) => "success",
+                Err(e) => {
+                    tracing::error!(
+                        target: "api_request_errors_count",
+                        "getLargestAccounts error: {:?}",
+                        e
+                    );
+                    "error"
+                }
+            };
+            metrics::CLOUDBREAK_API_REQUESTS_TOTAL
+                .with_label_values(&["getLargestAccounts", status_label])
+                .inc();
+
+            let json_response = json_serialize_response(id, result, ctx).await;
+
+            metrics::CLOUDBREAK_API_REQUEST_DURATION_MS
+                .with_label_values(&[
+                    "getLargestAccounts",
                     metrics::bytes_bucket(json_response.0.len() as u64),
                 ])
                 .observe(start_time.elapsed().as_millis() as f64);

@@ -16,7 +16,9 @@ use hyper::StatusCode;
 use sea_orm::{DatabaseConnection, EntityTrait};
 use serde::{Deserialize, Serialize};
 use solana_commitment_config::CommitmentLevel;
+use solana_pubkey::Pubkey;
 use solana_rpc_client_api::response::Response as RpcResponse;
+use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tracing::Instrument;
@@ -109,6 +111,8 @@ pub struct CloudbreakRpcState {
     pub max_multiple_accounts: usize,
     pub simulation_supported: bool,
     pub feature_set_cache: Arc<RwLock<Option<CachedFeatureSet>>>,
+    /// Will be `Some` if the node supports the `getLargestAccounts` RPC method.
+    pub largest_accounts_mints: Option<Arc<HashSet<Pubkey>>>,
 }
 
 impl CloudbreakRpcState {
@@ -130,6 +134,7 @@ impl CloudbreakRpcState {
         stakes_cache: SharedStakesSnapshot,
         max_multiple_accounts: usize,
         simulation_supported: bool,
+        largest_accounts_mints: Option<Arc<HashSet<Pubkey>>>,
     ) -> Self {
         Self {
             database,
@@ -149,6 +154,7 @@ impl CloudbreakRpcState {
             max_multiple_accounts,
             simulation_supported,
             feature_set_cache: Arc::new(RwLock::new(None)),
+            largest_accounts_mints,
         }
     }
 
@@ -283,6 +289,22 @@ fn extract_param<T: serde::de::DeserializeOwned>(
                 serde_json::from_value(v.clone()).map_err(|e| format!("Invalid parameter: {}", e))
             }),
         serde_json::Value::Null => Err(format!("Missing parameter at index {}", index)),
+        _ => Err("Parameters must be an array".to_string()),
+    }
+}
+
+fn extract_optional_param<T: serde::de::DeserializeOwned>(
+    params: &serde_json::Value,
+    index: usize,
+) -> Result<Option<T>, String> {
+    match params {
+        serde_json::Value::Array(arr) => match arr.get(index) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(v) => serde_json::from_value(v.clone())
+                .map(Some)
+                .map_err(|e| format!("Invalid parameter: {}", e)),
+        },
+        serde_json::Value::Null => Ok(None),
         _ => Err("Parameters must be an array".to_string()),
     }
 }

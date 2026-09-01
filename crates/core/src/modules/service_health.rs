@@ -18,7 +18,8 @@ use std::time::Duration;
 use cloudbreak_entity::{service_health, slots};
 use sea_orm::{
     ActiveValue::{NotSet, Set},
-    DatabaseConnection, DbErr, EntityTrait, TransactionTrait,
+    ConnectionTrait, DatabaseBackend, DatabaseConnection, DbErr, EntityTrait, Statement,
+    TransactionTrait,
     prelude::Expr,
     sea_query::OnConflict,
 };
@@ -67,4 +68,18 @@ pub async fn update_service_health(db: &DatabaseConnection, healthy: bool) -> Re
         tracing::error!(target: "service_health", "update_service_health timed out: {elapsed}");
         Err(DbErr::RecordNotInserted)
     })
+}
+
+/// Reads the node's health flag from the `service_health` row (id = 1). Returns
+/// `false` when the row is missing or the query fails.
+pub async fn is_healthy(db: &DatabaseConnection) -> bool {
+    db.query_one(Statement::from_string(
+        DatabaseBackend::Postgres,
+        "SELECT healthy FROM service_health WHERE id = 1".to_string(),
+    ))
+    .await
+    .ok()
+    .flatten()
+    .and_then(|row| row.try_get::<bool>("", "healthy").ok())
+    .unwrap_or(false)
 }
