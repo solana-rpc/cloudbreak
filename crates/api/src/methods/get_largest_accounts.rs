@@ -64,7 +64,7 @@ pub async fn get_largest_accounts(
 
     let Some(rows) = fetch_largest_record(state, &sentinel, latest_slot).await? else {
         tracing::warn!("getLargestAccounts has no record at slot {}", latest_slot);
-        return Err(RpcError::LargestAccountsNotReady);
+        return Err(state.node_unhealthy());
     };
 
     Ok(RpcResponse {

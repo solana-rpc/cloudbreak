@@ -98,8 +98,8 @@ pub async fn get_token_largest_accounts(
     // Record presence is the tracked-mints signal: the indexer persists a record
     // for exactly the mints it tracks, so an absent record means "not tracked".
     let Some(rows) = fetch_largest_record(state, &pubkey, latest_slot).await? else {
-        return Err(RpcError::MintNotTracked {
-            mint: pubkey.to_string(),
+        return Err(RpcError::KeyExcludedFromSecondaryIndex {
+            key: pubkey.to_string(),
         });
     };
 

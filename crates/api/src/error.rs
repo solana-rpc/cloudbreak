@@ -57,14 +57,6 @@ pub enum RpcError {
     /// The requested RPC method is not enabled in this node's API config.
     #[error("Method not found")]
     MethodNotFound,
-    /// `getTokenLargestAccounts` for a mint with no persisted record: the
-    /// indexer does not track it.
-    #[error("Invalid param: mint {mint} is not tracked by this node")]
-    MintNotTracked { mint: String },
-    /// The feature is enabled but no record has been persisted yet (indexer
-    /// still bootstrapping); retriable.
-    #[error("Largest accounts record is not available yet; retry later")]
-    LargestAccountsNotReady,
 }
 
 impl RpcError {
@@ -107,8 +99,6 @@ impl RpcError {
             RpcError::NotATokenMint { .. } => "Invalid param: not a Token mint",
             RpcError::MintDataNotFound { .. } => "Invalid param: could not find mint",
             RpcError::MethodNotFound => "METHOD_NOT_FOUND",
-            RpcError::MintNotTracked { .. } => "MINT_NOT_TRACKED",
-            RpcError::LargestAccountsNotReady => "LARGEST_ACCOUNTS_NOT_READY",
         }
     }
 
@@ -132,8 +122,6 @@ impl RpcError {
             RpcError::NotATokenMint { .. } => -32602,
             RpcError::MintDataNotFound { .. } => -32602,
             RpcError::MethodNotFound => -32601,
-            RpcError::MintNotTracked { .. } => -32602,
-            RpcError::LargestAccountsNotReady => -32017,
         }
     }
 }
