@@ -7,7 +7,7 @@
 //! that own their logic (in `core`) can record them directly. The index crate
 //! registers them with its Prometheus registry via `register_collectors`.
 
-use prometheus::{Counter, IntGauge, IntGaugeVec, Opts};
+use prometheus::{Counter, IntCounter, IntGauge, IntGaugeVec, Opts};
 
 lazy_static::lazy_static! {
     /// Current number of live Tokio tasks, labelled by task type.
@@ -26,6 +26,11 @@ lazy_static::lazy_static! {
         "cloudbreak_largest_accounts_stale_mints", "Number of tracked mints marked stale in the largest accounts tracker"
     )
     .expect("Failed to create largest accounts stale mints gauge");
+
+    pub static ref SUPPLY_QUERY_ERRORS: IntCounter = IntCounter::new(
+        "cloudbreak_supply_query_errors", "Supply persistence queries that failed or timed out"
+    )
+    .expect("Failed to create supply query errors counter");
 }
 
 /// We use a guard to increment the current tokio tasks metric when a task is created and

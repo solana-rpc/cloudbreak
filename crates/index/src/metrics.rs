@@ -8,7 +8,7 @@ use std::sync::{Once, OnceLock};
 use cloudbreak_core::IndexConfig;
 pub use cloudbreak_core::metrics::{
     CURRENT_TOKIO_TASKS, LARGEST_ACCOUNTS_DB_ERRORS, LARGEST_ACCOUNTS_STALE_MINTS,
-    TokioTaskCounterGuard,
+    SUPPLY_QUERY_ERRORS, TokioTaskCounterGuard,
 };
 use prometheus::{Counter, Histogram, HistogramOpts, HistogramVec, IntGauge, Registry};
 use tracing::error;
@@ -274,6 +274,21 @@ lazy_static::lazy_static! {
         "cloudbreak_finalize_slot_handler_queue_size", "Size of the finalize slot handler queue"
     )
     .expect("Failed to create finalize slot handler queue size gauge");
+
+    pub static ref SUPPLY_TOTAL_LAMPORTS: IntGauge = IntGauge::new(
+        "cloudbreak_supply_total_lamports", "Running total supply in lamports"
+    )
+    .expect("Failed to create supply total lamports gauge");
+
+    pub static ref SUPPLY_SLOT: IntGauge = IntGauge::new(
+        "cloudbreak_supply_slot", "Slot of the last committed supply total"
+    )
+    .expect("Failed to create supply slot gauge");
+
+    pub static ref SUPPLY_STALE: IntGauge = IntGauge::new(
+        "cloudbreak_supply_stale", "Whether the supply tracker is stale (1) or fresh (0)"
+    )
+    .expect("Failed to create supply stale gauge");
 }
 
 pub fn record_block_processing(elapsed: f64, origin: &str) {
@@ -384,5 +399,9 @@ pub fn register_collectors() {
         register!(FINALIZE_SLOT_DELETED_ACCOUNTS);
         register!(LARGEST_ACCOUNTS_DB_ERRORS);
         register!(LARGEST_ACCOUNTS_STALE_MINTS);
+        register!(SUPPLY_TOTAL_LAMPORTS);
+        register!(SUPPLY_SLOT);
+        register!(SUPPLY_STALE);
+        register!(SUPPLY_QUERY_ERRORS);
     });
 }

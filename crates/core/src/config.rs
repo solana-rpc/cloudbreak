@@ -458,6 +458,9 @@ pub struct IndexConfig {
     #[serde(default)]
     #[serde(rename = "accounts-owner-map-enabled")]
     pub accounts_owner_map_enabled: bool,
+    #[serde(default)]
+    #[serde(rename = "supply-tracker-enabled")]
+    pub supply_tracker_enabled: bool,
     #[serde(rename = "largest-accounts")]
     pub largest_accounts: Option<LargestAccountsConfig>,
 }
@@ -708,6 +711,10 @@ pub struct ApiConfig {
     pub gpa_cache: Option<GpaCacheConfig>,
     #[serde(rename = "genesis-hash", default = "ApiConfig::default_genesis_hash")]
     pub genesis_hash: String,
+    /// Serves getSupply from the supply ring. Set it together with the
+    /// indexer's `supply-tracker-enabled`.
+    #[serde(rename = "supply-enabled", default)]
+    pub supply_enabled: bool,
 }
 
 /// Config for the `cache` optional module for the API.

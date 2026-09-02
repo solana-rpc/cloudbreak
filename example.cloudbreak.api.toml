@@ -78,6 +78,11 @@ span-filter = [
 #    with per-item JSON-RPC errors.)
 # unhealthy-response = "json-rpc-error"
 
+# Serves getSupply from the supply ring the indexer maintains. Set it together
+# with supply-tracker-enabled in the indexer config; a disabled node answers
+# getSupply with method-not-found.
+# supply-enabled = false
+
 [slot-syncronizer]
 enabled = false
 interval_ms = 200

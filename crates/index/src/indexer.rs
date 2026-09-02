@@ -9,6 +9,7 @@ use cloudbreak_core::{
         account_owner_map::AccountOwnerMap,
         largest_accounts::{self, LargestAccountsTracker},
         non_circulating::{self, NonCirculatingTracker},
+        supply_tracker::SupplyTracker,
     },
 };
 use sea_orm::{ConnectOptions, Database, DatabaseConnection};
@@ -55,6 +56,7 @@ pub struct IndexerState {
     pub accounts_owner_map: AccountOwnerMap,
     pub largest_accounts: LargestAccountsTracker,
     pub non_circulating: NonCirculatingTracker,
+    pub supply_tracker: SupplyTracker,
 }
 
 pub async fn run(config: &str) -> CloudbreakResult<()> {
@@ -100,10 +102,28 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
     // stale largest_accounts rows. Disabled tracker when the feature is off.
     let largest_accounts = LargestAccountsTracker::from_config(&db, &config).await;
 
+    // The supply tracker keeps the running total-supply figure for getSupply. It
+    // needs a full index, the owner map, and the snapshot capitalization anchor.
+    let supply_tracker = if config.supply_tracker_enabled {
+        if !config.programs.supports_simulation() {
+            panic!("supply-tracker-enabled requires an empty [programs] filter");
+        }
+        if !config.accounts_owner_map_enabled {
+            panic!("supply-tracker-enabled requires accounts-owner-map-enabled");
+        }
+        if config.snapshot.is_none() {
+            panic!("supply-tracker-enabled requires the [snapshot] section");
+        }
+        SupplyTracker::new()
+    } else {
+        SupplyTracker::default()
+    };
+
     // The non-circulating tracker powers the getLargestAccounts circulating/non-circulating
     // filter. It is enabled with largest-accounts (which already requires a full index, the
-    // snapshot section, and the owner map).
-    let non_circulating = if largest_accounts.is_enabled() {
+    // snapshot section, and the owner map). The supply tracker also needs the
+    // recomputer's membership set, so it enables the tracker too.
+    let non_circulating = if largest_accounts.is_enabled() || supply_tracker.is_enabled() {
         NonCirculatingTracker::new()
     } else {
         NonCirculatingTracker::default()
@@ -132,13 +152,18 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
     let indexer_state = IndexerState {
         buffer_channel_rx_len: Arc::new(Mutex::new(buffer_channel_rx.len())),
         snapshot_processing_state: snapshot_processing_state.clone(),
-        self_healing_state: SelfHealingState::new(&config, slot_finalizer.clone()),
+        self_healing_state: SelfHealingState::new(
+            &config,
+            slot_finalizer.clone(),
+            supply_tracker.clone(),
+        ),
         slot_finalizer,
         updated_accounts_during_startup,
         finalize_slot_buffer_size: finalize_slot_buffer_size.clone(),
         accounts_owner_map,
         largest_accounts,
         non_circulating,
+        supply_tracker,
     };
 
     // Used for the hash-checker to signal the main loop to stop
@@ -184,6 +209,7 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
         indexer_state.non_circulating.clone(),
         indexer_state.accounts_owner_map.clone(),
         indexer_state.largest_accounts.clone(),
+        indexer_state.supply_tracker.clone(),
     );
 
     operational_endpoints::self_healing::SELF_HEALING

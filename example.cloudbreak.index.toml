@@ -1,6 +1,10 @@
 # The buffer size for queuing finalize slot events
 finalize-slot-buffer-size = 1000
 accounts-owner-map-enabled = false
+# Maintains the running total-supply figure served by getSupply. Requires an
+# empty [programs] filter, accounts-owner-map-enabled = true, and [snapshot].
+# Set it together with supply-enabled in the API config.
+supply-tracker-enabled = false
 
 [snapshot]
 accounts-file-concurency = 32
