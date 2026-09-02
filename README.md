@@ -713,6 +713,8 @@ The recomputer detects drift by comparing the total activated stake across runs.
 
 The transaction is executed read-only against the indexed account state at the requested slot; nothing is committed. Cloudbreak reconstructs the cluster's actually-activated feature set at that slot from the on-chain feature accounts (rather than enabling all features), so compute-unit accounting and execution behaviour match mainnet. `replaceRecentBlockhash` substitutes the latest recorded blockhash before execution and reports it with its `lastValidBlockHeight`; `sigVerify` verifies signatures; `accounts` returns post-simulation state for the requested addresses; `innerInstructions` includes decoded inner instructions.
 
+Cloudbreak accepts legacy, v0, and v1 transactions. A v1 transaction can be larger than the legacy 1232-byte packet, so the decoder applies the version's own size bound and rejects anything larger with an invalid-params error.
+
 ### Largest Accounts (`getLargestAccounts`, `getTokenLargestAccounts`)
 
 These methods are served from **maintained top-N holder sets** rather than live table scans, so they stay cheap at any index size and work even where upstream RPC nodes disable them. Enable the `[largest-accounts]` section on the indexer to activate the feature.

@@ -293,7 +293,10 @@ pub async fn process_update(
         }
         Some(UpdateOneof::Slot(slot_update)) => {
             let slot = slot_update.slot;
-            let commitment = SlotStatus::try_from(slot_update.status).expect("Invalid slot status");
+            let Ok(commitment) = SlotStatus::try_from(slot_update.status) else {
+                tracing::error!("Unknown slot status {} for slot {}", slot_update.status, slot);
+                return;
+            };
 
             match commitment {
                 SlotStatus::SlotProcessed | SlotStatus::SlotConfirmed => (),

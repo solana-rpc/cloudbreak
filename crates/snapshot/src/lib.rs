@@ -322,6 +322,7 @@ async fn process_downloaded_snapshot(
                         }),
                         slot: account_file_slot,
                         is_startup: true,
+                        bank_id: None,
                     };
 
                     current_accounts_chunk.push(account_update);
