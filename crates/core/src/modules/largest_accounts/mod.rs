@@ -1,14 +1,47 @@
-//! Top-N largest-accounts tracking backing getLargestAccounts and
-//! getTokenLargestAccounts.
+//! Top-N largest-accounts tracking backing getLargestAccounts (GLA) and
+//! getTokenLargestAccounts (GTLA).
 //!
-//! The indexer maintains a top-N holder set per tracked mint (the
-//! token-largest-accounts config section) and three sentinel "mints" for
-//! native-SOL, circulating, and non-circulating (the largest-accounts
-//! section). When a top-N changes, the persisted slice is written as one
-//! packed bytea record per (mint, slot) row in the largest_accounts table.
-//! The API reads the newest record at or below the commitment slot.
+//! The indexer maintains an in-memory top-N holder set per tracked mint (the
+//! `[token-largest-accounts]` section) and three sentinel "mints" for
+//! native-SOL, circulating, and non-circulating (the `[largest-accounts]`
+//! section). When a top-N changes, its top 20 rows are written as one packed
+//! bytea record per `(mint, slot)` row in the `largest_accounts` table. The API
+//! serves the newest record at or below the request's commitment slot.
 //!
-//! See README.md in this directory for the module layout and runtime model.
+//! # Layout
+//!
+//! - `mod.rs`: public surface, the sentinel mint constants, [`PERSISTED_TOP_N`],
+//!   token program ids, [`MintRecord`], and the packed bytea codec.
+//! - `tracker.rs`: in-memory state (per-mint tops with the eviction reservoir
+//!   and the `dropped_floor`/stale soundness bookkeeping), the snapshot seed
+//!   path, `apply_block`, and the class-sentinel reseed.
+//! - `persist.rs`: write path (record upserts, stale and cleared-mint deletes,
+//!   `from_config`, outcome persistence).
+//! - `read.rs`: read path shared with the API ([`fetch_record`]).
+//! - `prune.rs`: finalize-time pruner for redundant record generations, off the
+//!   finalization critical path.
+//!
+//! # Runtime model
+//!
+//! Both features ship in every binary and are gated at runtime by config. Two
+//! independent sections enable two independent domains in one tracker, each on
+//! only when its section is present with `enabled = true`.
+//!
+//! - `[largest-accounts]` (GLA) enables the three sentinel tops. It requires an
+//!   empty `[programs]` filter and the `[snapshot]` section.
+//! - `[token-largest-accounts]` (GTLA) enables one top per mint in
+//!   `tracked-mints`. It requires the token programs (Tokenkeg / Token-2022)
+//!   indexed, meaning an unfiltered `[programs]` or an include-list with both,
+//!   plus the `[snapshot]` section. It does not need the non-circulating tracker
+//!   or the GLA sentinels.
+//!
+//! The tracker is seeded from the startup snapshot pass and goes live when
+//! snapshot processing finishes. When neither section is enabled the handle is a
+//! no-op ([`LargestAccountsTracker::default()`]), so the indexer hooks cost
+//! nothing. The API enables each method from the same two sections in its own
+//! config and routes GTLA on record presence: a persisted record means the mint
+//! is tracked, and no record returns a fast error with no fallback table scan.
+//! There is no shared enablement state in the database.
 
 mod persist;
 mod prune;

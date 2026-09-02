@@ -20,7 +20,9 @@ use solana_rpc_client_api::response::Response as RpcResponse;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tracing::Instrument;
-use cloudbreak_core::{AccountSelectorConfig, ProcessedCommitmentBehavior, UnhealthyResponseBehavior};
+use cloudbreak_core::{
+    AccountSelectorConfig, MethodSection, ProcessedCommitmentBehavior, UnhealthyResponseBehavior,
+};
 use cloudbreak_entity::slots;
 
 #[derive(Clone)]
@@ -109,10 +111,12 @@ pub struct CloudbreakRpcState {
     pub max_multiple_accounts: usize,
     pub simulation_supported: bool,
     pub feature_set_cache: Arc<RwLock<Option<CachedFeatureSet>>>,
-    /// True when the API config has `[largest-accounts]` with `enabled = true`.
-    pub largest_accounts_enabled: bool,
-    /// True when the API config has `[token-largest-accounts]` with `enabled = true`.
-    pub token_largest_accounts_enabled: bool,
+    /// The `[largest-accounts]` API section; getLargestAccounts is served when
+    /// its `enabled` flag is set.
+    pub largest_accounts: MethodSection,
+    /// The `[token-largest-accounts]` API section; getTokenLargestAccounts is
+    /// served when its `enabled` flag is set.
+    pub token_largest_accounts: MethodSection,
 }
 
 impl CloudbreakRpcState {
@@ -134,8 +138,8 @@ impl CloudbreakRpcState {
         stakes_cache: SharedStakesSnapshot,
         max_multiple_accounts: usize,
         simulation_supported: bool,
-        largest_accounts_enabled: bool,
-        token_largest_accounts_enabled: bool,
+        largest_accounts: MethodSection,
+        token_largest_accounts: MethodSection,
     ) -> Self {
         Self {
             database,
@@ -155,8 +159,8 @@ impl CloudbreakRpcState {
             max_multiple_accounts,
             simulation_supported,
             feature_set_cache: Arc::new(RwLock::new(None)),
-            largest_accounts_enabled,
-            token_largest_accounts_enabled,
+            largest_accounts,
+            token_largest_accounts,
         }
     }
 

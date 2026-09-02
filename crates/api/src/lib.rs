@@ -94,18 +94,15 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
     let simulation_supported = indexer_filter.supports_simulation();
     info!("simulateTransaction: supported: {}", simulation_supported);
 
-    let largest_accounts_enabled = config
-        .largest_accounts
-        .as_ref()
-        .is_some_and(|section| section.enabled);
-    let token_largest_accounts_enabled = config
-        .token_largest_accounts
-        .as_ref()
-        .is_some_and(|section| section.enabled);
-    info!("getLargestAccounts: supported: {}", largest_accounts_enabled);
+    let largest_accounts = config.largest_accounts.clone().unwrap_or_default();
+    let token_largest_accounts = config.token_largest_accounts.clone().unwrap_or_default();
+    info!(
+        "getLargestAccounts: supported: {}",
+        largest_accounts.enabled
+    );
     info!(
         "getTokenLargestAccounts: supported: {}",
-        token_largest_accounts_enabled
+        token_largest_accounts.enabled
     );
 
     let vote_accounts_supported = indexer_filter.supports_vote_accounts();
@@ -158,8 +155,8 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
         stakes_cache,
         max_multiple_accounts,
         simulation_supported,
-        largest_accounts_enabled,
-        token_largest_accounts_enabled,
+        largest_accounts,
+        token_largest_accounts,
     );
 
     info!("Server is starting...");

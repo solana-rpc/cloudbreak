@@ -477,7 +477,7 @@ async fn process_single_request(
         }
         "getLargestAccounts" => {
             // Disabled method: clean JSON-RPC "Method not found".
-            if !state.largest_accounts_enabled {
+            if !state.largest_accounts.enabled {
                 let err = RpcError::MethodNotFound;
                 return make_error_response(id, err.to_numeric_code(), err.to_string());
             }
@@ -520,7 +520,7 @@ async fn process_single_request(
         }
         "getTokenLargestAccounts" => {
             // Disabled method: clean JSON-RPC "Method not found".
-            if !state.token_largest_accounts_enabled {
+            if !state.token_largest_accounts.enabled {
                 let err = RpcError::MethodNotFound;
                 return make_error_response(id, err.to_numeric_code(), err.to_string());
             }

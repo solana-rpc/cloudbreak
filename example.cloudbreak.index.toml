@@ -66,8 +66,8 @@ include = ["Stake11111111111111111111111111111111111111"]
 # neither supports. Uncomment a section and meet its prerequisites to enable.
 
 # GLA: the native-SOL top plus the circulating and non-circulating class tops
-# (the filter param). Prerequisites: [programs] unfiltered (include = []), the
-# [snapshot] section, and accounts-owner-map-enabled = true.
+# (the filter param). Prerequisites: [programs] unfiltered (include = []) and
+# the [snapshot] section.
 # [largest-accounts]
 # enabled = true
 # accounts-per-mint = 100      # in-memory holders per top, of which the top 20 are persisted and served

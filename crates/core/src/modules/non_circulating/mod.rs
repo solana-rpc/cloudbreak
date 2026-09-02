@@ -27,10 +27,9 @@ use solana_program::clock::Clock;
 use solana_pubkey::Pubkey;
 use solana_stake_interface::state::StakeStateV2;
 use tokio::task::JoinHandle;
-use tokio::time::Instant;
+use tokio::time::{Instant, timeout};
 
 use crate::metrics::TokioTaskCounterGuard;
-use crate::modules::account_owner_map::AccountOwnerMap;
 use crate::modules::largest_accounts::{LargestAccountsTracker, persist_largest_outcome};
 use crate::modules::service_health::is_healthy;
 use crate::{IndexConfig, STAKE_PROGRAM_ID};
@@ -88,7 +87,7 @@ const CLOCK_SYSVAR_ID: Pubkey =
 /// Latest live state per account for a given owner, across the live and snapshot tables.
 pub const LATEST_BY_OWNER_SQL: &str = r#"
 WITH latest AS (
-    SELECT DISTINCT ON (pubkey) pubkey, data, lamports
+    SELECT DISTINCT ON (pubkey) pubkey, slot, data, lamports
     FROM (
         SELECT pubkey, slot, data, lamports FROM accounts WHERE owner = $1
         UNION ALL
@@ -96,19 +95,18 @@ WITH latest AS (
     ) AS u
     ORDER BY pubkey, slot DESC
 )
-SELECT pubkey, data FROM latest WHERE lamports > 0
+SELECT pubkey, slot, data, lamports FROM latest WHERE lamports > 0
 "#;
 
-const LATEST_ACCOUNT_ROW_SQL: &str = r#"
-            SELECT lamports, slot FROM (
-                SELECT lamports, slot FROM accounts
-                WHERE owner = v.owner AND pubkey = v.pubkey
-                UNION ALL
-                SELECT lamports, slot FROM snapshot_accounts
-                WHERE owner = v.owner AND pubkey = v.pubkey
-            ) u
-            ORDER BY slot DESC
-            LIMIT 1
+/// Latest row per pubkey for a pubkey list, across the live and snapshot tables.
+const LATEST_BY_PUBKEY_SQL: &str = r#"
+SELECT DISTINCT ON (pubkey) pubkey, lamports, slot
+FROM (
+    SELECT pubkey, lamports, slot FROM accounts WHERE pubkey = ANY($1)
+    UNION ALL
+    SELECT pubkey, lamports, slot FROM snapshot_accounts WHERE pubkey = ANY($1)
+) AS u
+ORDER BY pubkey, slot DESC
 "#;
 
 /// Spawns the background task that periodically recomputes the non-circulating
@@ -118,7 +116,6 @@ pub fn spawn_non_circulating_recomputer(
     db: DatabaseConnection,
     config: IndexConfig,
     non_circulating: NonCirculatingTracker,
-    accounts_owner_map: AccountOwnerMap,
     largest_accounts: LargestAccountsTracker,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -128,6 +125,7 @@ pub fn spawn_non_circulating_recomputer(
             return;
         }
 
+        let query_timeout = Duration::from_secs(config.database.save_block_queries_timeout);
         let mut interval = tokio::time::interval(POLL_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut last_recompute: Option<Instant> = None;
@@ -154,7 +152,7 @@ pub fn spawn_non_circulating_recomputer(
                 continue;
             }
 
-            let (slot, accounts, next_expiry) = match recompute(&db).await {
+            let (slot, accounts, mut balances, next_expiry) = match recompute(&db).await {
                 Ok(result) => result,
                 Err(e) => {
                     tracing::error!(
@@ -165,16 +163,8 @@ pub fn spawn_non_circulating_recomputer(
                     continue;
                 }
             };
-            let members: Vec<(Pubkey, Pubkey)> = accounts
-                .iter()
-                .filter_map(|pubkey| {
-                    accounts_owner_map
-                        .get_owner(pubkey)
-                        .map(|owner| (owner, *pubkey))
-                })
-                .collect();
-            let balances = match fetch_non_circulating_balances(&db, &members).await {
-                Ok(balances) => balances,
+            let pinned = match fetch_pinned_balances(&db, query_timeout).await {
+                Ok(pinned) => pinned,
                 Err(e) => {
                     tracing::error!(
                         target: "non_circulating_recomputer",
@@ -184,14 +174,19 @@ pub fn spawn_non_circulating_recomputer(
                     continue;
                 }
             };
+            // The stake scan already covers a pinned account that is a stake account.
+            let scanned: HashSet<Pubkey> = balances.iter().map(|balance| balance.pubkey).collect();
+            balances.extend(
+                pinned
+                    .into_iter()
+                    .filter(|balance| !scanned.contains(&balance.pubkey)),
+            );
 
             last_recompute = Some(Instant::now());
             next_lockup_expiry = next_expiry;
             let member_set: HashSet<Pubkey> = accounts.iter().copied().collect();
             non_circulating.set_members(accounts);
-            if let Some(outcome) =
-                largest_accounts.seed_class_sentinels(slot, &member_set, &balances)
-            {
+            if let Some(outcome) = largest_accounts.seed_class_sentinels(&member_set, &balances) {
                 persist_largest_outcome(&largest_accounts, outcome, slot, &db, &config).await;
                 class_sentinels_seeded = true;
             }
@@ -199,9 +194,11 @@ pub fn spawn_non_circulating_recomputer(
     })
 }
 
+/// Resolves the member set. Returns the clock slot, the members, the balances of
+/// the stake members read by the scan, and the next lockup expiry.
 async fn recompute(
     db: &DatabaseConnection,
-) -> Result<(u64, Vec<Pubkey>, Option<i64>), anyhow::Error> {
+) -> Result<(u64, Vec<Pubkey>, Vec<NonCirculatingBalance>, Option<i64>), anyhow::Error> {
     let start_time = Instant::now();
     let clock = read_clock(db)
         .await
@@ -209,6 +206,7 @@ async fn recompute(
 
     let withdraw_authorities: HashSet<Pubkey> = WITHDRAW_AUTHORITY.iter().copied().collect();
     let mut set: HashSet<Pubkey> = NON_CIRCULATING_ACCOUNTS.iter().copied().collect();
+    let mut balances: Vec<NonCirculatingBalance> = Vec::new();
     let mut next_expiry: Option<i64> = None;
 
     let mut stream = db
@@ -241,7 +239,14 @@ async fn recompute(
             next_expiry = Some(next_expiry.map_or(ts, |current| current.min(ts)));
         }
         if in_force || withdraw_authorities.contains(&meta.authorized.withdrawer) {
+            let slot: i64 = row.try_get("", "slot")?;
+            let lamports: i64 = row.try_get("", "lamports")?;
             set.insert(pubkey);
+            balances.push(NonCirculatingBalance {
+                pubkey,
+                slot: slot as u64,
+                lamports: lamports as u64,
+            });
         }
     }
 
@@ -251,7 +256,7 @@ async fn recompute(
         set.len(),
         start_time.elapsed().as_secs_f64()
     );
-    Ok((clock.slot, set.into_iter().collect(), next_expiry))
+    Ok((clock.slot, set.into_iter().collect(), balances, next_expiry))
 }
 
 async fn read_clock(db: &DatabaseConnection) -> Option<Clock> {
@@ -283,31 +288,28 @@ async fn read_clock(db: &DatabaseConnection) -> Option<Clock> {
     bincode::deserialize::<Clock>(&data).ok()
 }
 
-/// Fetches the latest lamports/slot for each `(owner, pubkey)` member, routed by
-/// owner so the query prunes to the owner's partition.
-async fn fetch_non_circulating_balances(
+/// Fetches the latest lamports/slot of each pinned non-circulating account by
+/// pubkey.
+async fn fetch_pinned_balances(
     db: &DatabaseConnection,
-    members: &[(Pubkey, Pubkey)],
-) -> Result<Vec<NonCirculatingBalance>, sea_orm::DbErr> {
-    if members.is_empty() {
-        return Ok(Vec::new());
-    }
+    query_timeout: Duration,
+) -> Result<Vec<NonCirculatingBalance>, anyhow::Error> {
+    let pubkeys = bytea_array(
+        NON_CIRCULATING_ACCOUNTS
+            .iter()
+            .map(|pubkey| pubkey.to_bytes().to_vec())
+            .collect(),
+    );
 
-    let (owners, pubkeys) = owner_pubkey_arrays(members);
-
-    let rows = db
-        .query_all(Statement::from_sql_and_values(
+    let rows = timeout(
+        query_timeout,
+        db.query_all(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            format!(
-                r#"
-            SELECT v.pubkey, latest.lamports, latest.slot
-            FROM unnest($1::bytea[], $2::bytea[]) AS v(owner, pubkey)
-            JOIN LATERAL ({LATEST_ACCOUNT_ROW_SQL}) latest ON true
-            "#
-            ),
-            [owners, pubkeys],
-        ))
-        .await?;
+            LATEST_BY_PUBKEY_SQL,
+            [pubkeys],
+        )),
+    )
+    .await??;
 
     rows.into_iter()
         .map(|row| {
@@ -335,19 +337,7 @@ fn bytea_array(items: Vec<Vec<u8>>) -> Value {
     )
 }
 
-fn parse_pubkey(bytes: Vec<u8>) -> Result<Pubkey, sea_orm::DbErr> {
+fn parse_pubkey(bytes: Vec<u8>) -> Result<Pubkey, anyhow::Error> {
     Pubkey::try_from(bytes.as_slice())
-        .map_err(|_| sea_orm::DbErr::Custom("invalid pubkey bytes in query result".to_string()))
-}
-
-fn owner_pubkey_arrays(pairs: &[(Pubkey, Pubkey)]) -> (Value, Value) {
-    let owners = pairs
-        .iter()
-        .map(|(owner, _)| owner.to_bytes().to_vec())
-        .collect();
-    let pubkeys = pairs
-        .iter()
-        .map(|(_, pubkey)| pubkey.to_bytes().to_vec())
-        .collect();
-    (bytea_array(owners), bytea_array(pubkeys))
+        .map_err(|_| anyhow::anyhow!("invalid pubkey bytes in query result"))
 }

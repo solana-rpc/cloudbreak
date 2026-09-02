@@ -180,7 +180,6 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
         db.clone(),
         config.clone(),
         indexer_state.non_circulating.clone(),
-        indexer_state.accounts_owner_map.clone(),
         indexer_state.largest_accounts.clone(),
     );
 

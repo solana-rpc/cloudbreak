@@ -62,9 +62,10 @@ pub async fn clear_largest_accounts(db: &DatabaseConnection) -> Result<(), DbErr
 
 impl LargestAccountsTracker {
     /// Builds the tracker from the two config sections independently:
-    /// `[largest-accounts]` enables the SOL/class sentinel tops (and validates
-    /// its prerequisites), `[token-largest-accounts]` enables the per-mint token
-    /// tops. Clears stale `largest_accounts` rows when either is enabled.
+    /// `[largest-accounts]` enables the SOL/class sentinel tops (it needs an
+    /// unfiltered index and the snapshot section, not the owner map),
+    /// `[token-largest-accounts]` enables the per-mint token tops. Clears stale
+    /// `largest_accounts` rows when either is enabled.
     pub async fn from_config(db: &DatabaseConnection, config: &IndexConfig) -> Self {
         let sol_k = config
             .largest_accounts
@@ -76,11 +77,6 @@ impl LargestAccountsTracker {
                 }
                 if config.snapshot.is_none() {
                     panic!("largest-accounts requires the [snapshot] section");
-                }
-                if !config.accounts_owner_map_enabled {
-                    panic!(
-                        "largest-accounts requires accounts-owner-map-enabled (needed for the circulating/non-circulating filter)"
-                    );
                 }
                 if largest_config.accounts_per_mint < super::PERSISTED_TOP_N {
                     panic!(
