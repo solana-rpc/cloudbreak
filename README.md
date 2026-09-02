@@ -731,6 +731,8 @@ When the `[snapshot]` section (with `[snapshot.tracker_endpoint]`) is present in
 
 Set `accounts-owner-map-enabled = true` in the indexer config to maintain an in-memory map of account pubkey to owner + slot. This is used for tracking owner changes and closed-account handling. It increases memory usage but improves correctness for owner-change scenarios.
 
+The map also speeds up the finalize-slot cleanup. The `accounts` and `snapshot_accounts` tables are hash-partitioned by owner, so a cleanup DELETE that only knows the pubkey has to probe all 64 partitions. When the map is enabled, the indexer captures each account's owner at save time and the cleanup carries (pubkey, owner) pairs, letting Postgres prune each delete to a single partition. For an account whose owner changed, the old-owner pair recorded at the change routes the deletion of its old rows and closed-account mask to the old owner's partition. When the map is disabled the cleanup runs the no-owner SQL, with no owner routing.
+
 ### Slot Synchronizer
 
 The API server's `[slot-syncronizer]` section controls periodic slot fetching from the database. Enabled by default (200ms interval). Disable with `enabled = false` if not needed.
