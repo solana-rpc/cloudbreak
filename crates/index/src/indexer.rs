@@ -96,14 +96,13 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
         AccountOwnerMap::default()
     };
 
-    // Validates prerequisites, records tracked mints in environment_info, and clears
-    // stale largest_accounts rows. Disabled tracker when the feature is off.
+    // Validates prerequisites and clears stale largest_accounts rows. Disabled
+    // tracker when neither largest-accounts section is enabled.
     let largest_accounts = LargestAccountsTracker::from_config(&db, &config).await;
 
     // The non-circulating tracker powers the getLargestAccounts circulating/non-circulating
-    // filter. It is enabled with largest-accounts (which already requires a full index, the
-    // snapshot section, and the owner map).
-    let non_circulating = if largest_accounts.is_enabled() {
+    // filter, so it follows the [largest-accounts] section only.
+    let non_circulating = if largest_accounts.sol_tracking_enabled() {
         NonCirculatingTracker::new()
     } else {
         NonCirculatingTracker::default()
@@ -117,9 +116,8 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
         UpdatedAccountsDuringStartup::new(snapshot_processing_state.clone(), health.clone());
 
     let (prune_slot_tx, prune_slot_rx) = tokio::sync::watch::channel(0u64);
-    if config.largest_accounts_enabled() {
-        largest_accounts::spawn_largest_accounts_pruner(db.clone(), config.clone(), prune_slot_rx);
-    }
+    // No-op when neither largest-accounts section is enabled.
+    largest_accounts::spawn_largest_accounts_pruner(db.clone(), config.clone(), prune_slot_rx);
 
     let slot_finalizer = SlotFinalizer::spawn(
         db.clone(),
@@ -182,7 +180,6 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
         db.clone(),
         config.clone(),
         indexer_state.non_circulating.clone(),
-        indexer_state.accounts_owner_map.clone(),
         indexer_state.largest_accounts.clone(),
     );
 

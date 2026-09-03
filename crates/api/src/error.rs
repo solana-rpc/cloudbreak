@@ -54,6 +54,9 @@ pub enum RpcError {
     NotATokenMint { mint: String },
     #[error("Invalid param: could not find mint ({mint})")]
     MintDataNotFound { mint: String },
+    /// The requested RPC method is not enabled in this node's API config.
+    #[error("Method not found")]
+    MethodNotFound,
 }
 
 impl RpcError {
@@ -95,6 +98,7 @@ impl RpcError {
             RpcError::NotATokenAccount { .. } => "Invalid param: not a Token account",
             RpcError::NotATokenMint { .. } => "Invalid param: not a Token mint",
             RpcError::MintDataNotFound { .. } => "Invalid param: could not find mint",
+            RpcError::MethodNotFound => "METHOD_NOT_FOUND",
         }
     }
 
@@ -117,6 +121,7 @@ impl RpcError {
             RpcError::NotATokenAccount { .. } => -32602,
             RpcError::NotATokenMint { .. } => -32602,
             RpcError::MintDataNotFound { .. } => -32602,
+            RpcError::MethodNotFound => -32601,
         }
     }
 }

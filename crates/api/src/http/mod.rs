@@ -16,13 +16,13 @@ use hyper::StatusCode;
 use sea_orm::{DatabaseConnection, EntityTrait};
 use serde::{Deserialize, Serialize};
 use solana_commitment_config::CommitmentLevel;
-use solana_pubkey::Pubkey;
 use solana_rpc_client_api::response::Response as RpcResponse;
-use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tracing::Instrument;
-use cloudbreak_core::{AccountSelectorConfig, ProcessedCommitmentBehavior, UnhealthyResponseBehavior};
+use cloudbreak_core::{
+    AccountSelectorConfig, MethodSection, ProcessedCommitmentBehavior, UnhealthyResponseBehavior,
+};
 use cloudbreak_entity::slots;
 
 #[derive(Clone)]
@@ -111,8 +111,12 @@ pub struct CloudbreakRpcState {
     pub max_multiple_accounts: usize,
     pub simulation_supported: bool,
     pub feature_set_cache: Arc<RwLock<Option<CachedFeatureSet>>>,
-    /// Will be `Some` if the node supports the `getLargestAccounts` RPC method.
-    pub largest_accounts_mints: Option<Arc<HashSet<Pubkey>>>,
+    /// The `[largest-accounts]` API section; getLargestAccounts is served when
+    /// its `enabled` flag is set.
+    pub largest_accounts: MethodSection,
+    /// The `[token-largest-accounts]` API section; getTokenLargestAccounts is
+    /// served when its `enabled` flag is set.
+    pub token_largest_accounts: MethodSection,
 }
 
 impl CloudbreakRpcState {
@@ -134,7 +138,8 @@ impl CloudbreakRpcState {
         stakes_cache: SharedStakesSnapshot,
         max_multiple_accounts: usize,
         simulation_supported: bool,
-        largest_accounts_mints: Option<Arc<HashSet<Pubkey>>>,
+        largest_accounts: MethodSection,
+        token_largest_accounts: MethodSection,
     ) -> Self {
         Self {
             database,
@@ -154,7 +159,8 @@ impl CloudbreakRpcState {
             max_multiple_accounts,
             simulation_supported,
             feature_set_cache: Arc::new(RwLock::new(None)),
-            largest_accounts_mints,
+            largest_accounts,
+            token_largest_accounts,
         }
     }
 
