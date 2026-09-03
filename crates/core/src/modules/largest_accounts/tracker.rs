@@ -326,6 +326,7 @@ pub struct SeedAccount {
 
 /// Per-snapshot-file accumulator of candidate holders and observed closes, built
 /// without locking and merged into the tracker while it is still bootstrapping.
+/// A pubkey seen at several stamps keeps only its newest state.
 pub struct LargestAccountsSeed {
     sol_k: Option<usize>,
     token_k: usize,
@@ -391,8 +392,19 @@ impl LargestAccountsSeed {
         self.closes.push((pubkey, slot, write_version));
     }
 
+    /// Keeps the newest state per pubkey by `(slot, write_version)`, then the
+    /// top `k` of those by amount.
     fn shrink(entries: &mut Vec<SeedAccount>, k: usize) {
-        entries.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.amount));
+        entries.sort_unstable_by_key(|entry| {
+            (
+                entry.pubkey,
+                std::cmp::Reverse((entry.slot, entry.write_version, entry.amount)),
+            )
+        });
+        entries.dedup_by_key(|entry| entry.pubkey);
+        entries.sort_unstable_by_key(|entry| {
+            (std::cmp::Reverse(entry.amount), std::cmp::Reverse(entry.pubkey))
+        });
         entries.truncate(k);
     }
 }
@@ -520,9 +532,8 @@ impl LargestAccountsTracker {
                 state.remove_member(sentinel, pubkey, slot, write_version, &mut touched);
             }
         }
-        for (mint, mut entries) in seed.mints {
+        for (mint, entries) in seed.mints {
             let k = shared.k_for(&mint);
-            LargestAccountsSeed::shrink(&mut entries, k);
             for account in &entries {
                 state.max_applied_slot = state.max_applied_slot.max(account.slot);
             }
