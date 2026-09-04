@@ -4,7 +4,7 @@
  */
 
 use cloudbreak_core::{
-    IndexConfig, SnapshotConfig, SnapshotConfigOnIndexer, modules::supply_tracker::SupplyTracker,
+    IndexConfig, SnapshotConfig, SnapshotConfigOnIndexer, modules::supply::SupplyTracker,
 };
 use cloudbreak_snapshot::sidecar::{SnapshotPair, SnapshotType};
 use sea_orm::DatabaseConnection;
@@ -139,9 +139,8 @@ impl SelfHealingState {
                 // unsupported and `fill_gaps` fails fast in that case.
                 self.finalizer.pause().await;
 
-                if self.supply_tracker.mark_gap() {
-                    metrics::SUPPLY_STALE.set(1);
-                }
+                // The tracker sets the status gauge on the transition.
+                self.supply_tracker.mark_gap();
             }
         }
 

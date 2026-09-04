@@ -4,8 +4,7 @@
  */
 
 use cloudbreak_core::IndexConfig;
-use cloudbreak_core::modules::account_owner_map::AccountOwnerMap;
-use cloudbreak_core::modules::supply_tracker::SupplyTracker;
+use cloudbreak_core::modules::supply::{self, Pending};
 use cloudbreak_entity::accounts;
 use sea_orm::{
     ActiveValue::{NotSet, Set},
@@ -13,6 +12,7 @@ use sea_orm::{
 };
 use solana_pubkey::Pubkey;
 use std::collections::HashMap;
+use std::time::Duration;
 use tokio::{
     task::{JoinHandle, JoinSet},
     time::Instant,
@@ -106,8 +106,6 @@ pub async fn save_block(
     for account in block.accounts {
         let pubkey = Pubkey::try_from(account.pubkey.as_slice()).unwrap();
 
-        supply_tracker.observe_account(pubkey, slot, account.lamports);
-
         if supply_enabled {
             let pending = pending_supply_accounts
                 .entry(pubkey)
@@ -166,15 +164,7 @@ pub async fn save_block(
             continue;
         }
 
-        // A repaired block replays writes for an account that closed at or after
-        // this slot; upserting it would resurrect the map entry.
-        let resurrects_gap_closed_account = is_repaired
-            && supply_tracker
-                .gap_close_floor(&pubkey)
-                .is_some_and(|closed_slot| closed_slot >= slot);
-        if !resurrects_gap_closed_account {
-            accounts_owner_map.upsert_account(&account.pubkey, &account.owner, slot);
-        }
+        accounts_owner_map.upsert_account(&account.pubkey, &account.owner, slot);
 
         block_bytes_data += account.data.len();
         current_chunk_bytes += account.data.len();
@@ -211,35 +201,47 @@ pub async fn save_block(
         chunks.push((current_chunk, current_chunk_bytes));
     }
 
-    // Serialize supply-relevant map writes against the snapshot bootstrap resolve pass.
-    let supply_write_guard = supply_tracker.lock_block_writes().await;
-    if !is_repaired {
-        supply_tracker.record_gap_closes(slot, &closed_accounts_for_slot);
+    // Build the deduped closed list from the block's final state, so a same-block
+    // close then recreate produces one real row and no mask that would violate the
+    // (pubkey, slot) primary key.
+    if supply_enabled {
+        closed_accounts_for_slot.retain(|pubkey| {
+            Pubkey::try_from(pubkey.as_slice())
+                .ok()
+                .and_then(|pk| pending_supply_accounts.get(&pk))
+                .is_none_or(|pending| pending.lamports == 0)
+        });
     }
-    let defer_map_removals = supply_tracker.is_gap_filling();
-    let block_supply_delta = if supply_tracker.is_tracking_deltas() {
-        compute_block_supply_delta(
-            &accounts_owner_map,
-            &supply_tracker,
-            pending_supply_accounts,
+
+    // The supply delta runs under the block-writes lock, released before the
+    // block's own inserts so the miss read never reads this block's rows. The
+    // tracker owns the lock, the gap bookkeeping, and the metrics.
+    let supply_query_timeout = Duration::from_secs(config.database.save_block_queries_timeout);
+    let supply_pending: Vec<Pending> = if supply_enabled {
+        pending_supply_accounts
+            .into_iter()
+            .map(|(pubkey, pending)| Pending {
+                pubkey,
+                owner: pending.owner,
+                lamports: pending.lamports,
+                write_version: pending.write_version,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let supply_apply_start = std::time::Instant::now();
+    let supply_outcome = supply_tracker
+        .apply_block(
             slot,
             is_repaired,
+            supply_pending,
+            &closed_accounts_for_slot,
+            db,
+            supply_query_timeout,
         )
-    } else {
-        accounts_owner_map.merge_lamports(
-            pending_supply_accounts
-                .iter()
-                .map(|(pubkey, pending)| (*pubkey, pending.owner, pending.lamports)),
-            slot,
-        );
-        supply_tracker.record_startup_touches(
-            slot,
-            pending_supply_accounts
-                .into_iter()
-                .map(|(pubkey, pending)| (pubkey, pending.lamports, pending.write_version)),
-        );
-        None
-    };
+        .await;
+    let supply_apply_elapsed = supply_apply_start.elapsed();
 
     let closed_account_for_slot_len = closed_accounts_for_slot.len();
 
@@ -261,7 +263,6 @@ pub async fn save_block(
             slot,
             &config,
             accounts_owner_map,
-            defer_map_removals,
         )
     } else {
         None
@@ -313,16 +314,6 @@ pub async fn save_block(
         }
     }
 
-    if block_supply_delta.is_none() && !block_writes_ok && supply_tracker.mark_bootstrap_failed() {
-        tracing::error!(
-            target: "supply_tracker",
-            "account writes failed for slot {} during supply bootstrap, marking bootstrap failed",
-            slot
-        );
-    }
-
-    drop(supply_write_guard);
-
     largest_accounts
         .commit_block(slot, largest_pending, db, &config)
         .await;
@@ -347,51 +338,19 @@ pub async fn save_block(
     )
     .await;
 
-    if let Some(block_delta) = block_supply_delta {
-        if !block_writes_ok {
-            tracing::error!(
-                target: "supply_tracker",
-                "account writes failed for slot {}, marking supply stale",
-                slot
-            );
-            if supply_tracker.mark_stale() {
-                metrics::SUPPLY_STALE.set(1);
-            }
-        } else if let Some(commit) = supply_tracker.commit_block(slot, block_delta) {
-            db_queries::upsert_supply_row(db, &commit, &config).await;
-            metrics::SUPPLY_TOTAL_LAMPORTS.set(commit.total as i64);
-            metrics::SUPPLY_SLOT.set(commit.slot as i64);
-            metrics::SUPPLY_STALE.set(0);
-        }
+    // Commit or fail closed. The tracker set the status, total, and slot gauges
+    // and pinned or marked stale on a write failure; persist the row it returns.
+    let supply_finish_start = std::time::Instant::now();
+    if let Some(commit) = supply_tracker.finish_block(slot, supply_outcome, block_writes_ok) {
+        supply::persist::persist_supply_row(db, &commit, supply_query_timeout).await;
+    }
+    // Aggregate the supply work's cost in this loop (apply plus finish and the
+    // row upsert, excluding the account inserts between them) and log a summary
+    // every 50 blocks rather than per block.
+    if supply_enabled {
+        supply_tracker.observe_loop_time(slot, supply_apply_elapsed + supply_finish_start.elapsed());
     }
 
     let elapsed = start_time.elapsed().as_secs_f64();
     metrics::record_block_processing(elapsed, "block");
-}
-
-/// Routes the block's deduplicated account updates through the owner map and
-/// returns the block's net lamports delta. `take_zero_prev` must run before the
-/// gap-close skip so a startup zero-balance marker is always consumed.
-fn compute_block_supply_delta(
-    accounts_owner_map: &AccountOwnerMap,
-    supply_tracker: &SupplyTracker,
-    pending_accounts: HashMap<Pubkey, PendingSupplyAccount>,
-    slot: u64,
-    is_repaired: bool,
-) -> Option<i128> {
-    let mut routed = Vec::with_capacity(pending_accounts.len());
-    for (pubkey, pending) in pending_accounts {
-        let zero_prev = supply_tracker.take_zero_prev(&pubkey);
-        if is_repaired
-            && !zero_prev
-            && supply_tracker
-                .gap_close_floor(&pubkey)
-                .is_some_and(|closed_slot| closed_slot >= slot)
-        {
-            continue;
-        }
-        routed.push((pubkey, pending.owner, pending.lamports, zero_prev));
-    }
-
-    Some(accounts_owner_map.count_supply_deltas(routed, slot))
 }

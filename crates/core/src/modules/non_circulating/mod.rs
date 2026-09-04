@@ -33,7 +33,7 @@ use crate::metrics::{SUPPLY_QUERY_ERRORS, TokioTaskCounterGuard};
 use crate::modules::account_owner_map::AccountOwnerMap;
 use crate::modules::largest_accounts::{LargestAccountsTracker, persist_largest_outcome};
 use crate::modules::service_health::is_healthy;
-use crate::modules::supply_tracker::SupplyTracker;
+use crate::modules::supply::{SupplyTracker, prev};
 use crate::{IndexConfig, STAKE_PROGRAM_ID};
 use lists::{NON_CIRCULATING_ACCOUNTS, WITHDRAW_AUTHORITY};
 
@@ -86,18 +86,21 @@ const SYSVAR_OWNER_ID: Pubkey =
 const CLOCK_SYSVAR_ID: Pubkey =
     Pubkey::from_str_const("SysvarC1ock11111111111111111111111111111111");
 
-/// Latest live state per account for a given owner, across the live and snapshot tables.
+/// Latest live state per account for a given owner, across the live and snapshot
+/// tables. Carries slot and write_version so the stake scan can feed the supply
+/// pinned set. Rides `idx_accounts_stake_owner` when the owner is the Stake
+/// program on the de-partitioned supply node.
 pub const LATEST_BY_OWNER_SQL: &str = r#"
 WITH latest AS (
-    SELECT DISTINCT ON (pubkey) pubkey, data, lamports
+    SELECT DISTINCT ON (pubkey) pubkey, data, lamports, slot, write_version
     FROM (
-        SELECT pubkey, slot, data, lamports FROM accounts WHERE owner = $1
+        SELECT pubkey, slot, write_version, data, lamports FROM accounts WHERE owner = $1
         UNION ALL
-        SELECT pubkey, slot, data, lamports FROM snapshot_accounts WHERE owner = $1
+        SELECT pubkey, slot, write_version, data, lamports FROM snapshot_accounts WHERE owner = $1
     ) AS u
-    ORDER BY pubkey, slot DESC
+    ORDER BY pubkey, slot DESC, write_version DESC
 )
-SELECT pubkey, data FROM latest WHERE lamports > 0
+SELECT pubkey, data, lamports, slot, write_version FROM latest WHERE lamports > 0
 "#;
 
 const LATEST_ACCOUNT_ROW_SQL: &str = r#"
@@ -156,7 +159,7 @@ pub fn spawn_non_circulating_recomputer(
                 continue;
             }
 
-            let (slot, accounts, next_expiry) = match recompute(&db).await {
+            let (slot, accounts, next_expiry, stake_rows) = match recompute(&db).await {
                 Ok(result) => result,
                 Err(e) => {
                     tracing::error!(
@@ -167,23 +170,45 @@ pub fn spawn_non_circulating_recomputer(
                     continue;
                 }
             };
-            let members: Vec<(Pubkey, Pubkey)> = accounts
-                .iter()
-                .filter_map(|pubkey| {
-                    accounts_owner_map
-                        .get_owner(pubkey)
-                        .map(|owner| (owner, *pubkey))
-                })
-                .collect();
-            let balances = match fetch_non_circulating_balances(&db, &members).await {
-                Ok(balances) => balances,
-                Err(e) => {
-                    tracing::error!(
-                        target: "non_circulating_recomputer",
-                        "failed to fetch non-circulating balances: {:?}",
-                        e
-                    );
-                    continue;
+
+            // Feed every stake account into the supply pinned set so the epoch
+            // reward burst stays cache hits. No-op when stake pinning is off.
+            supply_tracker.refresh_pinned(stake_rows.iter().copied(), slot);
+
+            // On a supply node the owner map is off, so member balances are read
+            // by pubkey. On a largest-accounts node the map routes to the owner
+            // partition. Either way, no member balance is served stale.
+            let balances = if accounts_owner_map.is_enabled() {
+                let members: Vec<(Pubkey, Pubkey)> = accounts
+                    .iter()
+                    .filter_map(|pubkey| {
+                        accounts_owner_map
+                            .get_owner(pubkey)
+                            .map(|owner| (owner, *pubkey))
+                    })
+                    .collect();
+                match fetch_non_circulating_balances(&db, &members).await {
+                    Ok(balances) => balances,
+                    Err(e) => {
+                        tracing::error!(
+                            target: "non_circulating_recomputer",
+                            "failed to fetch non-circulating balances: {:?}",
+                            e
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                match fetch_member_balances_by_pubkey(&db, &accounts).await {
+                    Ok(balances) => balances,
+                    Err(e) => {
+                        tracing::error!(
+                            target: "non_circulating_recomputer",
+                            "failed to fetch non-circulating balances by pubkey: {:?}",
+                            e
+                        );
+                        continue;
+                    }
                 }
             };
 
@@ -205,9 +230,12 @@ pub fn spawn_non_circulating_recomputer(
     })
 }
 
+/// Returns the membership slot, the member set, the next lockup expiry, and the
+/// full stake scan rows `(pubkey, lamports, slot, write_version)` for the supply
+/// pinned set.
 async fn recompute(
     db: &DatabaseConnection,
-) -> Result<(u64, Vec<Pubkey>, Option<i64>), anyhow::Error> {
+) -> Result<(u64, Vec<Pubkey>, Option<i64>, Vec<(Pubkey, u64, u64, u64)>), anyhow::Error> {
     let start_time = Instant::now();
     let clock = read_clock(db)
         .await
@@ -216,6 +244,7 @@ async fn recompute(
     let withdraw_authorities: HashSet<Pubkey> = WITHDRAW_AUTHORITY.iter().copied().collect();
     let mut set: HashSet<Pubkey> = NON_CIRCULATING_ACCOUNTS.iter().copied().collect();
     let mut next_expiry: Option<i64> = None;
+    let mut stake_rows: Vec<(Pubkey, u64, u64, u64)> = Vec::new();
 
     let mut stream = db
         .stream(Statement::from_sql_and_values(
@@ -230,6 +259,11 @@ async fn recompute(
         let Ok(pubkey) = Pubkey::try_from(pubkey_bytes.as_slice()) else {
             continue;
         };
+        let lamports: i64 = row.try_get("", "lamports")?;
+        let row_slot: i64 = row.try_get("", "slot")?;
+        let write_version: i64 = row.try_get("", "write_version")?;
+        stake_rows.push((pubkey, lamports as u64, row_slot as u64, write_version as u64));
+
         let Ok(state) = bincode::deserialize::<StakeStateV2>(&data) else {
             continue;
         };
@@ -253,11 +287,31 @@ async fn recompute(
 
     tracing::debug!(
         target: "non_circulating_recomputer",
-        "recomputed membership ({} accounts) in {:.3}s",
+        "recomputed membership ({} accounts, {} stake rows) in {:.3}s",
         set.len(),
+        stake_rows.len(),
         start_time.elapsed().as_secs_f64()
     );
-    Ok((clock.slot, set.into_iter().collect(), next_expiry))
+    Ok((clock.slot, set.into_iter().collect(), next_expiry, stake_rows))
+}
+
+const MEMBER_BALANCES_QUERY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Fetches every member's latest balance by pubkey, owner-blind, for the supply
+/// node where the owner map is off. One batched read on the `(pubkey, slot)` key.
+async fn fetch_member_balances_by_pubkey(
+    db: &DatabaseConnection,
+    members: &[Pubkey],
+) -> Result<Vec<NonCirculatingBalance>, sea_orm::DbErr> {
+    let rows = prev::fetch_member_balances(db, members, MEMBER_BALANCES_QUERY_TIMEOUT).await?;
+    Ok(rows
+        .into_iter()
+        .map(|(pubkey, lamports, slot)| NonCirculatingBalance {
+            pubkey,
+            slot,
+            lamports,
+        })
+        .collect())
 }
 
 async fn read_clock(db: &DatabaseConnection) -> Option<Clock> {

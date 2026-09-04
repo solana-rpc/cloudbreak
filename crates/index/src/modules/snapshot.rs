@@ -7,7 +7,7 @@ use cloudbreak_core::{
     IndexConfig, SnapshotConfig,
     modules::{
         account_owner_map::AccountOwnerMap, largest_accounts::LargestAccountsTracker,
-        supply_tracker::SupplyTracker,
+        supply::SupplyTracker,
     },
 };
 use std::sync::{Arc, Mutex};

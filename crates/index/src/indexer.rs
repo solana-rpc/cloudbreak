@@ -9,7 +9,7 @@ use cloudbreak_core::{
         account_owner_map::AccountOwnerMap,
         largest_accounts::{self, LargestAccountsTracker},
         non_circulating::{self, NonCirculatingTracker},
-        supply_tracker::SupplyTracker,
+        supply::{self, SupplyTracker},
     },
 };
 use sea_orm::{ConnectOptions, Database, DatabaseConnection};
@@ -103,21 +103,10 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
     let largest_accounts = LargestAccountsTracker::from_config(&db, &config).await;
 
     // The supply tracker keeps the running total-supply figure for getSupply. It
-    // needs a full index, the owner map, and the snapshot capitalization anchor.
-    let supply_tracker = if config.supply_tracker_enabled {
-        if !config.programs.supports_simulation() {
-            panic!("supply-tracker-enabled requires an empty [programs] filter");
-        }
-        if !config.accounts_owner_map_enabled {
-            panic!("supply-tracker-enabled requires accounts-owner-map-enabled");
-        }
-        if config.snapshot.is_none() {
-            panic!("supply-tracker-enabled requires the [snapshot] section");
-        }
-        SupplyTracker::new()
-    } else {
-        SupplyTracker::default()
-    };
+    // reads the previous balance from a bounded hot-accounts cache, so it needs a
+    // full index, the owner map off, owner partitioning off, and the snapshot
+    // anchor. `from_config` validates all of it and clears a prior run's rows.
+    let supply_tracker = supply::persist::from_config(&db, &config).await;
 
     // The non-circulating tracker powers the getLargestAccounts circulating/non-circulating
     // filter. It is enabled with largest-accounts (which already requires a full index, the
@@ -140,6 +129,14 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
     if config.largest_accounts_enabled() {
         largest_accounts::spawn_largest_accounts_pruner(db.clone(), config.clone(), prune_slot_rx);
     }
+
+    // The cache sweeper wakes on each finalize-slot change and evicts stale
+    // unpinned entries off the block path. No-op when supply is disabled.
+    supply::maintain::spawn_supply_cache_sweeper(
+        db.clone(),
+        supply_tracker.clone(),
+        prune_slot_tx.subscribe(),
+    );
 
     let slot_finalizer = SlotFinalizer::spawn(
         db.clone(),

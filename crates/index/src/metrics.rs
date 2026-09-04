@@ -8,7 +8,9 @@ use std::sync::{Once, OnceLock};
 use cloudbreak_core::IndexConfig;
 pub use cloudbreak_core::metrics::{
     CURRENT_TOKIO_TASKS, LARGEST_ACCOUNTS_DB_ERRORS, LARGEST_ACCOUNTS_STALE_MINTS,
-    SUPPLY_QUERY_ERRORS, TokioTaskCounterGuard,
+    SUPPLY_CACHE_BUCKETS, SUPPLY_CACHE_ENTRIES, SUPPLY_CACHE_HITS_TOTAL, SUPPLY_CACHE_MISSES_TOTAL,
+    SUPPLY_DELTA_SECONDS, SUPPLY_MISS_READ_SECONDS, SUPPLY_QUERY_ERRORS, SUPPLY_SLOT, SUPPLY_STATUS,
+    SUPPLY_TOTAL_LAMPORTS, SUPPLY_WRITE_FAILURES_TOTAL, TokioTaskCounterGuard,
 };
 use prometheus::{Counter, Histogram, HistogramOpts, HistogramVec, IntGauge, Registry};
 use tracing::error;
@@ -274,21 +276,6 @@ lazy_static::lazy_static! {
         "cloudbreak_finalize_slot_handler_queue_size", "Size of the finalize slot handler queue"
     )
     .expect("Failed to create finalize slot handler queue size gauge");
-
-    pub static ref SUPPLY_TOTAL_LAMPORTS: IntGauge = IntGauge::new(
-        "cloudbreak_supply_total_lamports", "Running total supply in lamports"
-    )
-    .expect("Failed to create supply total lamports gauge");
-
-    pub static ref SUPPLY_SLOT: IntGauge = IntGauge::new(
-        "cloudbreak_supply_slot", "Slot of the last committed supply total"
-    )
-    .expect("Failed to create supply slot gauge");
-
-    pub static ref SUPPLY_STALE: IntGauge = IntGauge::new(
-        "cloudbreak_supply_stale", "Whether the supply tracker is stale (1) or fresh (0)"
-    )
-    .expect("Failed to create supply stale gauge");
 }
 
 pub fn record_block_processing(elapsed: f64, origin: &str) {
@@ -401,7 +388,14 @@ pub fn register_collectors() {
         register!(LARGEST_ACCOUNTS_STALE_MINTS);
         register!(SUPPLY_TOTAL_LAMPORTS);
         register!(SUPPLY_SLOT);
-        register!(SUPPLY_STALE);
+        register!(SUPPLY_STATUS);
         register!(SUPPLY_QUERY_ERRORS);
+        register!(SUPPLY_CACHE_ENTRIES);
+        register!(SUPPLY_CACHE_BUCKETS);
+        register!(SUPPLY_CACHE_HITS_TOTAL);
+        register!(SUPPLY_CACHE_MISSES_TOTAL);
+        register!(SUPPLY_WRITE_FAILURES_TOTAL);
+        register!(SUPPLY_DELTA_SECONDS);
+        register!(SUPPLY_MISS_READ_SECONDS);
     });
 }

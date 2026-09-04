@@ -9,7 +9,7 @@ use cloudbreak_core::{
     Result, SnapshotConfig, TryLoadConfig,
     modules::{
         account_owner_map::AccountOwnerMap, largest_accounts::LargestAccountsTracker,
-        supply_tracker::SupplyTracker,
+        supply::SupplyTracker,
     },
 };
 use cloudbreak_index::indexer::run as run_index;

@@ -6,9 +6,7 @@
 use sea_orm::{ConnectOptions, Database, DatabaseConnection};
 use agave_fs::FileInfo;
 use solana_accounts_db::accounts_file::AccountsFile;
-use solana_pubkey::Pubkey;
 use std::{
-    collections::HashMap,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -18,10 +16,11 @@ use yellowstone_grpc_proto::geyser::{
     SubscribeUpdateAccount, SubscribeUpdateAccountInfo, SubscribeUpdateBlock,
 };
 use cloudbreak_core::{
-    Result, SnapshotConfig,
+    Result, STAKE_PROGRAM_ID, SnapshotConfig,
     modules::{
-        account_owner_map::AccountOwnerMap, largest_accounts::LargestAccountsTracker,
-        supply_tracker::SupplyTracker,
+        account_owner_map::AccountOwnerMap,
+        largest_accounts::LargestAccountsTracker,
+        supply::{self, SupplyTracker},
     },
 };
 
@@ -41,11 +40,8 @@ pub use db_queries::persist_epoch_stakes;
 
 const DB_ACCOUNTS_BATCH_SIZE: usize = 200;
 
-/// Smallest on-disk footprint of a stored account, used to bound the owner-map
-/// reservation estimate from the snapshot byte size.
-const MIN_STORED_ACCOUNT_BYTES: usize = 136;
-
-const MAX_OWNER_MAP_RESERVE_ACCOUNTS: usize = 1_700_000_000;
+/// Timeout for the one supply seed upsert at snapshot start.
+const SUPPLY_SEED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Download and save into postgres the snapshot data for the received slot (getting all snapshots files
 ///  needed until data to that slot is available)
@@ -125,10 +121,8 @@ pub async fn run(
     db_queries::clean_up_closed_accounts(&database).await?;
     db_queries::create_database_indexes(&database, &config.pg_indexes).await?;
 
-    accounts_owner_map.remove_zero_lamport_entries();
-
     largest_accounts.finish_bootstrap_and_persist(&database).await;
-    finish_supply_bootstrap(&database, &accounts_owner_map, &supply_tracker).await;
+    supply::bootstrap::finish_bootstrap(&database, &supply_tracker).await;
 
     tracing::info!(
         "Total snapshot processing time after cleanup: {} secs",
@@ -136,122 +130,6 @@ pub async fn run(
     );
 
     Ok(())
-}
-
-const STARTUP_BALANCES_CHUNK_SIZE: usize = 5_000;
-
-/// Resolves the pre-touch balances of every account written during startup and
-/// folds the window delta onto the snapshot capitalization anchor. Pass two runs
-/// under the block-writes guard so no touch races the resolve.
-async fn finish_supply_bootstrap(
-    database: &DatabaseConnection,
-    accounts_owner_map: &AccountOwnerMap,
-    supply_tracker: &SupplyTracker,
-) {
-    let Some(startup_slot) = supply_tracker.startup_slot() else {
-        return;
-    };
-
-    if supply_tracker.bootstrap_failed() {
-        tracing::error!(
-            "Supply bootstrap poisoned by failed startup account writes, supply stays bootstrapping"
-        );
-        return;
-    }
-
-    let start_time = Instant::now();
-
-    let touched = supply_tracker.startup_touched_pubkeys();
-    let touched_count = touched.len();
-    let Ok(mut balances) =
-        resolve_startup_balances(database, accounts_owner_map, touched, startup_slot)
-            .await
-            .map_err(log_startup_balances_error)
-    else {
-        return;
-    };
-
-    let _write_guard = supply_tracker.lock_block_writes().await;
-
-    let late_touches: Vec<Pubkey> = supply_tracker
-        .startup_touched_pubkeys()
-        .into_iter()
-        .filter(|pubkey| !balances.contains_key(pubkey))
-        .collect();
-    let Ok(late_balances) =
-        resolve_startup_balances(database, accounts_owner_map, late_touches, startup_slot)
-            .await
-            .map_err(log_startup_balances_error)
-    else {
-        return;
-    };
-    balances.extend(late_balances);
-
-    let Some(commit) = supply_tracker.finish_bootstrap(&balances) else {
-        if supply_tracker.bootstrap_failed() {
-            tracing::error!(
-                "Supply bootstrap poisoned by failed startup account writes, supply stays bootstrapping"
-            );
-        } else {
-            tracing::error!(
-                "Supply bootstrap reconciliation left unresolved accounts, supply stays bootstrapping"
-            );
-        }
-        return;
-    };
-
-    tracing::info!(
-        target: "supply_bootstrap",
-        "Supply bootstrap reconciled {} touched accounts against startup slot {} in {} secs - slot: {}, total: {}",
-        touched_count,
-        startup_slot,
-        start_time.elapsed().as_secs_f64(),
-        commit.slot,
-        commit.total
-    );
-
-    if let Err(e) = db_queries::persist_supply_total(database, &commit).await {
-        tracing::error!("Failed to persist bootstrapped supply total: {:?}", e);
-    }
-}
-
-fn log_startup_balances_error(e: impl std::fmt::Debug) {
-    tracing::error!(
-        "Failed to resolve startup balances for supply bootstrap, supply stays bootstrapping: {:?}",
-        e
-    );
-}
-
-async fn resolve_startup_balances(
-    database: &DatabaseConnection,
-    accounts_owner_map: &AccountOwnerMap,
-    pubkeys: Vec<Pubkey>,
-    startup_slot: u64,
-) -> Result<HashMap<Pubkey, u64>> {
-    let mut routed = Vec::new();
-    let mut unrouted = Vec::new();
-    for pubkey in pubkeys {
-        match accounts_owner_map.get_owner(&pubkey) {
-            Some(owner) => routed.push((owner, pubkey)),
-            None => unrouted.push(pubkey),
-        }
-    }
-
-    let mut balances = HashMap::new();
-    for chunk in routed.chunks(STARTUP_BALANCES_CHUNK_SIZE) {
-        let probe =
-            db_queries::fetch_startup_balances_by_owner(database, chunk, startup_slot).await?;
-        balances.extend(probe.resolved);
-        unrouted.extend(probe.misses);
-    }
-
-    for chunk in unrouted.chunks(STARTUP_BALANCES_CHUNK_SIZE) {
-        let resolved =
-            db_queries::fetch_startup_balances_from_versions(database, chunk, startup_slot).await?;
-        balances.extend(resolved);
-    }
-
-    Ok(balances)
 }
 
 fn download_and_process_snapshot(
@@ -298,7 +176,7 @@ fn download_and_process_snapshot(
 async fn process_downloaded_snapshot(
     database: &DatabaseConnection,
     snapshot_data: SnapshotData,
-    snapshot_type: SnapshotType,
+    _snapshot_type: SnapshotType,
     config: SnapshotConfig,
     accounts_owner_map: AccountOwnerMap,
     largest_accounts: LargestAccountsTracker,
@@ -321,9 +199,12 @@ async fn process_downloaded_snapshot(
 
     if supply_tracker.is_enabled() {
         supply_tracker.set_startup_total(bank_info.slot, bank_info.capitalization);
-        if let Err(e) = db_queries::persist_supply_seed(database, &bank_info).await {
-            tracing::error!("Failed to persist supply seed from snapshot: {:?}", e);
-        }
+        let seed = supply::SupplyCommit {
+            slot: bank_info.slot,
+            total: bank_info.capitalization,
+            non_circulating: None,
+        };
+        supply::persist::persist_supply_row(database, &seed, SUPPLY_SEED_TIMEOUT).await;
     }
 
     let mut account_file_workers: JoinSet<Result<()>> = JoinSet::new();
@@ -340,17 +221,6 @@ async fn process_downloaded_snapshot(
         .iter()
         .map(|p| p.0)
         .collect::<Vec<_>>();
-
-    // Pre-size the owner map from the snapshot byte size to avoid rehash-doubling
-    // it at full population.
-    if snapshot_type == SnapshotType::Full
-        && programs_include.is_empty()
-        && programs_exclude.is_empty()
-    {
-        let total_bytes: usize = solana_snapshot.iter().map(|file| file.size).sum();
-        accounts_owner_map
-            .reserve((total_bytes / MIN_STORED_ACCOUNT_BYTES).min(MAX_OWNER_MAP_RESERVE_ACCOUNTS));
-    }
 
     let total_accounts_files_count = solana_snapshot.len();
     let accounts_files_processed = Arc::new(Mutex::new(0));
@@ -404,6 +274,7 @@ async fn process_downloaded_snapshot(
 
         let accounts_owner_map = accounts_owner_map.clone();
         let largest_accounts = largest_accounts.clone();
+        let supply_tracker = supply_tracker.clone();
 
         account_file_workers.spawn(async move {
             let start_time = Instant::now();
@@ -447,6 +318,17 @@ async fn process_downloaded_snapshot(
                         );
                     }
 
+                    // Seed only stake accounts into the supply pinned set, so the
+                    // epoch reward burst is all hits. No-op when supply is off.
+                    if account.owner == &STAKE_PROGRAM_ID {
+                        supply_tracker.seed_stake_account(
+                            *account.pubkey(),
+                            account.lamports,
+                            account_file_slot,
+                            write_version,
+                        );
+                    }
+
                     if !programs_include.is_empty() {
                         if !programs_include.contains(account.owner) {
                             return;
@@ -458,14 +340,9 @@ async fn process_downloaded_snapshot(
                     let pubkey = account.pubkey.to_bytes().to_vec();
                     let owner = account.owner.to_bytes().to_vec();
 
-                    // Zero-lamport entries stay in the map as tombstones until
-                    // `remove_zero_lamport_entries` runs after the bootstrap.
-                    accounts_owner_map.upsert_account_with_lamports(
-                        &pubkey,
-                        &owner,
-                        account_file_slot,
-                        account.lamports,
-                    );
+                    // Records the owner for the owner-map nodes; a no-op with the
+                    // owner map off, which is the supply node's configuration.
+                    accounts_owner_map.upsert_account(&pubkey, &owner, account_file_slot);
 
                     let account_update = SubscribeUpdateAccount {
                         account: Some(SubscribeUpdateAccountInfo {

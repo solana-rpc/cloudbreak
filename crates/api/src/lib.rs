@@ -139,7 +139,7 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
         );
     }
 
-    let supply_enabled = config.supply_enabled;
+    let supply_enabled = config.supply_enabled();
     let supply_cache: supply_cache::SharedSupplySnapshot = Arc::default();
     if supply_enabled {
         match supply_cache::load_latest_supply(&database).await {

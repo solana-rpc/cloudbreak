@@ -23,6 +23,7 @@ mod m20260709_000000_add_block_height_to_recent_blockhashes;
 mod m20260711_000000_create_index_patterns_table;
 mod m20260717_000000_create_supply_tables;
 mod m20260808_000000_largest_accounts_record;
+mod m20260904_000000_stake_owner_index;
 
 pub struct Migrator;
 
@@ -46,6 +47,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260711_000000_create_index_patterns_table::Migration),
             Box::new(m20260717_000000_create_supply_tables::Migration),
             Box::new(m20260808_000000_largest_accounts_record::Migration),
+            Box::new(m20260904_000000_stake_owner_index::Migration),
         ]
     }
 }

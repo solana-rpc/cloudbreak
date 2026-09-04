@@ -8,15 +8,8 @@ use std::{
     time::Duration,
 };
 
-use cloudbreak_core::{
-    IndexConfig,
-    modules::{
-        account_owner_map::AccountOwnerMap,
-        supply_tracker::{SUPPLY_RING_SLOTS, SupplyCommit},
-    },
-};
+use cloudbreak_core::{IndexConfig, modules::account_owner_map::AccountOwnerMap};
 use cloudbreak_entity::{accounts, slots};
-use rust_decimal::Decimal;
 use sea_orm::{
     ActiveValue::Set,
     ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait,
@@ -70,7 +63,6 @@ pub fn insert_closed_accounts(
     slot: u64,
     config: &IndexConfig,
     accounts_owner_map: AccountOwnerMap,
-    defer_map_removals: bool,
 ) -> Option<JoinHandle<bool>> {
     let query_timeout = Duration::from_secs(config.database.save_block_queries_timeout);
 
@@ -81,9 +73,7 @@ pub fn insert_closed_accounts(
         let mut inserted = true;
 
         if accounts_owner_map.is_enabled() {
-            let result = accounts_owner_map
-                .save_closed_accounts(pubkeys, slot, defer_map_removals)
-                .await;
+            let result = accounts_owner_map.save_closed_accounts(pubkeys, slot).await;
             match result {
                 Ok(res) => {
                     tracing::debug!("saved {} closed accounts", res.rows_affected());
@@ -409,43 +399,6 @@ pub async fn insert_recent_blockhash(
     }
 }
 
-/// Upserts the running supply total into the `supply` ring and prunes rows older
-/// than the retained window.
-pub async fn upsert_supply_row(
-    db: &DatabaseConnection,
-    commit: &SupplyCommit,
-    config: &IndexConfig,
-) {
-    let query_timeout = Duration::from_secs(config.database.save_block_queries_timeout);
-    let supply = Statement::from_sql_and_values(
-        DatabaseBackend::Postgres,
-        "WITH upsert AS ( \
-            INSERT INTO supply (slot, total, non_circulating_lamports) VALUES ($1, $2, $3) \
-            ON CONFLICT (slot) DO UPDATE SET \
-                total = EXCLUDED.total, \
-                non_circulating_lamports = EXCLUDED.non_circulating_lamports, \
-                updated_at = now() \
-         ) \
-         DELETE FROM supply WHERE slot < $4",
-        [
-            Value::from(commit.slot as i64),
-            Value::from(Decimal::from(commit.total)),
-            Value::from(commit.non_circulating.map(Decimal::from)),
-            Value::from(commit.slot.saturating_sub(SUPPLY_RING_SLOTS) as i64),
-        ],
-    );
-    let result = timeout(query_timeout, db.execute(supply))
-        .await
-        .unwrap_or_else(|elapsed| {
-            tracing::error!("upsert_supply_row timeout ERROR: {}", elapsed);
-            Err(sea_orm::DbErr::RecordNotInserted)
-        });
-
-    if let Err(e) = result {
-        tracing::error!("upsert_supply_row failed for slot {}: {}", commit.slot, e);
-        metrics::SUPPLY_QUERY_ERRORS.inc();
-    }
-}
 
 /// The latest persisted slot for each commitment level, plus the finalized→confirmed lag.
 ///

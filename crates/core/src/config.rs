@@ -458,11 +458,47 @@ pub struct IndexConfig {
     #[serde(default)]
     #[serde(rename = "accounts-owner-map-enabled")]
     pub accounts_owner_map_enabled: bool,
+    /// getSupply with the hot-accounts cache. Requires the owner map off, owner
+    /// partitioning off, a snapshot section, and an empty programs filter.
     #[serde(default)]
-    #[serde(rename = "supply-tracker-enabled")]
-    pub supply_tracker_enabled: bool,
+    pub supply: Option<SupplyConfig>,
     #[serde(rename = "largest-accounts")]
     pub largest_accounts: Option<LargestAccountsConfig>,
+}
+
+/// The `[supply]` section. Enabled by presence with `enabled = true`.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct SupplyConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Unpinned accounts kept resident in the hot-accounts map. About 64 bytes
+    /// each, plus every stake account when `pin-stake-accounts` is on.
+    #[serde(rename = "hot-accounts", default = "SupplyConfig::default_hot_accounts")]
+    pub hot_accounts: usize,
+    /// Keep every stake account resident so epoch rewards are cache hits.
+    #[serde(rename = "pin-stake-accounts", default = "default_true")]
+    pub pin_stake_accounts: bool,
+}
+
+impl SupplyConfig {
+    const fn default_hot_accounts() -> usize {
+        1_000_000
+    }
+}
+
+/// The uniform API gate for an optional method: only `enabled`, room to grow.
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct MethodSection {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl MethodSection {
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -525,6 +561,10 @@ impl IndexConfig {
         self.largest_accounts
             .as_ref()
             .is_some_and(|largest_accounts| largest_accounts.enabled)
+    }
+
+    pub fn supply_enabled(&self) -> bool {
+        self.supply.as_ref().is_some_and(|supply| supply.enabled)
     }
 }
 
@@ -711,10 +751,10 @@ pub struct ApiConfig {
     pub gpa_cache: Option<GpaCacheConfig>,
     #[serde(rename = "genesis-hash", default = "ApiConfig::default_genesis_hash")]
     pub genesis_hash: String,
-    /// Serves getSupply from the supply ring. Set it together with the
-    /// indexer's `supply-tracker-enabled`.
-    #[serde(rename = "supply-enabled", default)]
-    pub supply_enabled: bool,
+    /// Serves getSupply from the supply ring. Set it together with the indexer's
+    /// `[supply]` section.
+    #[serde(default)]
+    pub supply: Option<MethodSection>,
 }
 
 /// Config for the `cache` optional module for the API.
@@ -1349,6 +1389,10 @@ impl ApiConfig {
         ))
         .expect("error getting endpoint")
     }
+
+    pub fn supply_enabled(&self) -> bool {
+        self.supply.as_ref().is_some_and(|supply| supply.enabled)
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -1493,6 +1537,10 @@ pub struct MigrationPgIndexesConfig {
     pub idx_accounts_token_owner: bool,
     #[serde(default = "default_true")]
     pub idx_accounts_token_delegate: bool,
+    /// Partial index on stake-owned rows for the getSupply non-circulating stake
+    /// scan. Opt-in: only the supply node needs it. Default false.
+    #[serde(default)]
+    pub idx_accounts_stake_owner: bool,
 }
 
 impl Default for MigrationPgIndexesConfig {
@@ -1503,6 +1551,7 @@ impl Default for MigrationPgIndexesConfig {
             idx_accounts_token_mint: true,
             idx_accounts_token_owner: true,
             idx_accounts_token_delegate: true,
+            idx_accounts_stake_owner: false,
         }
     }
 }
@@ -1524,6 +1573,10 @@ pub struct SnapshotPgIndexesConfig {
     pub idx_snapshot_accounts_token_owner: bool,
     #[serde(default = "default_true")]
     pub idx_snapshot_accounts_token_delegate: bool,
+    /// Partial index on stake-owned rows for the getSupply non-circulating stake
+    /// scan. Opt-in: only the supply node needs it. Default false.
+    #[serde(default)]
+    pub idx_snapshot_accounts_stake_owner: bool,
 }
 
 impl Default for SnapshotPgIndexesConfig {
@@ -1534,6 +1587,7 @@ impl Default for SnapshotPgIndexesConfig {
             idx_snapshot_accounts_token_mint: true,
             idx_snapshot_accounts_token_owner: true,
             idx_snapshot_accounts_token_delegate: true,
+            idx_snapshot_accounts_stake_owner: false,
         }
     }
 }
