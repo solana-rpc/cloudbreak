@@ -83,7 +83,10 @@ pub async fn run(args: &Args) -> Result<()> {
         failures.push("no holders returned".to_string());
     }
     if rows.len() > 20 {
-        failures.push(format!("returned {} holders, expected at most 20", rows.len()));
+        failures.push(format!(
+            "returned {} holders, expected at most 20",
+            rows.len()
+        ));
     }
 
     let mut seen = HashSet::new();
@@ -114,9 +117,15 @@ pub async fn run(args: &Args) -> Result<()> {
     let mut exact = 0usize;
     let mut drifted = 0usize;
     for row in &rows {
-        let info = get_token_account(&client, &args.rpc, &args.rpc_name, &row.address, &args.commitment)
-            .await
-            .with_context(|| format!("getAccountInfo {}", row.address))?;
+        let info = get_token_account(
+            &client,
+            &args.rpc,
+            &args.rpc_name,
+            &row.address,
+            &args.commitment,
+        )
+        .await
+        .with_context(|| format!("getAccountInfo {}", row.address))?;
         match info {
             None => failures.push(format!("{} not found by getAccountInfo", row.address)),
             Some(info) => {
@@ -178,7 +187,10 @@ struct TokenAccount {
 
 fn parse_rows(response: &JsonValue) -> Result<Vec<Row>> {
     if let Some(err) = response.get("error") {
-        return Err(anyhow!("RPC error: {}", serde_json::to_string(err).unwrap_or_default()));
+        return Err(anyhow!(
+            "RPC error: {}",
+            serde_json::to_string(err).unwrap_or_default()
+        ));
     }
     let array = response
         .get("result")
@@ -203,7 +215,11 @@ fn parse_rows(response: &JsonValue) -> Result<Vec<Row>> {
                 .get("decimals")
                 .and_then(|d| d.as_u64())
                 .ok_or_else(|| anyhow!("missing decimals"))?;
-            Ok(Row { address, amount, decimals })
+            Ok(Row {
+                address,
+                amount,
+                decimals,
+            })
         })
         .collect()
 }
@@ -247,7 +263,11 @@ async fn get_token_account(
         .and_then(|a| a.as_str())
         .and_then(|a| a.parse::<u64>().ok())
         .ok_or_else(|| anyhow!("missing tokenAmount.amount"))?;
-    Ok(Some(TokenAccount { mint, owner, amount }))
+    Ok(Some(TokenAccount {
+        mint,
+        owner,
+        amount,
+    }))
 }
 
 async fn call(

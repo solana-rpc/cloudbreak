@@ -1260,7 +1260,17 @@ checksum = "4bd8b9603c7aa97359dbd97ecf258968c95f3adddd6db2f7e7a5bef101c84560"
 dependencies = [
  "alloc-no-stdlib",
  "alloc-stdlib",
- "brotli-decompressor",
+ "brotli-decompressor 5.0.0",
+]
+
+[[package]]
+name = "brotli-decompressor"
+version = "4.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a334ef7c9e23abf0ce748e8cd309037da93e606ad52eb372e4ce327a0dcfbdfd"
+dependencies = [
+ "alloc-no-stdlib",
+ "alloc-stdlib",
 ]
 
 [[package]]
@@ -1521,6 +1531,17 @@ name = "clap_lex"
 version = "0.7.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3e64b0cc0439b12df2fa678eae89a1c56a529fd067a9115f7827f1fffd22b32"
+
+[[package]]
+name = "clmm_liquidity_check"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "bs58",
+ "serde",
+ "serde_json",
+ "ureq",
+]
 
 [[package]]
 name = "cloudbreak"
@@ -3558,21 +3579,28 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "blake3",
  "bs58",
  "chrono",
  "clap",
+ "clmm_liquidity_check",
  "futures",
+ "futures-util",
  "hex",
  "rand 0.8.5",
  "reqwest",
+ "rustls",
  "sea-orm",
  "serde",
  "serde_json",
  "solana-pubkey 4.2.1",
  "tokio",
+ "tokio-util",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "yellowstone-grpc-client",
+ "yellowstone-grpc-proto",
  "zstd",
 ]
 
@@ -10358,6 +10386,23 @@ name = "unwrap_none"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "461d0c5956fcc728ecc03a3a961e4adc9a7975d86f6f8371389a289517c02ca9"
+
+[[package]]
+name = "ureq"
+version = "2.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "02d1a66277ed75f640d608235660df48c8e3c19f3b4edb6a263315626cc3c01d"
+dependencies = [
+ "base64 0.22.1",
+ "brotli-decompressor 4.0.3",
+ "flate2",
+ "log",
+ "once_cell",
+ "rustls",
+ "rustls-pki-types",
+ "url",
+ "webpki-roots 0.26.11",
+]
 
 [[package]]
 name = "uriparse"

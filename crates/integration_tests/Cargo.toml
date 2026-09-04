@@ -18,7 +18,7 @@ authors = [
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 tokio = { workspace = true }
-reqwest = { workspace = true, features = ["json"] }
+reqwest = { workspace = true, features = ["json", "stream"] }
 serde = { workspace = true }
 serde_json = "1"
 futures = { workspace = true }
@@ -34,3 +34,10 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 rand = { workspace = true }
 zstd = { workspace = true }
 base64 = { workspace = true }
+blake3 = "1"
+clmm_liquidity_check = { path = "../clmm_liquidity_check" }
+rustls = { workspace = true }
+tokio-util = { version = "0.7", features = ["io", "io-util"] }
+futures-util = "0.3"
+yellowstone-grpc-client = { workspace = true }
+yellowstone-grpc-proto = { workspace = true }

@@ -65,15 +65,15 @@ pub fn get_body_query(
         RequestType::GpaTokenMint => format!(
             "query={time_filter}rpc_call:=\"getProgramAccounts\" {encoding_filter} AND b_end:~\"liquid-tokenmint\" AND body:~\"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA|TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb\" AND body:~`memcmp.*offset.:\\s*0` | limit {limit}"
         ),
-        RequestType::GetAccountInfo => format!(
-            "query={time_filter}rpc_call:=\"getAccountInfo\"{pool_filter} | limit {limit}"
-        ),
+        RequestType::GetAccountInfo => {
+            format!("query={time_filter}rpc_call:=\"getAccountInfo\"{pool_filter} | limit {limit}")
+        }
         RequestType::GetMultipleAccounts => format!(
             "query={time_filter}rpc_call:=\"getMultipleAccounts\"{pool_filter} | limit {limit}"
         ),
-        RequestType::GetBalance => format!(
-            "query={time_filter}rpc_call:=\"getBalance\"{pool_filter} | limit {limit}"
-        ),
+        RequestType::GetBalance => {
+            format!("query={time_filter}rpc_call:=\"getBalance\"{pool_filter} | limit {limit}")
+        }
         RequestType::GetTokenAccountBalance => format!(
             "query={time_filter}rpc_call:=\"getTokenAccountBalance\"{pool_filter} | limit {limit}"
         ),

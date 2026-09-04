@@ -17,7 +17,10 @@ use crate::utils;
 /// its params object (creates the object if needed). This is necessary for GPA
 /// requests that were originally sent without context, so that slot compensation
 /// can work on the re-run.
-pub fn load_requests(dir: &str, inject_context: bool) -> Result<watch::Receiver<Vec<BenchRequest>>> {
+pub fn load_requests(
+    dir: &str,
+    inject_context: bool,
+) -> Result<watch::Receiver<Vec<BenchRequest>>> {
     let entries: Vec<_> = std::fs::read_dir(dir)
         .with_context(|| format!("Failed to read mismatch directory: {dir}"))?
         .filter_map(|e| e.ok())
@@ -66,4 +69,3 @@ pub fn load_requests(dir: &str, inject_context: bool) -> Result<watch::Receiver<
     let (_tx, rx) = watch::channel(requests);
     Ok(rx)
 }
-

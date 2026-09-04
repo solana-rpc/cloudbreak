@@ -10,6 +10,7 @@ mod benchmark;
 mod compare_accounts_by_mint;
 mod compare_accounts_by_mint_vs_cluster;
 mod compare_genesis_hash;
+mod compare_gpa_streaming;
 mod compare_largest_accounts;
 mod compare_program_accounts;
 mod compare_token_largest_accounts;
@@ -18,9 +19,11 @@ mod compare_vote_accounts;
 mod config;
 mod db_check;
 mod get_slot;
+mod geyser_check;
 mod logging;
 mod response_comparison;
 mod sources;
+mod streaming_gpa;
 mod utils;
 
 #[derive(Parser)]
@@ -37,6 +40,9 @@ enum Commands {
     Benchmark(config::BenchmarkArgs),
     /// Compare getProgramAccounts responses (legacy)
     Compare(compare_program_accounts::Args),
+    /// Compare a huge getProgramAccounts response by streaming both endpoints
+    /// and reducing each account to a digest — never buffers the responses
+    CompareGpaStreaming(compare_gpa_streaming::Args),
     /// Compare getVoteAccounts activatedStake against an upstream RPC
     CompareVoteAccounts(compare_vote_accounts::Args),
     /// Compare getTokenAccountsByMint (cloudbreak) against getProgramAccounts + mint memcmp (source of truth)
@@ -64,6 +70,7 @@ async fn main() -> anyhow::Result<()> {
     // before the subscriber is installed (see `logging::init_tracing`).
     match cli.command {
         Commands::Compare(args) => compare_program_accounts::run(&args).await?,
+        Commands::CompareGpaStreaming(args) => compare_gpa_streaming::run(&args).await?,
         Commands::CompareVoteAccounts(args) => compare_vote_accounts::run(&args).await?,
         Commands::CompareAccountsByMint(args) => compare_accounts_by_mint::run(&args).await?,
         Commands::CompareAccountsByMintVsCluster(args) => {

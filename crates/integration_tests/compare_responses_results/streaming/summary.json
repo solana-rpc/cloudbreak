@@ -1,0 +1,27 @@
+{
+  "mismatch_reports": [],
+  "rounds": [
+    {
+      "at": "2026-09-04T13:35:05Z",
+      "detail": {
+        "attempts": 1
+      },
+      "elapsed_secs": 55.9,
+      "outcome": "slot_exhausted",
+      "round": 1
+    }
+  ],
+  "started_at": "2026-09-04T13:34:09Z",
+  "totals": {
+    "clmm_both": 0,
+    "clmm_clean": 0,
+    "clmm_rpc1_only": 0,
+    "clmm_rpc2_only": 0,
+    "endpoint_error": 0,
+    "matched": 0,
+    "mismatched": 0,
+    "rounds": 1,
+    "slot_exhausted": 1
+  },
+  "updated_at": "2026-09-04T13:35:05Z"
+}

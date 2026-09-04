@@ -34,6 +34,8 @@ pub struct Config {
     pub comparison: Option<ComparisonConfig>,
     #[serde(default)]
     pub db_check: Option<DbCheckConfig>,
+    #[serde(default)]
+    pub geyser_check: Option<GeyserCheckConfig>,
     pub print_config: PrintConfig,
     #[serde(default)]
     pub retry_in_place: RetryInPlaceConfig,
@@ -48,6 +50,34 @@ pub struct DbCheckConfig {
     /// account to find the slot of its last transaction — the Agave source of truth.
     #[serde(default)]
     pub get_last_signature: bool,
+}
+
+/// Cross-checks mismatched accounts against the Yellowstone Geyser stream the
+/// indexer consumes. The subscription mirrors the indexer's exactly (whole
+/// blocks at Confirmed); only accounts owned by `program` are retained.
+#[derive(Deserialize, Debug, Clone)]
+pub struct GeyserCheckConfig {
+    /// Must be the same Yellowstone endpoint the indexer behind rpc1 consumes,
+    /// otherwise the comparison proves nothing.
+    pub endpoint: String,
+    #[serde(default)]
+    pub x_token: Option<String>,
+    /// Owner program whose accounts are tracked, base58.
+    pub program: String,
+    #[serde(default = "defaults::geyser_history_size")]
+    pub history_size: usize,
+    #[serde(default = "defaults::geyser_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Agave RPC used for the `getBlock` ledger cross-check. Omit to classify
+    /// from the Geyser history alone.
+    #[serde(default)]
+    pub rpc_url: Option<String>,
+    #[serde(default)]
+    pub verify_with_get_block: bool,
+    /// Upper bound on `getBlock` calls per mismatch. Blocks are several MB, so
+    /// this caps both bandwidth and the load on the oracle node.
+    #[serde(default = "defaults::geyser_max_blocks_per_mismatch")]
+    pub max_blocks_per_mismatch: usize,
 }
 
 #[derive(Deserialize, Debug)]
@@ -136,6 +166,20 @@ impl SourceConfig {
     }
 }
 
+/// The subset `compare-gpa-streaming` reads. Declared separately from `Config`
+/// so a deployment does not have to carry `[benchmark]` and `[source]` sections
+/// that the streaming comparison never looks at. A full `Config` file still
+/// parses as one, since unknown sections are ignored.
+#[derive(Deserialize, Debug)]
+pub struct StreamingConfig {
+    pub rpc1: RpcEndpoint,
+    pub rpc2: Option<RpcEndpoint>,
+    #[serde(default)]
+    pub geyser_check: Option<GeyserCheckConfig>,
+    #[serde(default)]
+    pub print_config: PrintConfig,
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct ComparisonConfig {
     /// Fraction of requests also sent to rpc2 for correctness checking (0.0 to 1.0)
@@ -190,6 +234,15 @@ pub struct ComparisonConfig {
 mod defaults {
     pub fn max_in_flight() -> usize {
         100
+    }
+    pub fn geyser_history_size() -> usize {
+        500
+    }
+    pub fn geyser_timeout_secs() -> u64 {
+        30
+    }
+    pub fn geyser_max_blocks_per_mismatch() -> usize {
+        6
     }
     pub fn timeout_secs() -> u64 {
         30
@@ -257,7 +310,7 @@ pub struct RetryInPlaceConfig {
     pub save_rescued: bool,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, Default)]
 pub struct PrintConfig {
     pub min_request_bytes: u64,
     pub min_request_duration_ms: u64,
@@ -296,6 +349,10 @@ pub struct PrintConfig {
     /// lacked `result.context` so slot lag can't be verified or compensated for.
     #[serde(default)]
     pub log_no_context_mismatches: bool,
+    /// `bench_geyser_check` — 🛰 per-account verdicts from the Geyser
+    /// cross-check. Only fires when `[geyser_check]` is configured.
+    #[serde(default)]
+    pub log_geyser_check: bool,
     /// `bench_compare::error` — 💥 / 💥💥 one or both endpoints returned an
     /// error in the comparison.
     #[serde(default)]
@@ -303,4 +360,71 @@ pub struct PrintConfig {
     /// `bench_request` — per-rpc1 line (also subject to the `min_*` thresholds).
     #[serde(default)]
     pub log_individual_requests: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The versioned example config must keep parsing. `cloudbreak.*.toml` is
+    /// gitignored, so this is the only config CI can check.
+    #[test]
+    fn example_config_parses() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example.cloudbreak.integration_tests.toml"
+        );
+        let content = std::fs::read_to_string(path).expect("example config is readable");
+        toml::from_str::<Config>(&content).expect("example config parses");
+    }
+
+    /// A deployment only needs the sections the streaming comparison reads —
+    /// no `[benchmark]`, no `[source]`.
+    #[test]
+    fn streaming_config_needs_only_its_own_sections() {
+        let config: StreamingConfig = toml::from_str(
+            r#"
+            [rpc1]
+            url = "http://cb:8899"
+            name = "Cloudbreak"
+            [rpc2]
+            url = "http://agave:8899"
+            name = "Agave"
+            "#,
+        )
+        .expect("minimal streaming config parses");
+
+        assert_eq!(config.rpc1.name, "Cloudbreak");
+        assert_eq!(config.rpc2.expect("rpc2").name, "Agave");
+        assert!(config.geyser_check.is_none());
+    }
+
+    /// A full benchmark config still works, so one file can drive both.
+    #[test]
+    fn streaming_config_ignores_the_benchmark_sections() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example.cloudbreak.integration_tests.toml"
+        );
+        let content = std::fs::read_to_string(path).expect("example config is readable");
+        toml::from_str::<StreamingConfig>(&content).expect("full config parses as streaming");
+    }
+
+    /// Every field but `endpoint` and `program` is optional.
+    #[test]
+    fn geyser_check_defaults() {
+        let geyser: GeyserCheckConfig = toml::from_str(
+            r#"
+            endpoint = "http://localhost:10000"
+            program = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+            "#,
+        )
+        .expect("minimal geyser_check parses");
+
+        assert_eq!(geyser.history_size, 500);
+        assert_eq!(geyser.timeout_secs, 30);
+        assert_eq!(geyser.max_blocks_per_mismatch, 6);
+        assert!(geyser.rpc_url.is_none());
+        assert!(!geyser.verify_with_get_block);
+    }
 }

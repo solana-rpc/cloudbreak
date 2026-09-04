@@ -6,7 +6,9 @@ use crate::config::RpcEndpoint;
 
 #[derive(Parser, Debug)]
 #[command(name = "compare_vote_accounts")]
-#[command(about = "Compare getVoteAccounts activatedStake between cloudbreak (rpc1) and an upstream RPC (rpc2)")]
+#[command(
+    about = "Compare getVoteAccounts activatedStake between cloudbreak (rpc1) and an upstream RPC (rpc2)"
+)]
 pub struct Args {
     /// Path to the config file
     #[arg(short = 'c', long, default_value = "cloudbreak.integration_tests.toml")]
@@ -77,7 +79,12 @@ pub async fn run(args: &Args) -> Result<(), anyhow::Error> {
     };
     println!("total diff = {diff} ({:.4}%)", frac * 100.0);
 
-    let mut keys: Vec<&String> = stakes1.keys().chain(stakes2.keys()).collect::<HashSet<_>>().into_iter().collect();
+    let mut keys: Vec<&String> = stakes1
+        .keys()
+        .chain(stakes2.keys())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
     keys.sort();
 
     let mut mismatches: Vec<(&String, u64, u64)> = keys
@@ -107,7 +114,10 @@ pub async fn run(args: &Args) -> Result<(), anyhow::Error> {
             args.tolerance * 100.0
         );
     }
-    println!("PASS: total activatedStake within {:.4}% tolerance", args.tolerance * 100.0);
+    println!(
+        "PASS: total activatedStake within {:.4}% tolerance",
+        args.tolerance * 100.0
+    );
     Ok(())
 }
 

@@ -51,14 +51,8 @@ pub async fn run(args: &Args) -> Result<()> {
     let (hash1, dur1) = r1?;
     let (hash2, dur2) = r2?;
 
-    println!(
-        "{:<12} {:>5}ms  {}",
-        args.rpc1_name, dur1, hash1
-    );
-    println!(
-        "{:<12} {:>5}ms  {}",
-        args.rpc2_name, dur2, hash2
-    );
+    println!("{:<12} {:>5}ms  {}", args.rpc1_name, dur1, hash1);
+    println!("{:<12} {:>5}ms  {}", args.rpc2_name, dur2, hash2);
 
     if hash1 == hash2 {
         println!("\nMATCH genesis hash is identical");
@@ -66,7 +60,10 @@ pub async fn run(args: &Args) -> Result<()> {
     } else {
         Err(anyhow!(
             "MISMATCH: {} returned {:?}, {} returned {:?}",
-            args.rpc1_name, hash1, args.rpc2_name, hash2
+            args.rpc1_name,
+            hash1,
+            args.rpc2_name,
+            hash2
         ))
     }
 }

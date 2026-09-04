@@ -12,6 +12,7 @@ use crate::{
 use anyhow::{Context, Result};
 use chrono::SecondsFormat;
 use serde_json::Value as JsonValue;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -194,6 +195,78 @@ pub fn extract_encoding_from_request(request: &JsonValue, request_type: RequestT
     }
 }
 
+/// How a single account differs between the two endpoints' responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffKind {
+    /// Both endpoints returned the account, with different contents.
+    DataMismatch,
+    /// Only rpc1 returned the account.
+    OnlyRpc1,
+    /// Only rpc2 returned the account.
+    OnlyRpc2,
+}
+
+/// One differing account, with whichever side(s) returned it.
+#[derive(Debug, Clone)]
+pub struct AccountDiff {
+    pub pubkey: String,
+    pub kind: DiffKind,
+    pub account1: Option<JsonValue>,
+    pub account2: Option<JsonValue>,
+}
+
+/// Diffs two `{pubkey, account}`-array responses by pubkey.
+///
+/// Returns `None` when either response is not such an array — the caller has
+/// nothing per-account to report. An empty `Vec` means the two agree.
+pub fn diff_accounts(response1: &JsonValue, response2: &JsonValue) -> Option<Vec<AccountDiff>> {
+    let index = |response: &JsonValue| -> Option<HashMap<String, JsonValue>> {
+        Some(
+            get_accounts(response)?
+                .iter()
+                .filter_map(|item| {
+                    let pubkey = item.get("pubkey")?.as_str()?.to_string();
+                    Some((pubkey, item.get("account")?.clone()))
+                })
+                .collect(),
+        )
+    };
+
+    let map1 = index(response1)?;
+    let map2 = index(response2)?;
+
+    let mut diffs = Vec::new();
+    for (pubkey, account1) in &map1 {
+        match map2.get(pubkey) {
+            Some(account2) if account1 != account2 => diffs.push(AccountDiff {
+                pubkey: pubkey.clone(),
+                kind: DiffKind::DataMismatch,
+                account1: Some(account1.clone()),
+                account2: Some(account2.clone()),
+            }),
+            None => diffs.push(AccountDiff {
+                pubkey: pubkey.clone(),
+                kind: DiffKind::OnlyRpc1,
+                account1: Some(account1.clone()),
+                account2: None,
+            }),
+            _ => {}
+        }
+    }
+    for (pubkey, account2) in &map2 {
+        if !map1.contains_key(pubkey) {
+            diffs.push(AccountDiff {
+                pubkey: pubkey.clone(),
+                kind: DiffKind::OnlyRpc2,
+                account1: None,
+                account2: Some(account2.clone()),
+            });
+        }
+    }
+
+    Some(diffs)
+}
+
 /// Borrowed view of one retry attempt suitable for saving into a mismatch file.
 pub struct SavedRetry<'a> {
     pub response_comparison: &'a ReponseComparison,
@@ -338,6 +411,7 @@ pub fn save_responses_diff_to_file_with_retry(
     original_context_matches: bool,
     original_iterations: Option<&[IterationCapture]>,
     retry: Option<SavedRetry<'_>>,
+    geyser_probe: Option<JsonValue>,
 ) -> Result<()> {
     let mut original_block = serde_json::json!({
         "context_matches": original_context_matches,
@@ -358,6 +432,11 @@ pub fn save_responses_diff_to_file_with_retry(
             rpc2.name.clone(): original.response2.clone(),
         },
     });
+    if let Some(probe) = geyser_probe
+        && let Some(obj) = original_block.as_object_mut()
+    {
+        obj.insert("geyser_probe".to_string(), probe);
+    }
     if let Some(iters) = original_iterations
         && let Some(obj) = original_block.as_object_mut()
     {
@@ -539,8 +618,18 @@ pub fn print_compare_responses_result_with_retry(
     let d1 = original_comparison.duration1;
     let d2 = original_comparison.duration2;
 
-    let rpc1_info = format!("{} ({:.2}KB {}ms)", rpc1.name, orig_size1 as f64 / 1024.0, d1);
-    let rpc2_info = format!("{} ({:.2}KB {}ms)", rpc2.name, orig_size2 as f64 / 1024.0, d2);
+    let rpc1_info = format!(
+        "{} ({:.2}KB {}ms)",
+        rpc1.name,
+        orig_size1 as f64 / 1024.0,
+        d1
+    );
+    let rpc2_info = format!(
+        "{} ({:.2}KB {}ms)",
+        rpc2.name,
+        orig_size2 as f64 / 1024.0,
+        d2
+    );
 
     let original_matched = original_result.matches;
     let retry_matched = retry.compare_result.matches;
@@ -793,8 +882,8 @@ pub fn maybe_print_sample(
         "❌"
     };
 
-    let request_pretty = serde_json::to_string_pretty(request)
-        .unwrap_or_else(|_| request.to_string());
+    let request_pretty =
+        serde_json::to_string_pretty(request).unwrap_or_else(|_| request.to_string());
     let response1_pretty = serde_json::to_string_pretty(&response_comparison.response1)
         .unwrap_or_else(|_| response_comparison.response1.to_string());
     let response2_pretty = serde_json::to_string_pretty(&response_comparison.response2)

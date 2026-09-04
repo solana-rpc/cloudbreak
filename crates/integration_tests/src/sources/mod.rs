@@ -135,8 +135,7 @@ pub async fn load_requests_from_source(
                     .await
                     {
                         Ok(new_requests) => {
-                            let new_requests =
-                                retain_unseen(new_requests, &mut seen, replay_once);
+                            let new_requests = retain_unseen(new_requests, &mut seen, replay_once);
                             if replay_once && new_requests.is_empty() {
                                 continue;
                             }

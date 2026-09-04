@@ -67,7 +67,9 @@ pub async fn run(args: &Args) -> Result<()> {
     } else {
         Err(anyhow!(
             "MISMATCH: {} returned {:?} which does not contain {:?}",
-            args.rpc1_name, v1, expected_substring
+            args.rpc1_name,
+            v1,
+            expected_substring
         ))
     }
 }

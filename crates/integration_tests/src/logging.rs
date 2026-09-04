@@ -15,8 +15,8 @@
 //! a directive targeting `bench_compare::match` will override a less specific
 //! `bench_compare=info` from `RUST_LOG` for events whose target is exactly
 //! `bench_compare::match`.
-use tracing_subscriber::filter::Directive;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::Directive;
 
 use crate::config::PrintConfig;
 
@@ -61,6 +61,9 @@ pub fn directives_for_print_config(cfg: &PrintConfig) -> Vec<Directive> {
     if !cfg.log_compare_errors {
         out.push(parse("bench_compare::error=off"));
     }
+    if !cfg.log_geyser_check {
+        out.push(parse("bench_geyser_check=off"));
+    }
     if !cfg.log_individual_requests {
         out.push(parse("bench_request=off"));
     }
@@ -92,9 +95,10 @@ mod tests {
             log_rescues: false,
             log_no_context_mismatches: false,
             log_compare_errors: false,
+            log_geyser_check: false,
             log_individual_requests: false,
         };
         let directives = directives_for_print_config(&cfg);
-        assert_eq!(directives.len(), 6);
+        assert_eq!(directives.len(), 7);
     }
 }

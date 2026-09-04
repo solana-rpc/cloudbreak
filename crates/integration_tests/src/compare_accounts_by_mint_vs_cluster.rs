@@ -84,16 +84,25 @@ pub async fn run(args: &Args) -> Result<()> {
 
     let cloudbreak_pubkeys = extract_accounts_by_mint_pubkeys(&cloudbreak_json)
         .with_context(|| format!("Parsing {} getTokenAccountsByMint response", args.rpc1_name))?;
-    let cluster_top: Vec<String> = extract_token_largest_addresses(&cluster_json)
-        .with_context(|| format!("Parsing {} getTokenLargestAccounts response", args.rpc2_name))?;
+    let cluster_top: Vec<String> =
+        extract_token_largest_addresses(&cluster_json).with_context(|| {
+            format!(
+                "Parsing {} getTokenLargestAccounts response",
+                args.rpc2_name
+            )
+        })?;
 
     println!(
         "{:<12} {:>5}ms  {} pubkeys from getTokenAccountsByMint",
-        args.rpc1_name, dur1, cloudbreak_pubkeys.len()
+        args.rpc1_name,
+        dur1,
+        cloudbreak_pubkeys.len()
     );
     println!(
         "{:<12} {:>5}ms  {} top addresses from getTokenLargestAccounts",
-        args.rpc2_name, dur2, cluster_top.len()
+        args.rpc2_name,
+        dur2,
+        cluster_top.len()
     );
 
     let missing: Vec<&String> = cluster_top
@@ -104,7 +113,8 @@ pub async fn run(args: &Args) -> Result<()> {
     if missing.is_empty() {
         println!(
             "\nMATCH all {} cluster top-holder addresses are present in {} result",
-            cluster_top.len(), args.rpc1_name
+            cluster_top.len(),
+            args.rpc1_name
         );
         Ok(())
     } else {
@@ -133,7 +143,11 @@ fn extract_accounts_by_mint_pubkeys(response: &JsonValue) -> Result<HashSet<Stri
 
     Ok(array
         .iter()
-        .filter_map(|item| item.get("pubkey").and_then(|p| p.as_str()).map(String::from))
+        .filter_map(|item| {
+            item.get("pubkey")
+                .and_then(|p| p.as_str())
+                .map(String::from)
+        })
         .collect())
 }
 
@@ -152,7 +166,11 @@ fn extract_token_largest_addresses(response: &JsonValue) -> Result<Vec<String>> 
 
     Ok(array
         .iter()
-        .filter_map(|item| item.get("address").and_then(|a| a.as_str()).map(String::from))
+        .filter_map(|item| {
+            item.get("address")
+                .and_then(|a| a.as_str())
+                .map(String::from)
+        })
         .collect())
 }
 

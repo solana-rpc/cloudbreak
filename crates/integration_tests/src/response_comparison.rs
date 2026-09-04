@@ -229,11 +229,7 @@ fn token_balance_map(balances: &JsonValue) -> Option<HashMap<String, &JsonValue>
         array
             .iter()
             .map(|b| {
-                let key = format!(
-                    "{}:{}",
-                    field(b, "accountIndex"),
-                    field(b, "mint"),
-                );
+                let key = format!("{}:{}", field(b, "accountIndex"), field(b, "mint"),);
                 (key, b)
             })
             .collect(),
@@ -514,28 +510,16 @@ pub async fn compare_with_slot_compensation(
                     retries += 1;
 
                     let fired_at = SystemTime::now();
-                    let (r1, r2, db_probe) = join_pair_with_probe(
-                        client,
-                        rpc1,
-                        rpc2,
-                        request,
-                        db_probe_ctx,
-                        bw_meter,
-                    )
-                    .await;
+                    let (r1, r2, db_probe) =
+                        join_pair_with_probe(client, rpc1, rpc2, request, db_probe_ctx, bw_meter)
+                            .await;
 
                     if let Some(it) = iterations.as_deref_mut() {
                         it.push(IterationCapture {
                             phase: iteration_phase,
                             fired_at,
-                            rpc1: r1
-                                .as_ref()
-                                .ok()
-                                .map(|(j, d)| (j.clone(), *d)),
-                            rpc2: r2
-                                .as_ref()
-                                .ok()
-                                .map(|(j, d)| (j.clone(), *d)),
+                            rpc1: r1.as_ref().ok().map(|(j, d)| (j.clone(), *d)),
+                            rpc2: r2.as_ref().ok().map(|(j, d)| (j.clone(), *d)),
                             db_probe,
                         });
                     }

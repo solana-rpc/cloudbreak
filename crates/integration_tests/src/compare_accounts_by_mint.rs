@@ -352,8 +352,7 @@ pub async fn run(args: &Args) -> Result<()> {
         let set1: HashSet<_> = pubkeys1.iter().collect();
         let set2: HashSet<_> = pubkeys2.iter().collect();
 
-        let mut only_in_rpc1: Vec<String> =
-            set1.difference(&set2).map(|s| (*s).clone()).collect();
+        let mut only_in_rpc1: Vec<String> = set1.difference(&set2).map(|s| (*s).clone()).collect();
         only_in_rpc1.sort();
 
         let previous_only_in_rpc1: Vec<String> = std::fs::read_to_string(
@@ -385,8 +384,7 @@ pub async fn run(args: &Args) -> Result<()> {
             serde_json::to_string_pretty(&only_in_rpc1)?,
         )?;
 
-        let mut only_in_rpc2: Vec<String> =
-            set2.difference(&set1).map(|s| (*s).clone()).collect();
+        let mut only_in_rpc2: Vec<String> = set2.difference(&set1).map(|s| (*s).clone()).collect();
         only_in_rpc2.sort();
 
         println!("RPC 1 ({}):\t{} pubkeys", config.rpc1.name, pubkeys1.len());

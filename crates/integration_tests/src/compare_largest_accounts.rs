@@ -101,14 +101,21 @@ pub async fn run(args: &Args) -> Result<()> {
     let mut exact = 0usize;
     let mut drifted = 0usize;
     for row in &rows {
-        let balance = get_balance(&client, &args.rpc, &args.rpc_name, &row.address, &args.commitment)
-            .await
-            .with_context(|| format!("getBalance {}", row.address))?;
+        let balance = get_balance(
+            &client,
+            &args.rpc,
+            &args.rpc_name,
+            &row.address,
+            &args.commitment,
+        )
+        .await
+        .with_context(|| format!("getBalance {}", row.address))?;
         match balance {
             None => failures.push(format!("{} not found by getBalance", row.address)),
-            Some(0) if row.lamports > 0 => {
-                failures.push(format!("{} phantom: GLA={} balance=0", row.address, row.lamports))
-            }
+            Some(0) if row.lamports > 0 => failures.push(format!(
+                "{} phantom: GLA={} balance=0",
+                row.address, row.lamports
+            )),
             Some(b) if b == row.lamports => exact += 1,
             Some(b) => {
                 let rel = (b.abs_diff(row.lamports)) as f64 / row.lamports.max(1) as f64;
@@ -147,7 +154,10 @@ pub async fn run(args: &Args) -> Result<()> {
 
 fn parse_rows(response: &JsonValue) -> Result<Vec<Row>> {
     if let Some(err) = response.get("error") {
-        return Err(anyhow!("RPC error: {}", serde_json::to_string(err).unwrap_or_default()));
+        return Err(anyhow!(
+            "RPC error: {}",
+            serde_json::to_string(err).unwrap_or_default()
+        ));
     }
     let array = response
         .get("result")

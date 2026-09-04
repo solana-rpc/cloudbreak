@@ -77,6 +77,23 @@ mismatch_output_dir = "crates/integration_tests/compare_responses_results"
 # rpc_url = "http://localhost:8899"  # Agave RPC to query getSignaturesForAddress
 # get_last_signature = true          # Fetch last tx slot per differing account
 
+# Cross-checks each differing account against the raw Yellowstone Geyser stream.
+# The subscription mirrors the indexer's exactly — whole blocks with accounts at
+# Confirmed — so a verdict here is about cloudbreak, not about the stream. Only
+# accounts owned by `program` are kept, plus every pubkey ever seen owned by it,
+# so closes and owner changes away from the program are not lost.
+# Verdict taxonomy: crates/integration_tests/README.md
+# [geyser_check]
+# endpoint = "http://REPLACE-ME:10000"   # MUST be the same Yellowstone the rpc1 indexer consumes
+# x_token = ""                           # optional
+# program = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+# history_size = 500                     # per-pubkey ring of writes
+# timeout_secs = 30
+# # Agave RPC used as the ledger oracle. Omit to classify from Geyser alone.
+# rpc_url = "http://nyc205.rpcpool.wg:8899"
+# verify_with_get_block = true           # getBlock only for suspect accounts, only for decisive slots
+# max_blocks_per_mismatch = 6            # blocks are several MB — this caps bandwidth
+
 [print_config]
 min_request_bytes = 0
 min_request_duration_ms = 100
@@ -95,6 +112,7 @@ min_request_account_count = 0
 # log_rescues               = false   # ✅ rescued by [retry_in_place]
 # log_no_context_mismatches = false   # ⚠️ mismatch with no result.context (slot lag unknowable)
 # log_compare_errors        = false   # 💥 one or both endpoints errored
+# log_geyser_check          = false   # 🛰 per-account verdicts from [geyser_check]
 # log_individual_requests   = false  # per-rpc1 line (also gated by the min_* thresholds)
 
 # Optional: re-run a request once and only count it as a mismatch if the retry

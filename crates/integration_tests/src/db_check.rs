@@ -28,64 +28,18 @@ pub async fn check_differing_accounts(
     rpc1: &RpcEndpoint,
     rpc2: &RpcEndpoint,
 ) -> Result<()> {
-    let accounts1 = match utils::get_accounts(&response_comparison.response1) {
-        Some(a) => a,
-        None => return Ok(()),
+    let Some(diffs) = utils::diff_accounts(
+        &response_comparison.response1,
+        &response_comparison.response2,
+    ) else {
+        return Ok(());
     };
-    let accounts2 = match utils::get_accounts(&response_comparison.response2) {
-        Some(a) => a,
-        None => return Ok(()),
-    };
-
-    let map1: HashMap<&str, &JsonValue> = accounts1
-        .iter()
-        .filter_map(|item| {
-            let pubkey = item.get("pubkey")?.as_str()?;
-            let account = item.get("account")?;
-            Some((pubkey, account))
-        })
-        .collect();
-
-    let map2: HashMap<&str, &JsonValue> = accounts2
-        .iter()
-        .filter_map(|item| {
-            let pubkey = item.get("pubkey")?.as_str()?;
-            let account = item.get("account")?;
-            Some((pubkey, account))
-        })
-        .collect();
-
-    #[derive(Debug)]
-    enum DiffKind {
-        DataMismatch,
-        OnlyRpc1,
-        OnlyRpc2,
-    }
-
-    let mut diffs: Vec<(String, DiffKind)> = Vec::new();
-
-    for (pk, acc1) in &map1 {
-        match map2.get(pk) {
-            Some(acc2) if acc1 != acc2 => {
-                diffs.push((pk.to_string(), DiffKind::DataMismatch));
-            }
-            None => {
-                diffs.push((pk.to_string(), DiffKind::OnlyRpc1));
-            }
-            _ => {}
-        }
-    }
-    for pk in map2.keys() {
-        if !map1.contains_key(pk) {
-            diffs.push((pk.to_string(), DiffKind::OnlyRpc2));
-        }
-    }
 
     if diffs.is_empty() {
         return Ok(());
     }
 
-    let all_pubkeys: Vec<String> = diffs.iter().map(|(pk, _)| pk.clone()).collect();
+    let all_pubkeys: Vec<String> = diffs.iter().map(|d| d.pubkey.clone()).collect();
 
     let slot1 = utils::get_slot(&response_comparison.response1);
     let slot2 = utils::get_slot(&response_comparison.response2);
@@ -114,15 +68,15 @@ pub async fn check_differing_accounts(
 
     let response_slot = slot1.or(slot2);
 
-    let should_get_sigs =
-        db_check_config.get_last_signature && db_check_config.rpc_url.is_some();
+    let should_get_sigs = db_check_config.get_last_signature && db_check_config.rpc_url.is_some();
     let rpc_url = db_check_config.rpc_url.as_deref().unwrap_or("");
 
-    for (pk, kind) in &diffs {
-        let kind_label = match kind {
-            DiffKind::DataMismatch => "mismatched data",
-            DiffKind::OnlyRpc1 => &format!("only in {}", rpc1.name),
-            DiffKind::OnlyRpc2 => &format!("only in {}", rpc2.name),
+    for diff in &diffs {
+        let pk = &diff.pubkey;
+        let kind_label = match diff.kind {
+            utils::DiffKind::DataMismatch => "mismatched data",
+            utils::DiffKind::OnlyRpc1 => &format!("only in {}", rpc1.name),
+            utils::DiffKind::OnlyRpc2 => &format!("only in {}", rpc2.name),
         };
 
         let db_info = db_map.get(pk.as_str());
@@ -338,10 +292,7 @@ async fn get_missed_tx_slots(
 
     let latest_tx_slot = all_slots.iter().copied().max();
 
-    let mut missed_slots: Vec<u64> = all_slots
-        .into_iter()
-        .filter(|&s| s > after_slot)
-        .collect();
+    let mut missed_slots: Vec<u64> = all_slots.into_iter().filter(|&s| s > after_slot).collect();
 
     missed_slots.sort_unstable();
     missed_slots.dedup();

@@ -5,8 +5,8 @@
 
 use crate::{
     config::{
-        BenchmarkArgs, BenchmarkConfig, ComparisonConfig, Config, DbCheckConfig, PrintConfig,
-        RetryInPlaceConfig, RpcEndpoint,
+        BenchmarkArgs, BenchmarkConfig, ComparisonConfig, Config, DbCheckConfig, GeyserCheckConfig,
+        PrintConfig, RetryInPlaceConfig, RpcEndpoint,
     },
     db_check::{self, DbProbeCtx},
     response_comparison, sources, utils,
@@ -49,6 +49,7 @@ pub async fn run(args: &BenchmarkArgs) -> Result<()> {
         source,
         comparison,
         db_check,
+        geyser_check,
         print_config,
         retry_in_place,
     } = config;
@@ -80,6 +81,13 @@ pub async fn run(args: &BenchmarkArgs) -> Result<()> {
         // .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(timeout_secs))
         .build()?;
+
+    // Optional Geyser cross-check: subscribes in the background and starts
+    // filling its history immediately, so it has depth by the time the first
+    // mismatch arrives. Accounts written before this point yield `NoHistory`.
+    let geyser_history = geyser_check
+        .as_ref()
+        .map(crate::geyser_check::spawn_subscriber);
 
     // Optional per-iteration DB probe pool — only built when both the flag is
     // on AND the request type is `getBalance` (the only shape the probe knows
@@ -116,8 +124,8 @@ pub async fn run(args: &BenchmarkArgs) -> Result<()> {
 
     // Spawner loop (runs for `duration` seconds)
     tokio::spawn(async move {
-        let mut deadline = (!start_on_first_request)
-            .then(|| Instant::now() + Duration::from_secs(duration_secs));
+        let mut deadline =
+            (!start_on_first_request).then(|| Instant::now() + Duration::from_secs(duration_secs));
         let mut idx: usize = 0;
         let mut pending: VecDeque<sources::BenchRequest> = VecDeque::new();
         let mut drained_initial = false;
@@ -134,7 +142,8 @@ pub async fn run(args: &BenchmarkArgs) -> Result<()> {
             let permit = semaphore.clone().try_acquire_owned();
 
             let request = if replay_once {
-                if pending.is_empty() && (!drained_initial || requests_rx.has_changed().unwrap_or(false))
+                if pending.is_empty()
+                    && (!drained_initial || requests_rx.has_changed().unwrap_or(false))
                 {
                     drained_initial = true;
                     pending.extend(requests_rx.borrow_and_update().iter().cloned());
@@ -181,6 +190,8 @@ pub async fn run(args: &BenchmarkArgs) -> Result<()> {
                     let rpc2 = rpc2.clone();
                     let comparison = comparison.clone();
                     let db_check = db_check.clone();
+                    let geyser_check = geyser_check.clone();
+                    let geyser_history = geyser_history.clone();
                     let print_config = print_config.clone();
                     let retry_in_place = retry_in_place.clone();
                     let db_probe_pool = db_probe_pool.clone();
@@ -194,6 +205,8 @@ pub async fn run(args: &BenchmarkArgs) -> Result<()> {
                             &request,
                             &comparison,
                             &db_check,
+                            &geyser_check,
+                            geyser_history.as_deref(),
                             tx,
                             request_type,
                             &print_config,
@@ -414,6 +427,8 @@ async fn process_request(
     request: &JsonValue,
     comparison_config: &Option<ComparisonConfig>,
     db_check_config: &Option<DbCheckConfig>,
+    geyser_check_config: &Option<GeyserCheckConfig>,
+    geyser_history: Option<&crate::geyser_check::GeyserHistory>,
     results_tx: tokio::sync::mpsc::UnboundedSender<BenchResult>,
     request_type: RequestType,
     print_config: &PrintConfig,
@@ -442,7 +457,8 @@ async fn process_request(
 
     // Comparison-disabled path keeps the legacy one-sided behavior (just rpc1).
     let Some(comparison_config) = comparison_config else {
-        let (json, duration) = utils::send_rpc_request(client, rpc1, request, Some(bw_meter)).await?;
+        let (json, duration) =
+            utils::send_rpc_request(client, rpc1, request, Some(bw_meter)).await?;
         utils::print_request_result(request, duration, &json, rpc1, &encoding, print_config);
         if let Err(e) = results_tx.send(BenchResult {
             duration,
@@ -672,6 +688,31 @@ async fn process_request(
         tracing::error!(target: "bench_db_check", "DB check failed: {}", e);
     }
 
+    // Classify each differing account against the raw Geyser stream. The
+    // report is logged and embedded in the saved mismatch file.
+    let geyser_probe = if final_matched {
+        None
+    } else if let (Some(cfg), Some(history)) = (geyser_check_config, geyser_history) {
+        match crate::geyser_check::check_differing_accounts(
+            client,
+            &verdict_outcome.response_comparison,
+            cfg,
+            history,
+            rpc1,
+            rpc2,
+        )
+        .await
+        {
+            Ok(probe) => probe,
+            Err(e) => {
+                tracing::error!(target: "bench_geyser_check", "Geyser check failed: {:#}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     if !final_matched && comparison_config.save_mismatches {
         utils::save_responses_diff_to_file_with_retry(
             request,
@@ -689,6 +730,7 @@ async fn process_request(
                 fire_after_ms: retry_in_place.retry_after_ms,
                 iterations: r.iterations.as_deref(),
             }),
+            geyser_probe,
         )?;
     }
 
@@ -709,6 +751,7 @@ async fn process_request(
                 fire_after_ms: retry_in_place.retry_after_ms,
                 iterations: r.iterations.as_deref(),
             }),
+            None,
         )?;
     }
 
@@ -912,6 +955,13 @@ impl BenchStats {
             names.dedup();
             names
         };
+
+        // Every request failed, so there is no latency data to tabulate. The
+        // table indexes `rpc_names[0]` unconditionally below.
+        if rpc_names.is_empty() {
+            println!("\nNo successful responses — no latency breakdown to show.");
+            return;
+        }
 
         let category_keys: Vec<(String, String)> = {
             let mut cats: Vec<_> = computed

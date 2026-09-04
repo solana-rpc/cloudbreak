@@ -1,0 +1,15 @@
+[
+  {
+    "id": "R",
+    "jsonrpc": "2.0",
+    "method": "getProgramAccounts",
+    "params": [
+      "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",
+      {
+        "commitment": "confirmed",
+        "encoding": "base64",
+        "withContext": true
+      }
+    ]
+  }
+]

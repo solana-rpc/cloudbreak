@@ -19,6 +19,8 @@ Benchmarking and correctness testing tool for Solana RPC endpoints.
 - **Slot-compensation iteration logs**: `[comparison].save_compensation_iterations = true` records every individual `rpc1+rpc2` send that happened during slot compensation (and the no-context retry) into the saved mismatch/rescue file under an `iterations: [...]` array, each entry timestamped with `fired_at` (ISO-8601 with ms) and a `phase` tag. Lets you separate "transient slot-lag, eventually picked a matching pair" from "stable same-slot disagreement that slot compensation papered over".
 - **Per-iteration DB cross-check (`getBalance` only)**: `[comparison].save_db_probe_iterations = true` adds a third arm to the `tokio::join!` of every iteration: a SQL probe against `[db_check].db_url` that captures the contents of the `slots` table plus the top-20 newest `(slot, lamports)` rows for the queried pubkey from `accounts` and `snapshot_accounts`. Embedded as `db_probe: {...}` on each iteration entry — lets you see directly whether the DB has a row at the slot the RPC returned, ruling slot compensation in or out as the cause of a mismatch.
 
+- **Geyser cross-check**: `[geyser_check]` subscribes to the same Yellowstone stream the indexer consumes (whole blocks at `Confirmed`) and keeps a bounded per-pubkey history of account writes, hashed rather than stored. On a mismatch it reports, per differing account, which write each endpoint's bytes match — separating a real `MissedUpdate` from legitimate slot lag, and catching closed or reassigned accounts that cloudbreak still serves. With `verify_with_get_block` it confirms the decisive slots against the ledger.
+
 ## How Comparison Works
 
 1. Every request is sent to `rpc1` and its latency/size are recorded.
@@ -103,6 +105,50 @@ cargo run --bin integration_tests -- benchmark -c custom.toml gpa
 | `get-account-info`            | `binary` (deprecated base58 plain-string; Agave's default)                                                       |
 | `get-multiple-accounts`       | `base64`                                                                                                        |
 | `get-balance` / `get-token-account-balance` | `none` (these methods have no `encoding` field)                                                   |
+
+### `compare-gpa-streaming`
+
+Compares one `getProgramAccounts` request between two endpoints when the response is too large to hold in memory. An unfiltered gPA over a busy program runs to gigabytes; buffering that into a `serde_json::Value` needs tens of GB and dies before it compares anything.
+
+Both endpoints are streamed concurrently and each account is reduced, as it arrives, to `(lamports, owner, executable, rentEpoch, blake3(data), len)`. The bytes are dropped immediately, so peak memory tracks the *account count*, not the response size. Measured on a 190k-account request: **222 MB peak RSS for 0.88 GB of combined wire data**.
+
+```bash
+cargo run --release --bin integration_tests -- compare-gpa-streaming \
+  --request crates/integration_tests/raydium_gpa.json --rounds 1
+```
+
+Use `--release`. Base64 decoding and hashing every account is real CPU work, and a debug build spends minutes on it for a multi-gigabyte body.
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--config` | `cloudbreak.integration_tests.toml` | Reads `[rpc1]`, `[rpc2]`, `[geyser_check]` and `[print_config]` |
+| `--request` | `crates/integration_tests/raydium_gpa.json` | Request file; an array takes its first entry |
+| `--rounds` | `1` | Comparison rounds; `0` runs until interrupted |
+| `--slot-attempts` | `5` | Attempts per round to land both endpoints on the same context slot |
+| `--output-dir` | `…/compare_responses_results/streaming` | Where mismatch reports go |
+
+#### Slot gating
+
+Both implementations open the envelope with `{"jsonrpc":"2.0","result":{"context":{"slot":N},"value":[`, so each side publishes its context slot within the first few hundred bytes. The two share a gate: if the slots disagree, both transfers abort immediately and the round restarts. That is this command's form of slot compensation, and a rejected round costs the header instead of two multi-gigabyte transfers.
+
+Measured against ams381 and fra218 with a 436 MB response, fired concurrently:
+
+```
+agave  ttfb=11.3s  total=28.2s   context slot = 443952874
+cb     ttfb=1.4s   total=29.2s   context slot = 443952874
+```
+
+Agave stamps the context from the bank it *starts* the scan on, not when it finishes writing, so the 10-second gap in time-to-first-byte does not translate into a slot offset — the two agree and the first attempt usually succeeds. The gain is bounded by the slower side's TTFB: cloudbreak knows its slot at ~1.4 s but Agave's arrives at ~11 s, so a doomed round is cancelled after cloudbreak has pulled `TTFB × throughput` bytes, not zero. On the full request that is 1–3 GB rather than 16 GB.
+
+A JSON-RPC error on either side also aborts the peer. Without that, Agave's `-32012` scan-limit error at 11 s would leave cloudbreak downloading 8 GB no one will read.
+
+#### Truncation
+
+The API truncates its body on purpose when the account stream fails mid-response (`cloudbreak_api::http::streaming`), leaving invalid JSON so the client cannot mistake a partial response for a complete one. The parse therefore runs to `Deserializer::end()`: a short body is a hard error, never a shorter account list. Without that check, every account missing from a truncated response would be reported as a real `OnlyRpc2` diff.
+
+#### Output
+
+Responses are never written to disk — the report holds digests, the per-kind diff counts, both endpoints' slot, byte count and duration, and the `geyser_probe` block when `[geyser_check]` is configured. Progress goes to the `bench_streaming` tracing target, which is not gated by `[print_config]`.
 
 ### `compare` (legacy)
 
@@ -285,6 +331,72 @@ The first line shows the DB's confirmed and finalized slot from the `slots` tabl
 The `└─` sub-line (when `get_last_signature = true`) shows:
 - The number of missed transactions (on-chain tx slots newer than the DB slot for that account)
 - The latest tx slot seen via `getSignaturesForAddress` and how far behind the response context it is. If no signatures are found, it shows `no txs found via RPC`. If there are no missed transactions, the account data may have been changed via a CPI or program invocation that doesn't produce a direct signature for that address.
+
+### `[geyser_check]` (optional)
+
+Classifies each differing account against the raw Yellowstone Geyser stream. `[db_check]` answers "what does the database hold"; this answers "what did the indexer actually receive", which is one step further upstream. It turns "the two RPCs disagree" into "cloudbreak was sent the write at slot N and never applied it".
+
+A background task subscribes at startup and mirrors the indexer's subscription byte for byte: whole `Block` messages with `include_accounts`, at `Confirmed`, `account_include` empty (see `cloudbreak_index::modules::grpc`). Keeping it identical is the point. A filter difference here would make every verdict meaningless. Because the source is confirmed blocks, forks cannot appear in the history and each slot carries the account's final state.
+
+Accounts are filtered client-side by owner, because a `blocks` filter has no owner field. The filter keeps every pubkey ever seen owned by `program`, not only the ones owned by it right now. Without that, a close (`lamports = 0`, owner → system program) or a reassignment away from the program is dropped by the filter, and those are exactly what produce "rpc1 returns an account rpc2 does not". Both land in the same per-pubkey ring as one more write, so there is no separate closed-account structure to keep in step.
+
+Per pubkey the tool keeps a ring of `history_size` writes as `(slot, write_version, lamports, blake3(data), data_len, owner, txn_signature)`, 144 bytes each with nothing on the heap. Data is hashed, not stored. `owner` is `None` while the account belongs to the tracked program, which is every write but the rare reassignment — storing it outright would repeat the same string on every event. The signature stays raw and is base58-encoded only when a mismatch reads it. A full ring is 72 KB per pubkey, so 10k tracked accounts at full depth is about 700 MB worst case; lower `history_size` for a program with many hot accounts.
+
+`write_version` should not matter under a confirmed-block subscription, but the read path depends on that being true: `crates/api/src/db/getProgramAccounts.sql` orders by `slot DESC` with no `write_version` tie-break, while `crates/index/src/modules/lt_hash.rs` orders by `slot DESC, write_version DESC`. Two rows sharing a `(pubkey, slot)` would therefore be resolved arbitrarily by gPA.
+
+The subscriber tests that directly. It counts how often one pubkey is written more than once inside a single block message — the only way two such rows can exist, since `save_block.rs` inserts every entry the block carries. A duplicate logs one `WARN` per affected block naming the pubkey and both write_versions. Running totals (slot, blocks seen, tracked pubkeys, duplicate writes) log every 500 blocks, roughly every 3 minutes, so the count is readable on any run rather than only when a mismatch happens.
+
+| Field                     | Default  | Description                                                                                                        |
+| ------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------ |
+| `endpoint`                | _(req)_  | Yellowstone gRPC endpoint. Must be the same stream the rpc1 indexer consumes, or the comparison proves nothing      |
+| `x_token`                 | _(none)_ | Auth token, when the endpoint needs one                                                                            |
+| `program`                 | _(req)_  | Owner program to track, base58                                                                                     |
+| `history_size`            | `500`    | Per-pubkey ring of writes                                                                                          |
+| `timeout_secs`            | `30`     | gRPC connect and request timeout                                                                                   |
+| `rpc_url`                 | _(none)_ | Agave RPC used as the ledger oracle for `getBlock`. Omit to classify from the Geyser history alone                  |
+| `verify_with_get_block`   | `false`  | Confirm suspect accounts against the ledger with `getBlock`                                                        |
+| `max_blocks_per_mismatch` | `6`      | Cap on `getBlock` calls per mismatch. Blocks run to several MB                                                     |
+
+#### Verdicts
+
+One verdict per differing account. The first five mark cloudbreak defects and are flagged `suspect` in the output. The rest are expected lag or missing evidence.
+
+| Verdict             | Meaning                                                                                                                            |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `MissedUpdate`      | Geyser delivered a write at a slot at or below cloudbreak's own context slot, and cloudbreak still serves the pre-write state       |
+| `ClosedAccountLeak` | Cloudbreak returns an account whose latest Geyser write closed it (`lamports = 0`)                                                  |
+| `OwnerChangeLeak`   | Cloudbreak returns an account that Geyser reassigned away from the tracked program                                                  |
+| `Rpc1Unknown`       | Cloudbreak's bytes match no write Geyser ever delivered                                                                            |
+| `BothUnknown`       | Neither side's bytes match an observed write. Usually means the history is too shallow, so raise `history_size`                     |
+| `Rpc2Unknown`       | Agave's bytes match no observed write. Points at the oracle, not at cloudbreak                                                      |
+| `Rpc1Lagging`       | Cloudbreak matches an older write, and its context slot sits below the newer one. Legitimate lag                                    |
+| `Rpc2Lagging`       | Agave is the one behind                                                                                                            |
+| `NoHistory`         | Geyser saw no write for this account since the subscription started                                                                 |
+
+The split between `MissedUpdate` and `Rpc1Lagging` is the whole point of the check. Both look like "cloudbreak is behind". Only the first is a bug, and the two are told apart by comparing the unapplied write's slot against cloudbreak's own `result.context.slot`.
+
+#### `getBlock` verification
+
+With `verify_with_get_block = true` and `rpc_url` set, suspect accounts get a ledger cross-check on the slots the verdict turned on — for `MissedUpdate`, the missed slot and the applied slot. The tool calls `getBlock` with `transactionDetails: "accounts"` and `encoding: "jsonParsed"`, which returns per transaction only the account keys with their `writable` flag plus pre/post balances. Loaded address-lookup-table addresses are included and the key list is index-aligned with the balance arrays, so `postBalances[i]` for the account is directly comparable to the Geyser event's lamports.
+
+That mode is used instead of `getSignaturesForAddress` plus `getTransaction` for three reasons. The address index does not expose whether the account was written, so read-only appearances and failed transactions look identical to writes. One block answers for every differing account in the same slot, rather than one call per signature. And the payload is roughly half the size of a full block.
+
+`getBlock` cannot verify account data. Its `meta` carries lamports and token balances only. Geyser stays the only source for the bytes. What the ledger adds is: the slot exists at confirmed, the event's `txn_signature` really is in it, the end-of-slot balance agrees, and — the valuable one — whether any transaction wrote the account in that slot without Geyser reporting it (`writes_missing_from_geyser`).
+
+Blocks are cached per mismatch and shared across every differing account, so a mismatch with twenty accounts landing in three slots costs three calls, not twenty. The cache lives for one comparison and is dropped with it. Nothing block-derived is retained between requests: each response is reduced to the writes touching the differing accounts — a few hundred bytes — and the parsed JSON is released immediately. Because that parse is the real cost, a global semaphore caps concurrent `getBlock` calls at 2, so `max_in_flight` cannot put hundreds of parsed blocks in memory at once.
+
+#### Output
+
+Verdicts use the `bench_geyser_check` tracing target, gated by `log_geyser_check` in `[print_config]`. Example:
+
+```
+ INFO bench_geyser_check: 🛰 2 differing accounts | Cloudbreak slot: Some(312456789) | Agave slot: Some(312456787) | geyser slot: 312456790 (4210 blocks, 8123 tracked pubkeys)
+ INFO bench_geyser_check:   5Kd3NBUq...abc | DataMismatch | MissedUpdate | serving slot 312456701, never applied slot 312456780 | 37 geyser events
+ INFO bench_geyser_check:     └─ {"slot":312456780,"ledger_writers":["4xR9..."],"geyser_signatures":["4xR9..."],"writes_missing_from_geyser":[],"ledger_post_balance":58320881436,"geyser_lamports":58320881436,"lamports_match":true}
+ INFO bench_geyser_check:   7Hj2PQmx...def | OnlyRpc1 | ClosedAccountLeak | closed at slot 312456788 | 4 geyser events
+```
+
+When `comparison.save_mismatches` is on, the same report is embedded as `geyser_probe` inside the `original` block of each saved mismatch file, next to `db_probe` and `iterations`, so a `mismatch_dir` replay keeps the evidence.
 
 ### `[retry_in_place]` (optional)
 
@@ -480,6 +592,7 @@ Two responsibilities:
 | `log_rescues`               | `false`  | Allow `bench_compare::rescued` events — ✅ `[retry_in_place]` flipped the verdict                                                                                                                                   |
 | `log_no_context_mismatches` | `false`  | Allow `bench_compare::no_context_mismatch` events — ⚠️ mismatch where both responses lacked `result.context`                                                                                                       |
 | `log_compare_errors`        | `false`  | Allow `bench_compare::error` events — 💥 / 💥💥 one or both endpoints returned an error in the comparison                                                                                                            |
+| `log_geyser_check`          | `false`  | Allow `bench_geyser_check` events — 🛰 per-account verdicts from `[geyser_check]`                                                                                                                                   |
 | `log_individual_requests`   | `false`  | Allow `bench_request` events — per-rpc1 line (still gated by the `min_*` thresholds when this is `true`)                                                                                                            |
 
 #### TOML vs `RUST_LOG` precedence
@@ -504,6 +617,7 @@ Logging uses `tracing` with the `RUST_LOG` environment variable for granular con
 | `bench_compare::mismatch`           | `INFO`  | `log_mismatches`             | ❌ post-compensation mismatch (covers `retry-also-failed`)            |
 | `bench_compare::rescued`            | `INFO`  | `log_rescues`                | ✅ `[retry_in_place]` flipped the verdict                             |
 | `bench_compare::no_context_mismatch`| `INFO`  | `log_no_context_mismatches`  | ⚠️ mismatch with no `result.context` (slot lag unverifiable)         |
+| `bench_geyser_check`                | `INFO`  | `log_geyser_check`           | 🛰 per-account verdicts against the Geyser stream                     |
 | `bench_compare::error`              | `INFO`  | `log_compare_errors`         | 💥 one endpoint errored / 💥💥 both endpoints errored                 |
 | `bench_source`                      | `INFO`  | _(RUST_LOG only)_            | VictoriaLogs / mismatch-dir refresh events                            |
 | `bench_source`                      | `ERROR` | _(RUST_LOG only)_            | Source refresh failures                                              |
@@ -804,6 +918,7 @@ log_mismatches            = true   # ❌ post-compensation mismatch (covers retr
 log_rescues               = true   # ✅ rescued by [retry_in_place]
 log_no_context_mismatches = true   # ⚠️ no-context mismatch (slot lag unverifiable)
 log_compare_errors        = true   # 💥 one or both endpoints errored
+log_geyser_check          = true   # 🛰 per-account verdicts from [geyser_check]
 log_individual_requests   = false  # per-rpc1 line (also gated by min_* thresholds)
 
 # Optional: re-run a request once and only count it as a mismatch if the retry
