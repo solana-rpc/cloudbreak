@@ -230,7 +230,6 @@ pub async fn save_block(
     } else {
         Vec::new()
     };
-    let supply_apply_start = std::time::Instant::now();
     let supply_outcome = supply_tracker
         .apply_block(
             slot,
@@ -241,7 +240,6 @@ pub async fn save_block(
             supply_query_timeout,
         )
         .await;
-    let supply_apply_elapsed = supply_apply_start.elapsed();
 
     let closed_account_for_slot_len = closed_accounts_for_slot.len();
 
@@ -340,15 +338,8 @@ pub async fn save_block(
 
     // Commit or fail closed. The tracker set the status, total, and slot gauges
     // and pinned or marked stale on a write failure; persist the row it returns.
-    let supply_finish_start = std::time::Instant::now();
     if let Some(commit) = supply_tracker.finish_block(slot, supply_outcome, block_writes_ok) {
         supply::persist::persist_supply_row(db, &commit, supply_query_timeout).await;
-    }
-    // Aggregate the supply work's cost in this loop (apply plus finish and the
-    // row upsert, excluding the account inserts between them) and log a summary
-    // every 50 blocks rather than per block.
-    if supply_enabled {
-        supply_tracker.observe_loop_time(slot, supply_apply_elapsed + supply_finish_start.elapsed());
     }
 
     let elapsed = start_time.elapsed().as_secs_f64();

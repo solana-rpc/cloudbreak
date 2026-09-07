@@ -29,7 +29,7 @@ use solana_stake_interface::state::StakeStateV2;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::metrics::{SUPPLY_QUERY_ERRORS, TokioTaskCounterGuard};
+use crate::metrics::TokioTaskCounterGuard;
 use crate::modules::account_owner_map::AccountOwnerMap;
 use crate::modules::largest_accounts::{LargestAccountsTracker, persist_largest_outcome};
 use crate::modules::service_health::is_healthy;
@@ -408,7 +408,6 @@ async fn upsert_non_circulating_accounts(db: &DatabaseConnection, slot: u64, acc
             slot,
             e
         );
-        SUPPLY_QUERY_ERRORS.inc();
     }
 }
 

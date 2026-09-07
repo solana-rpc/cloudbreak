@@ -10,7 +10,7 @@
 //! by the seed, the bootstrap resolve, and the block path.
 
 use crate::modules::supply::tracker::{SUPPLY_RING_SLOTS, SupplyCommit, SupplyTracker};
-use crate::{IndexConfig, metrics};
+use crate::IndexConfig;
 use rust_decimal::Decimal;
 use sea_orm::{
     ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement, Value,
@@ -117,14 +117,18 @@ async fn index_exists(db: &DatabaseConnection, index: &str) -> bool {
 }
 
 async fn clear_prior_run(db: &DatabaseConnection) {
-    if let Err(e) = db
-        .execute(Statement::from_string(
-            DatabaseBackend::Postgres,
-            "DELETE FROM supply; DELETE FROM non_circulating_accounts WHERE id = 1".to_string(),
-        ))
-        .await
-    {
-        tracing::error!(target: "supply_tracker", "failed to clear prior supply rows: {:?}", e);
+    // One statement per call. Postgres rejects multiple commands in a prepared
+    // statement, and sea-orm's `execute` always prepares.
+    for sql in [
+        "DELETE FROM supply",
+        "DELETE FROM non_circulating_accounts WHERE id = 1",
+    ] {
+        if let Err(e) = db
+            .execute_unprepared(sql)
+            .await
+        {
+            tracing::error!(target: "supply_tracker", "failed to clear prior supply rows ({sql}): {:?}", e);
+        }
     }
 }
 
@@ -160,6 +164,5 @@ pub async fn persist_supply_row(
         });
     if let Err(e) = result {
         tracing::error!(target: "supply_tracker", "persist_supply_row failed for slot {}: {}", commit.slot, e);
-        metrics::SUPPLY_QUERY_ERRORS.inc();
     }
 }

@@ -8,9 +8,7 @@ use std::sync::{Once, OnceLock};
 use cloudbreak_core::IndexConfig;
 pub use cloudbreak_core::metrics::{
     CURRENT_TOKIO_TASKS, LARGEST_ACCOUNTS_DB_ERRORS, LARGEST_ACCOUNTS_STALE_MINTS,
-    SUPPLY_CACHE_BUCKETS, SUPPLY_CACHE_ENTRIES, SUPPLY_CACHE_HITS_TOTAL, SUPPLY_CACHE_MISSES_TOTAL,
-    SUPPLY_DELTA_SECONDS, SUPPLY_MISS_READ_SECONDS, SUPPLY_QUERY_ERRORS, SUPPLY_SLOT, SUPPLY_STATUS,
-    SUPPLY_TOTAL_LAMPORTS, SUPPLY_WRITE_FAILURES_TOTAL, TokioTaskCounterGuard,
+    SUPPLY_CACHE_ENTRIES, SUPPLY_CACHE_HITS_TOTAL, SUPPLY_CACHE_MISSES_TOTAL, TokioTaskCounterGuard,
 };
 use prometheus::{Counter, Histogram, HistogramOpts, HistogramVec, IntGauge, Registry};
 use tracing::error;
@@ -386,16 +384,8 @@ pub fn register_collectors() {
         register!(FINALIZE_SLOT_DELETED_ACCOUNTS);
         register!(LARGEST_ACCOUNTS_DB_ERRORS);
         register!(LARGEST_ACCOUNTS_STALE_MINTS);
-        register!(SUPPLY_TOTAL_LAMPORTS);
-        register!(SUPPLY_SLOT);
-        register!(SUPPLY_STATUS);
-        register!(SUPPLY_QUERY_ERRORS);
         register!(SUPPLY_CACHE_ENTRIES);
-        register!(SUPPLY_CACHE_BUCKETS);
         register!(SUPPLY_CACHE_HITS_TOTAL);
         register!(SUPPLY_CACHE_MISSES_TOTAL);
-        register!(SUPPLY_WRITE_FAILURES_TOTAL);
-        register!(SUPPLY_DELTA_SECONDS);
-        register!(SUPPLY_MISS_READ_SECONDS);
     });
 }

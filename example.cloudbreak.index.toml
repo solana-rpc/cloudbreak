@@ -1,10 +1,18 @@
 # The buffer size for queuing finalize slot events
 finalize-slot-buffer-size = 1000
 accounts-owner-map-enabled = false
-# Maintains the running total-supply figure served by getSupply. Requires an
-# empty [programs] filter, accounts-owner-map-enabled = true, and [snapshot].
-# Set it together with supply-enabled in the API config.
-supply-tracker-enabled = false
+
+# Maintains the running total-supply figure served by getSupply from a bounded
+# hot-accounts cache. Requires an empty [programs] filter,
+# accounts-owner-map-enabled = false, owner partitioning off, [snapshot], and the
+# stake-owner indexes. Runs on a dedicated supply-only instance. Set it together
+# with the API [supply] section.
+# [supply]
+# enabled = false
+# Unpinned accounts kept resident in the hot-accounts map (~64 bytes each).
+# hot-accounts = 1000000
+# Keep every stake account resident so epoch rewards are cache hits.
+# pin-stake-accounts = true
 
 [snapshot]
 accounts-file-concurency = 32
@@ -19,6 +27,9 @@ idx_snapshot_accounts_pubkey_slot = true
 idx_snapshot_accounts_token_mint = true
 idx_snapshot_accounts_token_owner = true
 idx_snapshot_accounts_token_delegate = true
+# Partial index on stake-owned rows for the getSupply non-circulating stake scan.
+# Only the supply node needs it.
+idx_snapshot_accounts_stake_owner = false
 
 # If this section is not present, the indexer will not download or process any snapshot
 [snapshot.tracker_endpoint]

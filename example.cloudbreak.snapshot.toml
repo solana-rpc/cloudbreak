@@ -29,3 +29,6 @@ idx_snapshot_accounts_pubkey_slot = true
 idx_snapshot_accounts_token_mint = true
 idx_snapshot_accounts_token_owner = true
 idx_snapshot_accounts_token_delegate = true
+# Partial index on stake-owned rows for the getSupply non-circulating stake scan.
+# Only the supply node needs it.
+idx_snapshot_accounts_stake_owner = false

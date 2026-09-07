@@ -30,6 +30,15 @@ pub async fn get_supply(
         return Err(state.node_unhealthy());
     };
 
+    // Gate on node health like every other method. Without this getSupply keeps
+    // answering while the rest of the API returns unhealthy, and during a gap fill
+    // the finalized slot freezes so the staleness bound below can never fire.
+    if let Some(data) = state.slot_syncronizer_data.as_ref() {
+        if !data.read().unwrap().is_healthy() {
+            return Err(state.node_unhealthy());
+        }
+    }
+
     let finalized_slot = match state
         .slot_syncronizer_data
         .as_ref()

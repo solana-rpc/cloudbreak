@@ -70,23 +70,7 @@ struct Inner {
     block_writes: tokio::sync::Mutex<()>,
     /// Whether every stake account is pinned resident.
     pin_stake: bool,
-    /// Aggregated save_block supply timing, logged every SUPPLY_TIMING_WINDOW blocks.
-    timing: Mutex<LoopTiming>,
 }
-
-/// Rolling min/max/mean of the supply work's per-block cost inside the
-/// save_block loop. Logged and reset every [`SUPPLY_TIMING_WINDOW`] blocks so
-/// the cost is visible without a line per block.
-#[derive(Default)]
-struct LoopTiming {
-    count: u32,
-    first_slot: u64,
-    min_ms: f64,
-    max_ms: f64,
-    sum_ms: f64,
-}
-
-const SUPPLY_TIMING_WINDOW: u32 = 50;
 
 #[derive(Clone, Copy, Default, PartialEq)]
 enum SupplyStatus {
@@ -150,7 +134,6 @@ impl SupplyTracker {
             non_circulating: RwLock::new(NonCirculatingState::default()),
             block_writes: tokio::sync::Mutex::new(()),
             pin_stake,
-            timing: Mutex::new(LoopTiming::default()),
         })))
     }
 
@@ -161,41 +144,6 @@ impl SupplyTracker {
     pub async fn lock_block_writes(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
         let inner = self.0.as_deref()?;
         Some(inner.block_writes.lock().await)
-    }
-
-    /// Records the wall time the supply work took in the save_block loop for one
-    /// block. Every [`SUPPLY_TIMING_WINDOW`] blocks it logs the min, max, and
-    /// mean over that window and resets, so per-block cost is observable in the
-    /// logs without a line every block. Off the hot lock; no-op when disabled.
-    pub fn observe_loop_time(&self, slot: u64, elapsed: std::time::Duration) {
-        let Some(inner) = self.0.as_deref() else {
-            return;
-        };
-        let ms = elapsed.as_secs_f64() * 1000.0;
-        let mut t = inner.timing.lock().expect("Failed to lock supply timing");
-        if t.count == 0 {
-            t.first_slot = slot;
-            t.min_ms = ms;
-            t.max_ms = ms;
-        } else {
-            t.min_ms = t.min_ms.min(ms);
-            t.max_ms = t.max_ms.max(ms);
-        }
-        t.sum_ms += ms;
-        t.count += 1;
-        if t.count >= SUPPLY_TIMING_WINDOW {
-            tracing::info!(
-                target: "supply_tracker",
-                "supply save_block time over last {} blocks (slots {}..{}): min {:.2} ms, max {:.2} ms, mean {:.2} ms",
-                t.count,
-                t.first_slot,
-                slot,
-                t.min_ms,
-                t.max_ms,
-                t.sum_ms / t.count as f64,
-            );
-            *t = LoopTiming::default();
-        }
     }
 
     pub fn is_non_circulating(&self, pubkey: &Pubkey) -> bool {
@@ -322,7 +270,6 @@ impl SupplyTracker {
             return false;
         }
         state.bootstrap_failed = true;
-        inner.set_status_metric(&state);
         true
     }
 
@@ -367,7 +314,6 @@ impl SupplyTracker {
         state.startup_touched = HashMap::new();
         state.startup_zero_prev = zero_prev;
         state.status = SupplyStatus::Live;
-        inner.set_status_metric(&state);
         Some(inner.commit(&state))
     }
 
@@ -385,7 +331,6 @@ impl SupplyTracker {
             return false;
         }
         state.status = SupplyStatus::GapFilling;
-        inner.set_status_metric(&state);
         true
     }
 
@@ -396,7 +341,6 @@ impl SupplyTracker {
             state.status = SupplyStatus::Live;
             // The repaired range is applied. Its gap-close skips no longer hold.
             state.gap_closes.clear();
-            inner.set_status_metric(&state);
         }
     }
 
@@ -409,7 +353,6 @@ impl SupplyTracker {
             return false;
         }
         state.status = SupplyStatus::Stale;
-        inner.set_status_metric(&state);
         true
     }
 
@@ -441,7 +384,6 @@ impl SupplyTracker {
             return BlockOutcome::Idle;
         };
         let _write_guard = inner.block_writes.lock().await;
-        let start = std::time::Instant::now();
 
         // Non-circulating member balances come from the deduped set, guarded on slot.
         for p in &pending {
@@ -529,7 +471,6 @@ impl SupplyTracker {
         if !misses.is_empty() {
             metrics::SUPPLY_CACHE_MISSES_TOTAL.inc_by(misses.len() as u64);
             let pubkeys: Vec<Pubkey> = misses.iter().map(|p| p.pubkey).collect();
-            let read_start = std::time::Instant::now();
             let prev_map = match prev::fetch_prev_balances(db, &pubkeys, query_timeout).await {
                 Ok(map) => map,
                 Err(first) => {
@@ -538,14 +479,12 @@ impl SupplyTracker {
                         Ok(map) => map,
                         Err(second) => {
                             tracing::error!(target: "supply_tracker", "miss read failed twice for slot {}, marking stale: {:?}", slot, second);
-                            metrics::SUPPLY_QUERY_ERRORS.inc();
                             self.mark_stale();
                             return BlockOutcome::ReadFailed;
                         }
                     }
                 }
             };
-            metrics::SUPPLY_MISS_READ_SECONDS.observe(read_start.elapsed().as_secs_f64());
 
             let mut state = inner.state();
             for p in misses {
@@ -558,7 +497,6 @@ impl SupplyTracker {
             inner.refresh_cache_gauges(&state.cache);
         }
 
-        metrics::SUPPLY_DELTA_SECONDS.observe(start.elapsed().as_secs_f64());
         BlockOutcome::Delta { delta, touched }
     }
 
@@ -581,7 +519,6 @@ impl SupplyTracker {
             }
             BlockOutcome::Delta { delta, touched } => {
                 if !block_writes_ok {
-                    metrics::SUPPLY_WRITE_FAILURES_TOTAL.inc();
                     let pinned = inner.state().cache.pin_failed(&touched);
                     if !pinned {
                         tracing::error!(
@@ -635,8 +572,6 @@ impl Inner {
                 state.total = (state.total as i128 + block_delta) as u64;
                 if state.status == SupplyStatus::Live {
                     let commit = self.commit(&state);
-                    metrics::SUPPLY_TOTAL_LAMPORTS.set(commit.total as i64);
-                    metrics::SUPPLY_SLOT.set(commit.slot as i64);
                     Some(commit)
                 } else {
                     None
@@ -664,20 +599,6 @@ impl Inner {
         Some(lamports as u64)
     }
 
-    fn set_status_metric(&self, state: &SupplyState) {
-        let code = if state.bootstrap_failed {
-            4
-        } else {
-            match state.status {
-                SupplyStatus::Bootstrapping => 0,
-                SupplyStatus::Live => 1,
-                SupplyStatus::GapFilling => 2,
-                SupplyStatus::Stale => 3,
-            }
-        };
-        metrics::SUPPLY_STATUS.set(code);
-    }
-
     fn refresh_cache_gauges(&self, cache: &HotAccounts) {
         metrics::SUPPLY_CACHE_ENTRIES
             .with_label_values(&["pinned"])
@@ -685,7 +606,6 @@ impl Inner {
         metrics::SUPPLY_CACHE_ENTRIES
             .with_label_values(&["hot"])
             .set(cache.hot_len() as i64);
-        metrics::SUPPLY_CACHE_BUCKETS.set(cache.bucket_count() as i64);
     }
 }
 
