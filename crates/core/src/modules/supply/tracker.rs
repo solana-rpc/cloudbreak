@@ -57,7 +57,7 @@ pub enum BlockOutcome {
     Bootstrapping,
     /// A live or gap-filling block whose delta was computed.
     Delta { delta: i128, touched: Vec<Pubkey> },
-    /// The miss read failed after a retry; the tracker is already Stale.
+    /// The miss read failed after a retry. The tracker is already Stale.
     ReadFailed,
 }
 
@@ -68,7 +68,6 @@ struct Inner {
     state: Mutex<SupplyState>,
     non_circulating: RwLock<NonCirculatingState>,
     block_writes: tokio::sync::Mutex<()>,
-    /// Whether every stake account is pinned resident.
     pin_stake: bool,
 }
 
@@ -115,9 +114,8 @@ pub struct SupplyCommit {
 }
 
 impl SupplyTracker {
-    /// Builds an enabled tracker with a pre-sized cache. `cap` is the unpinned
-    /// cap, `buckets` the pre-sized bucket target, `fail_pin_cap` the live
-    /// write-failure pin budget, `pin_stake` whether stake accounts are pinned.
+    /// Builds an enabled tracker with a pre-sized cache. `cap` bounds the unpinned
+    /// entries and `fail_pin_cap` the live write-failure pins.
     pub fn new(buckets: usize, cap: usize, fail_pin_cap: usize, pin_stake: bool) -> Self {
         Self(Some(Arc::new(Inner {
             state: Mutex::new(SupplyState {
@@ -339,7 +337,7 @@ impl SupplyTracker {
         let mut state = inner.state();
         if state.status == SupplyStatus::GapFilling {
             state.status = SupplyStatus::Live;
-            // The repaired range is applied. Its gap-close skips no longer hold.
+            // The repaired range is applied, so the gap-close skips are void.
             state.gap_closes.clear();
         }
     }
@@ -368,9 +366,8 @@ impl SupplyTracker {
         inner.refresh_cache_gauges(&state.cache);
     }
 
-    /// The per-block delta path. Runs under the block-writes lock, releases it
-    /// before returning so the caller's inserts and the next block's miss read
-    /// run outside it. See the module rustdoc for the lock protocol.
+    /// The per-block delta path. Takes the block-writes lock and releases it
+    /// before returning. See the module rustdoc for the lock protocol.
     pub async fn apply_block(
         &self,
         slot: u64,
@@ -385,7 +382,6 @@ impl SupplyTracker {
         };
         let _write_guard = inner.block_writes.lock().await;
 
-        // Non-circulating member balances come from the deduped set, guarded on slot.
         for p in &pending {
             self.observe_account(p.pubkey, slot, p.lamports);
         }
@@ -500,9 +496,8 @@ impl SupplyTracker {
         BlockOutcome::Delta { delta, touched }
     }
 
-    /// Commits the block outcome. On a write failure while Live it pins the
-    /// block's touched set so the DB is never consulted for it; if the pin cap is
-    /// exceeded it marks Stale. During bootstrap a write failure poisons it.
+    /// Commits the block outcome. A write failure while Live pins the touched
+    /// set, or marks Stale past the pin cap. During bootstrap it poisons the seed.
     pub fn finish_block(&self, slot: u64, outcome: BlockOutcome, block_writes_ok: bool) -> Option<SupplyCommit> {
         let inner = self.0.as_deref()?;
         match outcome {
@@ -647,18 +642,14 @@ mod tests {
             .expect("bootstrap commits");
         // total = 1000 + (300 - 200) + (0 - 50) = 1050.
         assert_eq!(commit.total, 1050);
-        // The closed account seeds zero_prev.
         assert!(t.0.as_deref().unwrap().state().startup_zero_prev.contains(&pk(2)));
     }
 
-    #[tokio::test]
-    async fn stale_after_read_failure_returns_no_delta() {
+    #[test]
+    fn stale_tracker_commits_nothing() {
         let t = tracker();
         t.set_startup_total(100, 1_000);
-        // Flip to Live with no touches.
         t.finish_bootstrap(&HashMap::new()).expect("live");
-        // A miss with no DB connection can't be exercised here; instead assert the
-        // status machine: mark_stale then commit_block is a no-op.
         assert!(t.mark_stale());
         assert!(t.finish_block(200, BlockOutcome::Delta { delta: 5, touched: vec![] }, true).is_none());
     }

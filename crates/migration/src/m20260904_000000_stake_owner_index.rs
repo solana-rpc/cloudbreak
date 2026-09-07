@@ -6,7 +6,7 @@ pub struct Migration;
 /// Partial index on stake-owned rows of the `accounts` table for the getSupply
 /// non-circulating stake scan. With owner partitioning off, the scan is otherwise
 /// a full ~1.15B-row table scan every 10 minutes. Gated by
-/// `pg-indexes.idx-accounts-stake-owner`; only the supply node sets it.
+/// `pg-indexes.idx-accounts-stake-owner`. Only the supply node sets it.
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {

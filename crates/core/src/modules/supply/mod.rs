@@ -28,7 +28,7 @@
 //!
 //! # Runtime model
 //!
-//! The indexer builds and persists the total; the API only reads the ring. A
+//! The indexer builds and persists the total. The API only reads the ring. A
 //! disabled tracker is a cheap-clone no-op handle. The block path calls
 //! `apply_block` under the block-writes lock, releases it before the inserts,
 //! then `finish_block` commits or fails closed.
@@ -38,7 +38,7 @@
 //! The miss read runs strictly before the block's own inserts, or it would read
 //! the block's own row as the previous balance. `apply_block` returns before the
 //! inserts are spawned. The block-writes lock serializes the bootstrap resolve's
-//! second pass against the block path. It no longer spans the inserts: nothing
+//! second pass against the block path. It does not span the inserts: nothing
 //! the resolve reads is written by a live block.
 //!
 //! # Newest state wins

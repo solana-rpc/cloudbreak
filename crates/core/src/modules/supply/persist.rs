@@ -52,9 +52,8 @@ pub async fn from_config(db: &DatabaseConnection, config: &IndexConfig) -> Suppl
         panic!("[supply] requires snapshot pg-indexes idx-snapshot-accounts-stake-owner = true");
     }
 
-    // Catalog requirements: the indexer config has no partitioning knob, so the
-    // catalog is the truth. Both tables must be plain (relkind 'r', not 'p'), and
-    // the pubkey-slot and stake-owner indexes must exist on `accounts`.
+    // Catalog requirements. The indexer config has no partitioning knob, so the
+    // catalog is the truth for the table kinds and the `accounts` indexes.
     for table in ["accounts", "snapshot_accounts"] {
         let relkind = table_relkind(db, table).await;
         match relkind.as_deref() {

@@ -4,7 +4,7 @@
  */
 
 //! The one read path shared by the API. The indexer writes the ring and the
-//! member list; the API only reads them through [`load_latest_supply`]. No
+//! member list. The API only reads them through [`load_latest_supply`]. No
 //! feature-enablement state lives in the DB: an absent ring means not served.
 
 use crate::modules::supply::tracker::SUPPLY_RING_SLOTS;

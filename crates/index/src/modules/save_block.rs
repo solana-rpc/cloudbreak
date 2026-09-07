@@ -201,9 +201,8 @@ pub async fn save_block(
         chunks.push((current_chunk, current_chunk_bytes));
     }
 
-    // Build the deduped closed list from the block's final state, so a same-block
-    // close then recreate produces one real row and no mask that would violate the
-    // (pubkey, slot) primary key.
+    // Dedupe the closed list from the block's final state, so a same-block close
+    // then recreate produces one real row and no mask on the (pubkey, slot) key.
     if supply_enabled {
         closed_accounts_for_slot.retain(|pubkey| {
             Pubkey::try_from(pubkey.as_slice())
@@ -213,9 +212,8 @@ pub async fn save_block(
         });
     }
 
-    // The supply delta runs under the block-writes lock, released before the
-    // block's own inserts so the miss read never reads this block's rows. The
-    // tracker owns the lock, the gap bookkeeping, and the metrics.
+    // The supply delta runs under the block-writes lock and releases it before
+    // the block's own inserts, so the miss read never reads this block's rows.
     let supply_query_timeout = Duration::from_secs(config.database.save_block_queries_timeout);
     let supply_pending: Vec<Pending> = if supply_enabled {
         pending_supply_accounts
@@ -336,8 +334,8 @@ pub async fn save_block(
     )
     .await;
 
-    // Commit or fail closed. The tracker set the status, total, and slot gauges
-    // and pinned or marked stale on a write failure; persist the row it returns.
+    // Commit or fail closed. The tracker handles the gauges and the write-failure
+    // pinning. Persist the row it returns.
     if let Some(commit) = supply_tracker.finish_block(slot, supply_outcome, block_writes_ok) {
         supply::persist::persist_supply_row(db, &commit, supply_query_timeout).await;
     }

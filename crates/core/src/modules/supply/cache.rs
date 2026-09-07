@@ -51,9 +51,7 @@ pub struct HotAccounts {
     pin_stake: bool,
     /// Maintained incrementally so the sweep and metrics never rescan the map.
     pinned_count: usize,
-    /// Entries pinned by a write failure, counted against `fail_pin_cap`.
     fail_pinned: usize,
-    /// Slot of the last sweep, for the "at least every N slots" trigger.
     last_sweep_slot: u64,
 }
 
@@ -94,9 +92,8 @@ impl HotAccounts {
         self.map.capacity()
     }
 
-    /// Writes back `(lamports, slot, write_version)` for a touched account and
-    /// updates its pinned flag from the owner. Adjusts the pinned count. Used for
-    /// hits and for the miss write-back. Never downgrades on a stale stamp.
+    /// Writes back a touched account and its pinned flag. Never downgrades on a
+    /// stale stamp.
     fn write_back(&mut self, pubkey: Pubkey, lamports: u64, slot: u64, wv: u64, owner: &Pubkey) {
         let pinned = self.is_stake(owner);
         match self.map.get_mut(&pubkey) {
@@ -137,11 +134,9 @@ impl HotAccounts {
         }
     }
 
-    /// Probes a touched account. On a hit the delta is folded and the entry
-    /// written back. On a miss the caller resolves it with a DB read.
-    ///
-    /// `zero_prev` forces a full count with no DB read, for an account that
-    /// closed inside the bootstrap window: its previous balance is known to be 0.
+    /// Probes a touched account. A hit folds the delta and writes back. A miss
+    /// leaves the DB read to the caller. `zero_prev` forces a full count for an
+    /// account that closed inside the bootstrap window.
     pub fn probe(
         &mut self,
         pubkey: Pubkey,
@@ -174,9 +169,8 @@ impl HotAccounts {
         }
     }
 
-    /// Applies the entry rule after a miss read returned `prev` (or `None`).
-    /// Inserts the newer of the block write and the DB row, and returns the
-    /// delta.
+    /// Applies the entry rule after a miss read. Inserts the newer of the block
+    /// write and the DB row, and returns the delta.
     pub fn apply_miss(
         &mut self,
         pubkey: Pubkey,
@@ -203,9 +197,8 @@ impl HotAccounts {
         }
     }
 
-    /// Seeds one stake account from the snapshot. Newest `(slot, write_version)`
-    /// wins across the concurrent full and incremental passes. Stored pinned,
-    /// including a zero-lamport tombstone.
+    /// Seeds one stake account from the snapshot, pinned. Newest stamp wins
+    /// across the concurrent full and incremental passes.
     pub fn seed_stake_account(&mut self, pubkey: Pubkey, lamports: u64, slot: u64, wv: u64) {
         match self.map.get_mut(&pubkey) {
             Some(entry) => {
@@ -231,10 +224,8 @@ impl HotAccounts {
         }
     }
 
-    /// Folds the stake scan into the pinned set: inserts an absent account,
-    /// upgrades an older entry, never downgrades. Drops pinned tombstones older
-    /// than `scan_slot - PINNED_TOMBSTONE_RETENTION`, whose DB rows are
-    /// finalize-cleaned by then so a miss read returns the same answer (nothing).
+    /// Folds the stake scan into the pinned set, never downgrading. Drops pinned
+    /// tombstones past `PINNED_TOMBSTONE_RETENTION`, whose DB rows are gone by then.
     pub fn refresh_pinned(
         &mut self,
         rows: impl IntoIterator<Item = (Pubkey, u64, u64, u64)>,
@@ -309,14 +300,9 @@ impl HotAccounts {
         before - self.map.len()
     }
 
-    /// Pins a live-write-failure block's touched accounts so the DB is never
-    /// consulted for them, keeping the cache authoritative. Returns false when
-    /// the failure-pin cap would be exceeded, so the tracker fails closed.
-    ///
-    /// Exactness: each touched entry already holds this block's applied write, so
-    /// pinning it keeps the correct balance resident. Nothing else writes the
-    /// account before its next touch, so no later hit or miss ever needs the row
-    /// the failed write never persisted.
+    /// Pins a failed block's touched accounts so the DB is never consulted for them.
+    /// Exact: each entry already holds this block's write, and nothing else writes
+    /// it before its next touch. Returns false past the failure-pin cap.
     pub fn pin_failed(&mut self, pubkeys: &[Pubkey]) -> bool {
         let mut newly = 0usize;
         for pubkey in pubkeys {
@@ -369,7 +355,6 @@ mod tests {
         assert!(matches!(c.probe(pk(1), 100, 10, 1, &other(), false), Probe::Miss));
         let d = c.apply_miss(pk(1), 100, 10, 1, &other(), None);
         assert_eq!(d, 100);
-        // Next touch is a hit with the delta from the stored balance.
         match c.probe(pk(1), 150, 12, 2, &other(), false) {
             Probe::Hit(d) => assert_eq!(d, 50),
             Probe::Miss => panic!("expected hit"),
@@ -381,24 +366,14 @@ mod tests {
     fn older_stamp_rejected() {
         let mut c = cache();
         c.apply_miss(pk(1), 100, 12, 5, &other(), None);
-        // An update at an older slot contributes 0 and does not overwrite.
-        match c.probe(pk(1), 40, 11, 1, &other(), false) {
-            Probe::Hit(d) => assert_eq!(d, 0),
-            Probe::Miss => panic!("expected hit"),
+        // An older slot, then an equal slot with a lower write version.
+        for (slot, wv) in [(11, 1), (12, 4)] {
+            match c.probe(pk(1), 40, slot, wv, &other(), false) {
+                Probe::Hit(d) => assert_eq!(d, 0),
+                Probe::Miss => panic!("expected hit"),
+            }
+            assert_eq!(c.get(&pk(1)).unwrap().lamports, 100);
         }
-        assert_eq!(c.get(&pk(1)).unwrap().lamports, 100);
-    }
-
-    #[test]
-    fn equal_slot_replay_contributes_zero() {
-        let mut c = cache();
-        c.apply_miss(pk(1), 100, 12, 5, &other(), None);
-        match c.probe(pk(1), 999, 12, 4, &other(), false) {
-            Probe::Hit(d) => assert_eq!(d, 0),
-            Probe::Miss => panic!("expected hit"),
-        }
-        // Same slot, lower write version: no overwrite.
-        assert_eq!(c.get(&pk(1)).unwrap().lamports, 100);
     }
 
     #[test]
@@ -414,16 +389,8 @@ mod tests {
     }
 
     #[test]
-    fn miss_no_row_counts_full() {
-        let mut c = cache();
-        let d = c.apply_miss(pk(5), 100, 30, 1, &other(), None);
-        assert_eq!(d, 100);
-    }
-
-    #[test]
     fn miss_newer_db_row_contributes_zero_and_caches_it() {
         let mut c = cache();
-        // The DB already has a newer row than this block write.
         let d = c.apply_miss(pk(5), 500, 30, 1, &other(), Some((700, 31, 9)));
         assert_eq!(d, 0);
         let e = c.get(&pk(5)).unwrap();
@@ -463,11 +430,9 @@ mod tests {
         assert_eq!(c.hot_len(), 4);
         let evicted = c.sweep(100);
         assert!(evicted >= 1);
-        // Pinned entries survive.
         assert!(c.get(&pk(1)).is_some());
         assert!(c.get(&pk(2)).is_some());
         assert_eq!(c.pinned_len(), 2);
-        // The newest unpinned entry survives.
         assert!(c.get(&pk(13)).is_some());
     }
 

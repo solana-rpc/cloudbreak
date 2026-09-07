@@ -37,10 +37,9 @@ fn parse_pubkey(bytes: Vec<u8>) -> Result<Pubkey, sea_orm::DbErr> {
         .map_err(|_| sea_orm::DbErr::Custom("invalid pubkey bytes in query result".to_string()))
 }
 
-/// Returns the latest row by pubkey for every miss account. A key with no row is
-/// absent from the map, meaning a new account. The `prev_slot >= block_slot` test
-/// is applied by the caller in Rust, not with a `slot < block` SQL filter, which
-/// would double-count a gap write for an evicted account.
+/// Returns the latest row by pubkey for every miss account. No row means a new
+/// account. The caller compares `prev_slot` to the block slot in Rust. A SQL
+/// `slot < block` filter would double-count a gap write for an evicted account.
 pub async fn fetch_prev_balances(
     db: &DatabaseConnection,
     pubkeys: &[Pubkey],
@@ -53,9 +52,8 @@ pub async fn fetch_prev_balances(
 
     let query = db.query_all(Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
-        // No owner predicate and no slot filter. `lamports DESC` is the same-slot
-        // mask tie-break; it cannot fire under the `(pubkey, slot)` primary key
-        // but keeps the read exact if a mask and a real row ever coexist.
+        // `lamports DESC` breaks a same-slot mask tie. It cannot fire under the
+        // `(pubkey, slot)` key but keeps the read exact if it ever does.
         r#"
         SELECT v.pubkey, prev.lamports, prev.slot, prev.write_version
         FROM unnest($1::bytea[]) AS v(pubkey)
@@ -136,9 +134,8 @@ pub async fn fetch_startup_balances(
     Ok(out)
 }
 
-/// Fetches the latest lamports/slot by pubkey for the non-circulating members
-/// that are not stake accounts (the pinned-list holders). Owner-blind, one
-/// batched read. Stake member balances come from the recomputer's scan instead.
+/// Fetches the latest lamports/slot by pubkey for the non-circulating members.
+/// Owner-blind, one batched read.
 pub async fn fetch_member_balances(
     db: &DatabaseConnection,
     pubkeys: &[Pubkey],

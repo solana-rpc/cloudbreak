@@ -12,7 +12,7 @@ pub type SharedSupplySnapshot = Arc<RwLock<Arc<SupplySnapshot>>>;
 const SUPPLY_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Polls the supply ring and the member list into the API cache. The query lives
-/// in core `read.rs`, shared with the indexer; this task only refreshes the cache.
+/// in core `read.rs`, shared with the indexer. This task only refreshes the cache.
 pub fn spawn_poll_task(db: DatabaseConnection, cache: SharedSupplySnapshot) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {

@@ -86,10 +86,8 @@ const SYSVAR_OWNER_ID: Pubkey =
 const CLOCK_SYSVAR_ID: Pubkey =
     Pubkey::from_str_const("SysvarC1ock11111111111111111111111111111111");
 
-/// Latest live state per account for a given owner, across the live and snapshot
-/// tables. Carries slot and write_version so the stake scan can feed the supply
-/// pinned set. Rides `idx_accounts_stake_owner` when the owner is the Stake
-/// program on the de-partitioned supply node.
+/// Latest live state per account for one owner, across the live and snapshot
+/// tables. On the supply node the stake scan rides `idx_accounts_stake_owner`.
 pub const LATEST_BY_OWNER_SQL: &str = r#"
 WITH latest AS (
     SELECT DISTINCT ON (pubkey) pubkey, data, lamports, slot, write_version
@@ -175,9 +173,8 @@ pub fn spawn_non_circulating_recomputer(
             // reward burst stays cache hits. No-op when stake pinning is off.
             supply_tracker.refresh_pinned(stake_rows.iter().copied(), slot);
 
-            // On a supply node the owner map is off, so member balances are read
-            // by pubkey. On a largest-accounts node the map routes to the owner
-            // partition. Either way, no member balance is served stale.
+            // With the owner map off (supply node) member balances are read by
+            // pubkey. With it on (largest-accounts node) the map routes by owner.
             let balances = if accounts_owner_map.is_enabled() {
                 let members: Vec<(Pubkey, Pubkey)> = accounts
                     .iter()
@@ -231,8 +228,7 @@ pub fn spawn_non_circulating_recomputer(
 }
 
 /// Returns the membership slot, the member set, the next lockup expiry, and the
-/// full stake scan rows `(pubkey, lamports, slot, write_version)` for the supply
-/// pinned set.
+/// stake scan rows `(pubkey, lamports, slot, write_version)`.
 async fn recompute(
     db: &DatabaseConnection,
 ) -> Result<(u64, Vec<Pubkey>, Option<i64>, Vec<(Pubkey, u64, u64, u64)>), anyhow::Error> {
