@@ -16,10 +16,11 @@ use yellowstone_grpc_proto::geyser::{
     SubscribeUpdateAccount, SubscribeUpdateAccountInfo, SubscribeUpdateBlock,
 };
 use cloudbreak_core::{
-    Result, STAKE_PROGRAM_ID, SnapshotConfig,
+    Result, SnapshotConfig,
     modules::{
         account_owner_map::AccountOwnerMap,
         largest_accounts::LargestAccountsTracker,
+        non_circulating::NonCirculatingTracker,
         supply::{self, SupplyTracker},
     },
 };
@@ -40,14 +41,12 @@ pub use db_queries::persist_epoch_stakes;
 
 const DB_ACCOUNTS_BATCH_SIZE: usize = 200;
 
-/// Timeout for the one supply seed upsert at snapshot start.
-const SUPPLY_SEED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-
 /// Download and save into postgres the snapshot data for the received slot (getting all snapshots files
 ///  needed until data to that slot is available)
 /// If slot is not provided it will just download the latest available full and incremental snapshots
 ///
 /// Safety Note: This function should be run in a separate thread to avoid blocking the main thread
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     config: SnapshotConfig,
     received_slot: Option<u64>,
@@ -55,6 +54,7 @@ pub async fn run(
     buffer_size: Option<Arc<Mutex<usize>>>,
     accounts_owner_map: AccountOwnerMap,
     largest_accounts: LargestAccountsTracker,
+    non_circulating: NonCirculatingTracker,
     supply_tracker: SupplyTracker,
 ) -> Result<()> {
     let start_time = Instant::now();
@@ -84,6 +84,7 @@ pub async fn run(
         config.clone(),
         accounts_owner_map.clone(),
         largest_accounts.clone(),
+        non_circulating.clone(),
         supply_tracker.clone(),
     );
 
@@ -97,6 +98,7 @@ pub async fn run(
             config.clone(),
             accounts_owner_map.clone(),
             largest_accounts.clone(),
+            non_circulating.clone(),
             supply_tracker.clone(),
         )
         .await??;
@@ -121,7 +123,12 @@ pub async fn run(
     db_queries::clean_up_closed_accounts(&database).await?;
     db_queries::create_database_indexes(&database, &config.pg_indexes).await?;
 
-    largest_accounts.finish_bootstrap_and_persist(&database).await;
+    // Membership flips first: GLA seeds its class sentinels from it, and every
+    // supply commit reads its running sum.
+    non_circulating.finish_bootstrap_and_persist(&database).await;
+    largest_accounts
+        .finish_bootstrap_and_persist(&database, &non_circulating)
+        .await;
     supply::bootstrap::finish_bootstrap(&database, &supply_tracker).await;
 
     tracing::info!(
@@ -132,6 +139,7 @@ pub async fn run(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn download_and_process_snapshot(
     sidecar_endpoint: String,
     snapshot_data: SnapshotData,
@@ -140,6 +148,7 @@ fn download_and_process_snapshot(
     config: SnapshotConfig,
     accounts_owner_map: AccountOwnerMap,
     largest_accounts: LargestAccountsTracker,
+    non_circulating: NonCirculatingTracker,
     supply_tracker: SupplyTracker,
 ) -> JoinHandle<Result<()>> {
     let db_clone = database.clone();
@@ -164,6 +173,7 @@ fn download_and_process_snapshot(
             config,
             accounts_owner_map,
             largest_accounts,
+            non_circulating,
             supply_tracker,
         )
         .await?;
@@ -173,6 +183,7 @@ fn download_and_process_snapshot(
 }
 
 /// Note: this function uses `jobs` as a concurrency limit for spawning new tasks
+#[allow(clippy::too_many_arguments)]
 async fn process_downloaded_snapshot(
     database: &DatabaseConnection,
     snapshot_data: SnapshotData,
@@ -180,6 +191,7 @@ async fn process_downloaded_snapshot(
     config: SnapshotConfig,
     accounts_owner_map: AccountOwnerMap,
     largest_accounts: LargestAccountsTracker,
+    non_circulating: NonCirculatingTracker,
     supply_tracker: SupplyTracker,
 ) -> Result<()> {
     let start_time = Instant::now();
@@ -197,15 +209,13 @@ async fn process_downloaded_snapshot(
         tracing::error!("Failed to persist epoch stakes from snapshot: {:?}", e);
     }
 
-    if supply_tracker.is_enabled() {
-        supply_tracker.set_startup_total(bank_info.slot, bank_info.capitalization);
-        let seed = supply::SupplyCommit {
-            slot: bank_info.slot,
-            total: bank_info.capitalization,
-            non_circulating: None,
-        };
-        supply::persist::persist_supply_row(database, &seed, SUPPLY_SEED_TIMEOUT).await;
-    }
+    supply::bootstrap::seed_anchor(
+        database,
+        &supply_tracker,
+        bank_info.slot,
+        bank_info.capitalization,
+    )
+    .await;
 
     let mut account_file_workers: JoinSet<Result<()>> = JoinSet::new();
     let accounts_file_concurency = config.accounts_file_concurency.unwrap_or(32);
@@ -274,7 +284,7 @@ async fn process_downloaded_snapshot(
 
         let accounts_owner_map = accounts_owner_map.clone();
         let largest_accounts = largest_accounts.clone();
-        let supply_tracker = supply_tracker.clone();
+        let non_circulating = non_circulating.clone();
 
         account_file_workers.spawn(async move {
             let start_time = Instant::now();
@@ -318,16 +328,15 @@ async fn process_downloaded_snapshot(
                         );
                     }
 
-                    // Seed only stake accounts into the supply pinned set, so the
-                    // epoch reward burst is all hits. No-op when supply is off.
-                    if account.owner == &STAKE_PROGRAM_ID {
-                        supply_tracker.seed_stake_account(
-                            *account.pubkey(),
-                            account.lamports,
-                            account_file_slot,
-                            write_version,
-                        );
-                    }
+                    // Seeds the stake map, the pinned accounts and the clock.
+                    // No-op unless a class-aware feature is on.
+                    non_circulating.seed_account(
+                        account.pubkey(),
+                        account.owner,
+                        account.lamports,
+                        account.data,
+                        account_file_slot,
+                    );
 
                     if !programs_include.is_empty() {
                         if !programs_include.contains(account.owner) {

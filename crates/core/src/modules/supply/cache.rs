@@ -3,26 +3,27 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-//! The bounded hot-accounts map. One entry per account touched recently or
-//! pinned, keyed by the full pubkey. It holds the previous balance for the
-//! per-block supply delta: a hit is a memory read, a miss goes to the DB.
+//! The bounded hot-accounts map. One entry per account touched recently, keyed
+//! by the full pubkey. It holds the previous balance for the per-block supply
+//! delta: a hit is a memory read, a miss goes to the DB. Stake-owned accounts
+//! never enter it, because the non-circulating stake map owns their balance.
 //!
 //! No async, no DB, no lock. The tracker owns one `HotAccounts` behind its state
 //! mutex and calls these methods under it. Fully unit-tested below.
 
 use crate::STAKE_PROGRAM_ID;
+use serde::Serialize;
 use solana_pubkey::Pubkey;
 use std::collections::HashMap;
 
 /// One cached account. A zero-lamport entry is a tombstone kept like any other,
-/// carrying the close stamp so a later repaired block contributes nothing.
-#[derive(Clone, Copy, Debug)]
+/// carrying the close slot so a later repaired block contributes nothing.
+#[derive(Clone, Copy, Debug, Serialize)]
 pub struct Entry {
     pub lamports: u64,
     pub slot: u64,
-    pub write_version: u64,
-    /// True while the account's last known owner is the Stake program. Pinned
-    /// entries are never swept, so the epoch-reward burst is all hits.
+    /// Pinned by a live write failure: never swept, so the DB is never
+    /// consulted for a balance it does not hold.
     pub pinned: bool,
 }
 
@@ -36,40 +37,33 @@ pub enum Probe {
     Miss,
 }
 
-/// The DB row a miss read returned for one account, or `None` for no row.
-pub type PrevRow = Option<(u64, u64, u64)>;
+/// The `(lamports, slot)` row a miss read returned for one account, or `None`
+/// for no row.
+pub type PrevRow = Option<(u64, u64)>;
 
 pub struct HotAccounts {
     map: HashMap<Pubkey, Entry>,
-    /// Cap on unpinned entries. Pinned stake accounts sit on top of it.
+    /// Cap on unpinned entries.
     cap: usize,
-    /// Cap on entries pinned by a live write failure, so a stuck DB does not pin
-    /// without bound. Beyond it the tracker fails closed.
+    /// Cap on pinned entries, so a stuck DB does not pin without bound. Beyond
+    /// it the tracker fails closed.
     fail_pin_cap: usize,
-    /// When false the stake-account pinning is off and stake rides the cap like
-    /// any other account. The epoch burst then falls to the DB.
-    pin_stake: bool,
     /// Maintained incrementally so the sweep and metrics never rescan the map.
     pinned_count: usize,
-    fail_pinned: usize,
     last_sweep_slot: u64,
 }
 
 impl HotAccounts {
-    pub fn with_capacity(buckets: usize, cap: usize, fail_pin_cap: usize, pin_stake: bool) -> Self {
+    /// Pre-sizes the map for the cap, the sweep slack above it, and the pin
+    /// budget, so it never resizes in steady state.
+    pub fn with_capacity(cap: usize, fail_pin_cap: usize) -> Self {
         Self {
-            map: HashMap::with_capacity(buckets),
+            map: HashMap::with_capacity(cap + cap / 10 + fail_pin_cap),
             cap,
             fail_pin_cap,
-            pin_stake,
             pinned_count: 0,
-            fail_pinned: 0,
             last_sweep_slot: 0,
         }
-    }
-
-    fn is_stake(&self, owner: &Pubkey) -> bool {
-        self.pin_stake && owner == &STAKE_PROGRAM_ID
     }
 
     pub fn pinned_len(&self) -> usize {
@@ -88,49 +82,55 @@ impl HotAccounts {
         self.map.is_empty()
     }
 
-    pub fn bucket_count(&self) -> usize {
+    /// Items the map holds before it resizes.
+    pub fn capacity(&self) -> usize {
         self.map.capacity()
     }
 
-    /// Writes back a touched account and its pinned flag. Never downgrades on a
-    /// stale stamp.
-    fn write_back(&mut self, pubkey: Pubkey, lamports: u64, slot: u64, wv: u64, owner: &Pubkey) {
-        let pinned = self.is_stake(owner);
+    pub fn cap(&self) -> usize {
+        self.cap
+    }
+
+    pub fn last_sweep_slot(&self) -> u64 {
+        self.last_sweep_slot
+    }
+
+    pub fn get(&self, pubkey: &Pubkey) -> Option<Entry> {
+        self.map.get(pubkey).copied()
+    }
+
+    /// Writes back a touched account. Never downgrades on an older slot. A
+    /// stake-owned write leaves the cache instead: the stake map owns it now.
+    fn write_back(&mut self, pubkey: Pubkey, lamports: u64, slot: u64, owner: &Pubkey) {
+        if owner == &STAKE_PROGRAM_ID {
+            self.remove(&pubkey);
+            return;
+        }
         match self.map.get_mut(&pubkey) {
             Some(entry) => {
-                if (slot, wv) >= (entry.slot, entry.write_version) {
+                if slot >= entry.slot {
                     entry.lamports = lamports;
                     entry.slot = slot;
-                    entry.write_version = wv;
-                    self.set_pinned(pubkey, pinned);
                 }
             }
             None => {
-                if pinned {
-                    self.pinned_count += 1;
-                }
                 self.map.insert(
                     pubkey,
                     Entry {
                         lamports,
                         slot,
-                        write_version: wv,
-                        pinned,
+                        pinned: false,
                     },
                 );
             }
         }
     }
 
-    /// Flips an existing entry's pinned flag and keeps the pinned count exact.
-    fn set_pinned(&mut self, pubkey: Pubkey, pinned: bool) {
-        if let Some(entry) = self.map.get_mut(&pubkey) {
-            if entry.pinned && !pinned {
-                self.pinned_count -= 1;
-            } else if !entry.pinned && pinned {
-                self.pinned_count += 1;
-            }
-            entry.pinned = pinned;
+    fn remove(&mut self, pubkey: &Pubkey) {
+        if let Some(entry) = self.map.remove(pubkey)
+            && entry.pinned
+        {
+            self.pinned_count -= 1;
         }
     }
 
@@ -142,29 +142,21 @@ impl HotAccounts {
         pubkey: Pubkey,
         lamports: u64,
         slot: u64,
-        wv: u64,
         owner: &Pubkey,
         zero_prev: bool,
     ) -> Probe {
         if zero_prev {
-            self.write_back(pubkey, lamports, slot, wv, owner);
+            self.write_back(pubkey, lamports, slot, owner);
             return Probe::Hit(lamports as i128);
         }
         match self.map.get(&pubkey).copied() {
-            Some(entry) => {
-                if entry.slot < slot {
-                    let delta = lamports as i128 - entry.lamports as i128;
-                    self.write_back(pubkey, lamports, slot, wv, owner);
-                    Probe::Hit(delta)
-                } else {
-                    // A replayed or out-of-order update. Newest stamp still wins,
-                    // but it contributes no delta.
-                    if (slot, wv) > (entry.slot, entry.write_version) {
-                        self.write_back(pubkey, lamports, slot, wv, owner);
-                    }
-                    Probe::Hit(0)
-                }
+            Some(entry) if entry.slot < slot => {
+                let delta = lamports as i128 - entry.lamports as i128;
+                self.write_back(pubkey, lamports, slot, owner);
+                Probe::Hit(delta)
             }
+            // A replayed or out-of-order update: already counted, no delta.
+            Some(_) => Probe::Hit(0),
             None => Probe::Miss,
         }
     }
@@ -176,96 +168,24 @@ impl HotAccounts {
         pubkey: Pubkey,
         lamports: u64,
         slot: u64,
-        wv: u64,
         owner: &Pubkey,
         prev: PrevRow,
     ) -> i128 {
         match prev {
             None => {
-                self.write_back(pubkey, lamports, slot, wv, owner);
+                self.write_back(pubkey, lamports, slot, owner);
                 lamports as i128
             }
-            Some((prev_lamports, prev_slot, _prev_wv)) if prev_slot < slot => {
-                self.write_back(pubkey, lamports, slot, wv, owner);
+            Some((prev_lamports, prev_slot)) if prev_slot < slot => {
+                self.write_back(pubkey, lamports, slot, owner);
                 lamports as i128 - prev_lamports as i128
             }
-            Some((prev_lamports, prev_slot, prev_wv)) => {
+            Some((prev_lamports, prev_slot)) => {
                 // The DB row is newer than the block write. Cache it, count 0.
-                self.write_back(pubkey, prev_lamports, prev_slot, prev_wv, owner);
+                self.write_back(pubkey, prev_lamports, prev_slot, owner);
                 0
             }
         }
-    }
-
-    /// Seeds one stake account from the snapshot, pinned. Newest stamp wins
-    /// across the concurrent full and incremental passes.
-    pub fn seed_stake_account(&mut self, pubkey: Pubkey, lamports: u64, slot: u64, wv: u64) {
-        match self.map.get_mut(&pubkey) {
-            Some(entry) => {
-                if (slot, wv) > (entry.slot, entry.write_version) {
-                    entry.lamports = lamports;
-                    entry.slot = slot;
-                    entry.write_version = wv;
-                }
-                self.set_pinned(pubkey, true);
-            }
-            None => {
-                self.pinned_count += 1;
-                self.map.insert(
-                    pubkey,
-                    Entry {
-                        lamports,
-                        slot,
-                        write_version: wv,
-                        pinned: true,
-                    },
-                );
-            }
-        }
-    }
-
-    /// Folds the stake scan into the pinned set, never downgrading. Drops pinned
-    /// tombstones past `PINNED_TOMBSTONE_RETENTION`, whose DB rows are gone by then.
-    pub fn refresh_pinned(
-        &mut self,
-        rows: impl IntoIterator<Item = (Pubkey, u64, u64, u64)>,
-        scan_slot: u64,
-    ) {
-        for (pubkey, lamports, slot, wv) in rows {
-            match self.map.get_mut(&pubkey) {
-                Some(entry) => {
-                    if (slot, wv) > (entry.slot, entry.write_version) {
-                        entry.lamports = lamports;
-                        entry.slot = slot;
-                        entry.write_version = wv;
-                    }
-                    self.set_pinned(pubkey, true);
-                }
-                None => {
-                    self.pinned_count += 1;
-                    self.map.insert(
-                        pubkey,
-                        Entry {
-                            lamports,
-                            slot,
-                            write_version: wv,
-                            pinned: true,
-                        },
-                    );
-                }
-            }
-        }
-
-        let cutoff = scan_slot.saturating_sub(PINNED_TOMBSTONE_RETENTION);
-        let mut dropped = 0usize;
-        self.map.retain(|_, entry| {
-            let drop = entry.pinned && entry.lamports == 0 && entry.slot < cutoff;
-            if drop {
-                dropped += 1;
-            }
-            !drop
-        });
-        self.pinned_count -= dropped;
     }
 
     /// True when the unpinned population is over the cap plus its slack, or the
@@ -304,31 +224,22 @@ impl HotAccounts {
     /// Exact: each entry already holds this block's write, and nothing else writes
     /// it before its next touch. Returns false past the failure-pin cap.
     pub fn pin_failed(&mut self, pubkeys: &[Pubkey]) -> bool {
-        let mut newly = 0usize;
-        for pubkey in pubkeys {
-            if self.map.get(pubkey).is_some_and(|entry| !entry.pinned) {
-                newly += 1;
-            }
-        }
-        if self.fail_pinned + newly > self.fail_pin_cap {
+        let newly = pubkeys
+            .iter()
+            .filter(|pubkey| self.map.get(pubkey).is_some_and(|entry| !entry.pinned))
+            .count();
+        if self.pinned_count + newly > self.fail_pin_cap {
             return false;
         }
-        self.fail_pinned += newly;
+        self.pinned_count += newly;
         for pubkey in pubkeys {
-            self.set_pinned(*pubkey, true);
+            if let Some(entry) = self.map.get_mut(pubkey) {
+                entry.pinned = true;
+            }
         }
         true
     }
-
-    #[cfg(test)]
-    pub fn get(&self, pubkey: &Pubkey) -> Option<Entry> {
-        self.map.get(pubkey).copied()
-    }
 }
-
-/// Pinned tombstones older than this many slots before the scan slot are
-/// dropped: their DB rows are finalize-cleaned, so a miss returns no row (0).
-const PINNED_TOMBSTONE_RETENTION: u64 = 1_000;
 
 /// The sweep runs at least this often even when the cap is not exceeded.
 const SWEEP_SLOT_FLOOR: u64 = 3_000;
@@ -346,16 +257,19 @@ mod tests {
     }
 
     fn cache() -> HotAccounts {
-        HotAccounts::with_capacity(64, 4, 8, true)
+        HotAccounts::with_capacity(4, 8)
     }
 
     #[test]
     fn hit_delta_and_write_back() {
         let mut c = cache();
-        assert!(matches!(c.probe(pk(1), 100, 10, 1, &other(), false), Probe::Miss));
-        let d = c.apply_miss(pk(1), 100, 10, 1, &other(), None);
+        assert!(matches!(
+            c.probe(pk(1), 100, 10, &other(), false),
+            Probe::Miss
+        ));
+        let d = c.apply_miss(pk(1), 100, 10, &other(), None);
         assert_eq!(d, 100);
-        match c.probe(pk(1), 150, 12, 2, &other(), false) {
+        match c.probe(pk(1), 150, 12, &other(), false) {
             Probe::Hit(d) => assert_eq!(d, 50),
             Probe::Miss => panic!("expected hit"),
         }
@@ -363,12 +277,12 @@ mod tests {
     }
 
     #[test]
-    fn older_stamp_rejected() {
+    fn older_or_same_slot_contributes_nothing() {
         let mut c = cache();
-        c.apply_miss(pk(1), 100, 12, 5, &other(), None);
-        // An older slot, then an equal slot with a lower write version.
-        for (slot, wv) in [(11, 1), (12, 4)] {
-            match c.probe(pk(1), 40, slot, wv, &other(), false) {
+        c.apply_miss(pk(1), 100, 12, &other(), None);
+        // An out-of-order older slot, then a replayed equal slot.
+        for slot in [11, 12] {
+            match c.probe(pk(1), 40, slot, &other(), false) {
                 Probe::Hit(d) => assert_eq!(d, 0),
                 Probe::Miss => panic!("expected hit"),
             }
@@ -380,9 +294,9 @@ mod tests {
     fn tombstone_hit_counts_full_new_balance() {
         let mut c = cache();
         // Close: zero-lamport tombstone kept with the close stamp.
-        c.apply_miss(pk(1), 0, 12, 5, &other(), None);
+        c.apply_miss(pk(1), 0, 12, &other(), None);
         assert_eq!(c.get(&pk(1)).unwrap().lamports, 0);
-        match c.probe(pk(1), 130, 13, 1, &other(), false) {
+        match c.probe(pk(1), 130, 13, &other(), false) {
             Probe::Hit(d) => assert_eq!(d, 130),
             Probe::Miss => panic!("expected hit"),
         }
@@ -391,7 +305,7 @@ mod tests {
     #[test]
     fn miss_newer_db_row_contributes_zero_and_caches_it() {
         let mut c = cache();
-        let d = c.apply_miss(pk(5), 500, 30, 1, &other(), Some((700, 31, 9)));
+        let d = c.apply_miss(pk(5), 500, 30, &other(), Some((700, 31)));
         assert_eq!(d, 0);
         let e = c.get(&pk(5)).unwrap();
         assert_eq!((e.lamports, e.slot), (700, 31));
@@ -400,33 +314,38 @@ mod tests {
     #[test]
     fn miss_older_db_row_counts_difference() {
         let mut c = cache();
-        let d = c.apply_miss(pk(5), 500, 30, 2, &other(), Some((300, 28, 1)));
+        let d = c.apply_miss(pk(5), 500, 30, &other(), Some((300, 28)));
         assert_eq!(d, 200);
         assert_eq!(c.get(&pk(5)).unwrap().lamports, 500);
     }
 
     #[test]
-    fn pinned_routing_by_owner_and_unpin_on_close() {
+    fn stake_owned_write_leaves_the_cache() {
         let mut c = cache();
-        c.apply_miss(pk(1), 100, 10, 1, &STAKE_PROGRAM_ID, None);
-        assert!(c.get(&pk(1)).unwrap().pinned);
-        assert_eq!(c.pinned_len(), 1);
-        // Close under the system program: becomes an unpinned tombstone.
-        c.probe(pk(1), 0, 11, 2, &other(), false);
-        assert!(!c.get(&pk(1)).unwrap().pinned);
+        c.apply_miss(pk(1), 100, 10, &other(), None);
+        assert!(c.pin_failed(&[pk(1)]));
+        // The delta still counts, then the stake map owns the pubkey.
+        match c.probe(pk(1), 100, 11, &STAKE_PROGRAM_ID, false) {
+            Probe::Hit(d) => assert_eq!(d, 0),
+            Probe::Miss => panic!("expected hit"),
+        }
+        assert!(c.get(&pk(1)).is_none());
         assert_eq!(c.pinned_len(), 0);
+        assert_eq!(c.apply_miss(pk(2), 5, 11, &STAKE_PROGRAM_ID, None), 5);
+        assert!(c.is_empty());
     }
 
     #[test]
     fn sweep_keeps_pinned_and_drops_below_cutoff() {
-        let mut c = HotAccounts::with_capacity(64, 2, 8, true);
+        let mut c = HotAccounts::with_capacity(2, 8);
         // Two pinned, four unpinned at rising slots.
-        c.apply_miss(pk(1), 1, 5, 1, &STAKE_PROGRAM_ID, None);
-        c.apply_miss(pk(2), 1, 6, 1, &STAKE_PROGRAM_ID, None);
-        c.apply_miss(pk(10), 1, 10, 1, &other(), None);
-        c.apply_miss(pk(11), 1, 11, 1, &other(), None);
-        c.apply_miss(pk(12), 1, 12, 1, &other(), None);
-        c.apply_miss(pk(13), 1, 13, 1, &other(), None);
+        c.apply_miss(pk(1), 1, 5, &other(), None);
+        c.apply_miss(pk(2), 1, 6, &other(), None);
+        assert!(c.pin_failed(&[pk(1), pk(2)]));
+        c.apply_miss(pk(10), 1, 10, &other(), None);
+        c.apply_miss(pk(11), 1, 11, &other(), None);
+        c.apply_miss(pk(12), 1, 12, &other(), None);
+        c.apply_miss(pk(13), 1, 13, &other(), None);
         assert_eq!(c.hot_len(), 4);
         let evicted = c.sweep(100);
         assert!(evicted >= 1);
@@ -437,44 +356,11 @@ mod tests {
     }
 
     #[test]
-    fn seed_newest_wins_across_out_of_order_passes() {
-        let mut c = cache();
-        // Incremental (higher slot) arrives first, then full (lower slot).
-        c.seed_stake_account(pk(6), 600, 50, 5);
-        c.seed_stake_account(pk(6), 500, 40, 4);
-        let e = c.get(&pk(6)).unwrap();
-        assert_eq!((e.lamports, e.slot), (600, 50));
-        assert!(e.pinned);
-    }
-
-    #[test]
-    fn refresh_pinned_never_downgrades() {
-        let mut c = cache();
-        c.seed_stake_account(pk(6), 600, 50, 5);
-        c.refresh_pinned([(pk(6), 100, 40, 1)], 60);
-        // Older scan row does not clobber the newer seed.
-        assert_eq!(c.get(&pk(6)).unwrap().lamports, 600);
-        c.refresh_pinned([(pk(6), 800, 70, 1)], 80);
-        assert_eq!(c.get(&pk(6)).unwrap().lamports, 800);
-    }
-
-    #[test]
-    fn refresh_pinned_drops_old_tombstone() {
-        let mut c = cache();
-        c.seed_stake_account(pk(6), 0, 50, 5);
-        assert_eq!(c.pinned_len(), 1);
-        // Scan far ahead: the old tombstone is dropped.
-        c.refresh_pinned(std::iter::empty(), 50 + PINNED_TOMBSTONE_RETENTION + 1);
-        assert!(c.get(&pk(6)).is_none());
-        assert_eq!(c.pinned_len(), 0);
-    }
-
-    #[test]
     fn pin_failed_respects_cap() {
-        let mut c = HotAccounts::with_capacity(64, 4, 2, true);
-        c.apply_miss(pk(1), 1, 5, 1, &other(), None);
-        c.apply_miss(pk(2), 1, 6, 1, &other(), None);
-        c.apply_miss(pk(3), 1, 7, 1, &other(), None);
+        let mut c = HotAccounts::with_capacity(4, 2);
+        c.apply_miss(pk(1), 1, 5, &other(), None);
+        c.apply_miss(pk(2), 1, 6, &other(), None);
+        c.apply_miss(pk(3), 1, 7, &other(), None);
         assert!(c.pin_failed(&[pk(1), pk(2)]));
         // Third failure pin exceeds the cap of 2.
         assert!(!c.pin_failed(&[pk(3)]));

@@ -7,6 +7,7 @@
 //! member list. The API only reads them through [`load_latest_supply`]. No
 //! feature-enablement state lives in the DB: an absent ring means not served.
 
+use crate::modules::non_circulating::read::load_members;
 use crate::modules::supply::tracker::SUPPLY_RING_SLOTS;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
@@ -64,25 +65,9 @@ pub async fn load_latest_supply(
     }
     rows.reverse();
 
-    let nc_row = db
-        .query_one(Statement::from_string(
-            DatabaseBackend::Postgres,
-            "SELECT accounts FROM non_circulating_accounts WHERE id = 1".to_string(),
-        ))
-        .await?;
-    let non_circulating_accounts = match nc_row {
-        Some(row) => {
-            let accounts: Vec<Vec<u8>> = row.try_get("", "accounts")?;
-            Some(
-                accounts
-                    .into_iter()
-                    .filter_map(|bytes| Pubkey::try_from(bytes.as_slice()).ok())
-                    .map(|p| p.to_string())
-                    .collect(),
-            )
-        }
-        None => None,
-    };
+    let non_circulating_accounts = load_members(db)
+        .await?
+        .map(|members| members.iter().map(Pubkey::to_string).collect());
 
     Ok(Some(SupplySnapshot {
         rows,

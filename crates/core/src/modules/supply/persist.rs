@@ -5,21 +5,18 @@
 
 //! The write path and the `from_config` constructor. `from_config` validates the
 //! node requirements (owner map off, owner partitioning off, snapshot present,
-//! empty programs filter, the stake and pubkey indexes), clears a prior run's
-//! rows, and pre-sizes the cache. `persist_supply_row` is the single upsert used
-//! by the seed, the bootstrap resolve, and the block path.
+//! empty programs filter, the pubkey indexes), clears a prior run's rows, and
+//! pre-sizes the cache. `persist_supply_row` is the single upsert used by the
+//! seed, the bootstrap resolve, and the block path.
 
-use crate::modules::supply::tracker::{SUPPLY_RING_SLOTS, SupplyCommit, SupplyTracker};
 use crate::IndexConfig;
+use crate::metrics::SUPPLY_DB_MICROSECONDS;
+use crate::modules::non_circulating::NonCirculatingTracker;
+use crate::modules::supply::tracker::{SUPPLY_RING_SLOTS, SupplyCommit, SupplyTracker};
 use rust_decimal::Decimal;
-use sea_orm::{
-    ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement, Value,
-};
+use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement, Value};
 use std::time::Duration;
-
-/// Pre-sized bucket target for the hot-accounts map: 2^22 buckets hold the ~2.55M
-/// peak (1.1M unpinned cap plus ~1.45M pinned stake) at the 7/8 load factor.
-const SUPPLY_CACHE_BUCKETS: usize = 1 << 22;
+use tokio::time::Instant;
 
 /// Failure-pin budget: the number of live-write-failure accounts pinned before
 /// the tracker fails closed. About 200k entries, ~13 MB.
@@ -28,7 +25,11 @@ const SUPPLY_FAIL_PIN_CAP: usize = 200_000;
 /// Builds the tracker from config. Returns the disabled handle when the `[supply]`
 /// section is absent or off. When on it panics on any unmet node requirement, so
 /// a misconfigured node never serves a wrong total.
-pub async fn from_config(db: &DatabaseConnection, config: &IndexConfig) -> SupplyTracker {
+pub async fn from_config(
+    db: &DatabaseConnection,
+    config: &IndexConfig,
+    non_circulating: NonCirculatingTracker,
+) -> SupplyTracker {
     let Some(supply) = config.supply.as_ref().filter(|s| s.enabled) else {
         return SupplyTracker::default();
     };
@@ -48,12 +49,9 @@ pub async fn from_config(db: &DatabaseConnection, config: &IndexConfig) -> Suppl
     if !snapshot.pg_indexes.idx_snapshot_accounts_pubkey_slot {
         panic!("[supply] requires snapshot pg-indexes idx-snapshot-accounts-pubkey-slot = true");
     }
-    if !snapshot.pg_indexes.idx_snapshot_accounts_stake_owner {
-        panic!("[supply] requires snapshot pg-indexes idx-snapshot-accounts-stake-owner = true");
-    }
 
     // Catalog requirements. The indexer config has no partitioning knob, so the
-    // catalog is the truth for the table kinds and the `accounts` indexes.
+    // catalog is the truth for the table kinds and the `accounts` index.
     for table in ["accounts", "snapshot_accounts"] {
         let relkind = table_relkind(db, table).await;
         match relkind.as_deref() {
@@ -64,27 +62,29 @@ pub async fn from_config(db: &DatabaseConnection, config: &IndexConfig) -> Suppl
             other => panic!("[supply] could not read relkind for {table}: {other:?}"),
         }
     }
-    for index in ["idx_accounts_pubkey_slot", "idx_accounts_stake_owner"] {
-        if !index_exists(db, index).await {
-            panic!("[supply] requires index {index} on accounts; create it via the migration flags");
-        }
+    if !index_exists(db, "idx_accounts_pubkey_slot").await {
+        panic!(
+            "[supply] requires index idx_accounts_pubkey_slot on accounts; create it via the migration flags"
+        );
     }
 
     // Clear a prior run's rows so a stale total is never served before the seed.
-    clear_prior_run(db).await;
+    if let Err(e) = db.execute_unprepared("DELETE FROM supply").await {
+        tracing::error!(target: "supply_tracker", "failed to clear prior supply rows: {:?}", e);
+    }
 
     let tracker = SupplyTracker::new(
-        SUPPLY_CACHE_BUCKETS,
+        db.clone(),
+        Duration::from_secs(config.database.save_block_queries_timeout),
         supply.hot_accounts,
         SUPPLY_FAIL_PIN_CAP,
-        supply.pin_stake_accounts,
+        non_circulating,
     );
     tracing::info!(
         target: "supply_tracker",
-        "supply enabled: cache pre-sized to {} buckets, unpinned cap {}, pin-stake {}",
-        SUPPLY_CACHE_BUCKETS,
+        "supply enabled: cache pre-sized for {} accounts, capacity {}",
         supply.hot_accounts,
-        supply.pin_stake_accounts
+        tracker.summary().map_or(0, |summary| summary.capacity)
     );
     tracker
 }
@@ -115,22 +115,6 @@ async fn index_exists(db: &DatabaseConnection, index: &str) -> bool {
     .is_some()
 }
 
-async fn clear_prior_run(db: &DatabaseConnection) {
-    // One statement per call. Postgres rejects multiple commands in a prepared
-    // statement, and sea-orm's `execute` always prepares.
-    for sql in [
-        "DELETE FROM supply",
-        "DELETE FROM non_circulating_accounts WHERE id = 1",
-    ] {
-        if let Err(e) = db
-            .execute_unprepared(sql)
-            .await
-        {
-            tracing::error!(target: "supply_tracker", "failed to clear prior supply rows ({sql}): {:?}", e);
-        }
-    }
-}
-
 /// Upserts one supply row and prunes the ring. Used by the snapshot seed
 /// (`non_circulating` None), the bootstrap resolve, and every committed block.
 pub async fn persist_supply_row(
@@ -155,12 +139,16 @@ pub async fn persist_supply_row(
             Value::from(commit.slot.saturating_sub(SUPPLY_RING_SLOTS) as i64),
         ],
     );
+    let started = Instant::now();
     let result = tokio::time::timeout(query_timeout, db.execute(statement))
         .await
         .unwrap_or_else(|elapsed| {
             tracing::error!(target: "supply_tracker", "persist_supply_row timeout: {}", elapsed);
             Err(sea_orm::DbErr::RecordNotInserted)
         });
+    SUPPLY_DB_MICROSECONDS
+        .with_label_values(&["persist_row"])
+        .observe(started.elapsed().as_micros() as f64);
     if let Err(e) = result {
         tracing::error!(target: "supply_tracker", "persist_supply_row failed for slot {}: {}", commit.slot, e);
     }

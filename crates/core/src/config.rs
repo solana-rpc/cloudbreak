@@ -428,13 +428,10 @@ pub struct IndexConfig {
 pub struct SupplyConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// Unpinned accounts kept resident in the hot-accounts map. About 64 bytes
-    /// each, plus every stake account when `pin-stake-accounts` is on.
+    /// Accounts kept resident in the hot-accounts map, about 65 bytes each.
+    /// Stake accounts live in the non-circulating stake map instead.
     #[serde(rename = "hot-accounts", default = "SupplyConfig::default_hot_accounts")]
     pub hot_accounts: usize,
-    /// Keep every stake account resident so epoch rewards are cache hits.
-    #[serde(rename = "pin-stake-accounts", default = "default_true")]
-    pub pin_stake_accounts: bool,
 }
 
 impl SupplyConfig {
@@ -1537,10 +1534,6 @@ pub struct MigrationPgIndexesConfig {
     pub idx_accounts_token_owner: bool,
     #[serde(default = "default_true")]
     pub idx_accounts_token_delegate: bool,
-    /// Partial index on stake-owned rows for the getSupply non-circulating stake
-    /// scan. Opt-in: only the supply node needs it. Default false.
-    #[serde(default)]
-    pub idx_accounts_stake_owner: bool,
 }
 
 impl Default for MigrationPgIndexesConfig {
@@ -1551,7 +1544,6 @@ impl Default for MigrationPgIndexesConfig {
             idx_accounts_token_mint: true,
             idx_accounts_token_owner: true,
             idx_accounts_token_delegate: true,
-            idx_accounts_stake_owner: false,
         }
     }
 }
@@ -1573,10 +1565,6 @@ pub struct SnapshotPgIndexesConfig {
     pub idx_snapshot_accounts_token_owner: bool,
     #[serde(default = "default_true")]
     pub idx_snapshot_accounts_token_delegate: bool,
-    /// Partial index on stake-owned rows for the getSupply non-circulating stake
-    /// scan. Opt-in: only the supply node needs it. Default false.
-    #[serde(default)]
-    pub idx_snapshot_accounts_stake_owner: bool,
 }
 
 impl Default for SnapshotPgIndexesConfig {
@@ -1587,7 +1575,6 @@ impl Default for SnapshotPgIndexesConfig {
             idx_snapshot_accounts_token_mint: true,
             idx_snapshot_accounts_token_owner: true,
             idx_snapshot_accounts_token_delegate: true,
-            idx_snapshot_accounts_stake_owner: false,
         }
     }
 }

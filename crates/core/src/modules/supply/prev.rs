@@ -11,14 +11,14 @@
 //! the `(pubkey, slot)` primary key. Neither carries an owner predicate, so there
 //! is no wrong-partition miss and no owner-change over-count class.
 
-use crate::modules::supply::cache::PrevRow;
+use crate::metrics::SUPPLY_DB_MICROSECONDS;
 use sea_orm::{
     ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement, Value, sea_query::ArrayType,
 };
 use solana_pubkey::Pubkey;
 use std::collections::HashMap;
 use std::time::Duration;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout};
 
 fn bytea_array(pubkeys: &[Pubkey]) -> Value {
     Value::Array(
@@ -37,14 +37,17 @@ fn parse_pubkey(bytes: Vec<u8>) -> Result<Pubkey, sea_orm::DbErr> {
         .map_err(|_| sea_orm::DbErr::Custom("invalid pubkey bytes in query result".to_string()))
 }
 
-/// Returns the latest row by pubkey for every miss account. No row means a new
-/// account. The caller compares `prev_slot` to the block slot in Rust. A SQL
-/// `slot < block` filter would double-count a gap write for an evicted account.
+/// Returns the latest `(lamports, slot)` row by pubkey for every miss account.
+/// No row means a new account. A live block passes its own slot as `below_slot`
+/// so the read skips the block's own row and can overlap the block's inserts. A
+/// repaired block passes `None` and reads the newest row: a gap write already
+/// absorbed by a later live block must come back, so the caller counts zero.
 pub async fn fetch_prev_balances(
     db: &DatabaseConnection,
     pubkeys: &[Pubkey],
+    below_slot: Option<u64>,
     query_timeout: Duration,
-) -> Result<HashMap<Pubkey, (u64, u64, u64)>, sea_orm::DbErr> {
+) -> Result<HashMap<Pubkey, (u64, u64)>, sea_orm::DbErr> {
     let mut out = HashMap::with_capacity(pubkeys.len());
     if pubkeys.is_empty() {
         return Ok(out);
@@ -55,41 +58,42 @@ pub async fn fetch_prev_balances(
         // `lamports DESC` breaks a same-slot mask tie. It cannot fire under the
         // `(pubkey, slot)` key but keeps the read exact if it ever does.
         r#"
-        SELECT v.pubkey, prev.lamports, prev.slot, prev.write_version
+        SELECT v.pubkey, prev.lamports, prev.slot
         FROM unnest($1::bytea[]) AS v(pubkey)
         LEFT JOIN LATERAL (
-            SELECT lamports, slot, write_version FROM (
-                SELECT lamports, slot, write_version FROM accounts          WHERE pubkey = v.pubkey
+            SELECT lamports, slot FROM (
+                SELECT lamports, slot FROM accounts          WHERE pubkey = v.pubkey AND slot < $2
                 UNION ALL
-                SELECT lamports, slot, write_version FROM snapshot_accounts WHERE pubkey = v.pubkey
+                SELECT lamports, slot FROM snapshot_accounts WHERE pubkey = v.pubkey AND slot < $2
             ) u
             ORDER BY slot DESC, lamports DESC
             LIMIT 1
         ) prev ON true
         "#,
-        [bytea_array(pubkeys)],
+        [
+            bytea_array(pubkeys),
+            Value::BigInt(Some(below_slot.map_or(i64::MAX, |slot| slot as i64))),
+        ],
     ));
 
-    let rows = timeout(query_timeout, query)
-        .await
-        .map_err(|elapsed| sea_orm::DbErr::Custom(format!("fetch_prev_balances timeout: {elapsed}")))??;
+    let started = Instant::now();
+    let rows = timeout(query_timeout, query).await.map_err(|elapsed| {
+        sea_orm::DbErr::Custom(format!("fetch_prev_balances timeout: {elapsed}"))
+    });
+    SUPPLY_DB_MICROSECONDS
+        .with_label_values(&["prev_balances"])
+        .observe(started.elapsed().as_micros() as f64);
 
-    for row in rows {
+    for row in rows?? {
         let pubkey = parse_pubkey(row.try_get("", "pubkey")?)?;
         let lamports: Option<i64> = row.try_get("", "lamports")?;
         let slot: Option<i64> = row.try_get("", "slot")?;
-        let wv: Option<i64> = row.try_get("", "write_version")?;
-        if let (Some(lamports), Some(slot), Some(wv)) = (lamports, slot, wv) {
-            out.insert(pubkey, (lamports as u64, slot as u64, wv as u64));
+        if let (Some(lamports), Some(slot)) = (lamports, slot) {
+            out.insert(pubkey, (lamports as u64, slot as u64));
         }
     }
 
     Ok(out)
-}
-
-/// Convenience wrapper so a caller can look up one miss result as a [`PrevRow`].
-pub fn prev_row(map: &HashMap<Pubkey, (u64, u64, u64)>, pubkey: &Pubkey) -> PrevRow {
-    map.get(pubkey).copied()
 }
 
 /// Resolves the balance at or below `startup_slot` for every startup touch,
@@ -118,32 +122,25 @@ pub async fn fetch_startup_balances(
             LIMIT 1
         ) prev ON true
         "#,
-        [bytea_array(pubkeys), Value::BigInt(Some(startup_slot as i64))],
+        [
+            bytea_array(pubkeys),
+            Value::BigInt(Some(startup_slot as i64)),
+        ],
     ));
 
+    let started = Instant::now();
     let rows = timeout(query_timeout, query).await.map_err(|elapsed| {
         sea_orm::DbErr::Custom(format!("fetch_startup_balances timeout: {elapsed}"))
-    })??;
+    });
+    SUPPLY_DB_MICROSECONDS
+        .with_label_values(&["startup_balances"])
+        .observe(started.elapsed().as_micros() as f64);
 
-    for row in rows {
+    for row in rows?? {
         let pubkey = parse_pubkey(row.try_get("", "pubkey")?)?;
         let lamports: i64 = row.try_get("", "lamports")?;
         out.insert(pubkey, lamports as u64);
     }
 
     Ok(out)
-}
-
-/// Fetches the latest lamports/slot by pubkey for the non-circulating members.
-/// Owner-blind, one batched read.
-pub async fn fetch_member_balances(
-    db: &DatabaseConnection,
-    pubkeys: &[Pubkey],
-    query_timeout: Duration,
-) -> Result<Vec<(Pubkey, u64, u64)>, sea_orm::DbErr> {
-    let map = fetch_prev_balances(db, pubkeys, query_timeout).await?;
-    Ok(map
-        .into_iter()
-        .map(|(pubkey, (lamports, slot, _wv))| (pubkey, lamports, slot))
-        .collect())
 }

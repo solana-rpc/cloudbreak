@@ -7,7 +7,7 @@ use cloudbreak_core::{
     IndexConfig, SnapshotConfig,
     modules::{
         account_owner_map::AccountOwnerMap, largest_accounts::LargestAccountsTracker,
-        supply::SupplyTracker,
+        non_circulating::NonCirculatingTracker, supply::SupplyTracker,
     },
 };
 use std::sync::{Arc, Mutex};
@@ -40,6 +40,7 @@ pub async fn process_snapshot_if_needed(
     finalize_slot_buffer_size: Arc<Mutex<usize>>,
     accounts_owner_map: AccountOwnerMap,
     largest_accounts: LargestAccountsTracker,
+    non_circulating: NonCirculatingTracker,
     supply_tracker: SupplyTracker,
 ) {
     let snapshot_config = match config.snapshot {
@@ -88,6 +89,7 @@ pub async fn process_snapshot_if_needed(
             Some(finalize_slot_buffer_size.clone()),
             accounts_owner_map,
             largest_accounts,
+            non_circulating,
             supply_tracker,
         )
         .await;

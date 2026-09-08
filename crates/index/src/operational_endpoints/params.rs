@@ -3,6 +3,8 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+use solana_pubkey::Pubkey;
+
 /// Filters the per-block listing of the finalizer debug endpoint by block origin.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BlockKindFilter {
@@ -22,7 +24,7 @@ pub(crate) enum DebugDetail {
     Full,
 }
 
-/// Parsed query parameters shared by both module debug endpoints.
+/// Parsed query parameters shared by the module debug endpoints.
 pub(crate) struct DebugParams {
     pub detail: DebugDetail,
     pub kind: BlockKindFilter,
@@ -30,6 +32,8 @@ pub(crate) struct DebugParams {
     pub max_slot: Option<u64>,
     pub limit: Option<usize>,
     pub with_pubkeys: bool,
+    /// A single account to look up, for the supply and non-circulating endpoints.
+    pub pubkey: Option<Pubkey>,
 }
 
 impl DebugParams {
@@ -40,6 +44,7 @@ impl DebugParams {
         let mut max_slot: Option<u64> = None;
         let mut limit: Option<usize> = None;
         let mut with_pubkeys = false;
+        let mut pubkey: Option<Pubkey> = None;
 
         if let Some(q) = query {
             for pair in q.split('&').filter(|s| !s.is_empty()) {
@@ -87,6 +92,12 @@ impl DebugParams {
                                 .map_err(|e| format!("invalid `limit` value '{v}': {e}"))?,
                         );
                     }
+                    "pubkey" => {
+                        pubkey = Some(
+                            v.parse::<Pubkey>()
+                                .map_err(|e| format!("invalid `pubkey` value '{v}': {e}"))?,
+                        );
+                    }
                     "with_pubkeys" => {
                         with_pubkeys = match v {
                             "true" | "1" => true,
@@ -126,6 +137,7 @@ impl DebugParams {
             max_slot,
             limit,
             with_pubkeys,
+            pubkey,
         })
     }
 

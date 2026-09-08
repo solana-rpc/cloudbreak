@@ -4,33 +4,19 @@
  */
 
 use cloudbreak_core::IndexConfig;
-use cloudbreak_core::modules::supply::{self, Pending};
 use cloudbreak_entity::accounts;
 use sea_orm::{
     ActiveValue::{NotSet, Set},
     DatabaseConnection,
 };
 use solana_pubkey::Pubkey;
-use std::collections::HashMap;
-use std::time::Duration;
-use tokio::{
-    task::{JoinHandle, JoinSet},
-    time::Instant,
-};
+use tokio::{task::JoinSet, time::Instant};
 use yellowstone_grpc_proto::geyser::CommitmentLevel;
 use yellowstone_grpc_proto::geyser::SubscribeUpdateBlock;
 
 use crate::indexer::{AccountsReceivedPerBlock, IndexerState};
 use crate::modules::snapshot::SnapshotProcessingState;
 use crate::{db_queries, metrics, modules};
-
-/// One account's latest geyser update in the block, deduplicated by write version
-/// for the supply delta computation.
-struct PendingSupplyAccount {
-    owner: Pubkey,
-    lamports: u64,
-    write_version: u64,
-}
 
 /// Splits the block into chunks and saves them into the "accounts" table
 /// Also updates the HashMap with the accounts pubkeys that were updated in the slot
@@ -67,6 +53,7 @@ pub async fn save_block(
         finalize_slot_buffer_size.clone(),
         accounts_owner_map.clone(),
         largest_accounts.clone(),
+        non_circulating.clone(),
         supply_tracker.clone(),
     )
     .await;
@@ -94,32 +81,20 @@ pub async fn save_block(
         .map(|pubkey| pubkey.0.to_bytes().to_vec())
         .collect::<Vec<_>>();
 
-    // Fold the block's accounts into the largest-accounts tracker before the main loop
-    // consumes `block.accounts`. Returns empty when the feature is disabled.
-    let largest_pending = largest_accounts.build_block_pending(&block.accounts, &non_circulating);
-
-    let supply_enabled = supply_tracker.is_enabled();
-    let mut pending_supply_accounts: HashMap<Pubkey, PendingSupplyAccount> = HashMap::new();
+    // The stake map goes first so the trackers below see this block's membership.
+    // Each returns empty when its feature is disabled.
+    let stake_block = non_circulating.apply_block(slot, is_repaired, &block.accounts);
+    let largest_pending = largest_accounts.build_block_pending(
+        &block.accounts,
+        &non_circulating,
+        &stake_block.expired,
+    );
+    let supply_pending = supply_tracker.build_block_pending(&block.accounts);
 
     // Create the chunks for updating the "accounts" table
     let system_program_id = [0u8; 32].to_vec();
     for account in block.accounts {
         let pubkey = Pubkey::try_from(account.pubkey.as_slice()).unwrap();
-
-        if supply_enabled {
-            let pending = pending_supply_accounts
-                .entry(pubkey)
-                .or_insert_with(|| PendingSupplyAccount {
-                    owner: Pubkey::try_from(account.owner.as_slice()).unwrap(),
-                    lamports: account.lamports,
-                    write_version: account.write_version,
-                });
-            if account.write_version > pending.write_version {
-                pending.owner = Pubkey::try_from(account.owner.as_slice()).unwrap();
-                pending.lamports = account.lamports;
-                pending.write_version = account.write_version;
-            }
-        }
 
         // If the account is being closed we still add it to the hashmap for cleanup
         //  but we don't add it to the "accounts" table in a normal fashion, instead we added using [`db_queries::insert_closed_accounts`]
@@ -201,44 +176,6 @@ pub async fn save_block(
         chunks.push((current_chunk, current_chunk_bytes));
     }
 
-    // Dedupe the closed list from the block's final state, so a same-block close
-    // then recreate produces one real row and no mask on the (pubkey, slot) key.
-    if supply_enabled {
-        closed_accounts_for_slot.retain(|pubkey| {
-            Pubkey::try_from(pubkey.as_slice())
-                .ok()
-                .and_then(|pk| pending_supply_accounts.get(&pk))
-                .is_none_or(|pending| pending.lamports == 0)
-        });
-    }
-
-    // The supply delta runs under the block-writes lock and releases it before
-    // the block's own inserts, so the miss read never reads this block's rows.
-    let supply_query_timeout = Duration::from_secs(config.database.save_block_queries_timeout);
-    let supply_pending: Vec<Pending> = if supply_enabled {
-        pending_supply_accounts
-            .into_iter()
-            .map(|(pubkey, pending)| Pending {
-                pubkey,
-                owner: pending.owner,
-                lamports: pending.lamports,
-                write_version: pending.write_version,
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let supply_outcome = supply_tracker
-        .apply_block(
-            slot,
-            is_repaired,
-            supply_pending,
-            &closed_accounts_for_slot,
-            db,
-            supply_query_timeout,
-        )
-        .await;
-
     let closed_account_for_slot_len = closed_accounts_for_slot.len();
 
     // We delay the closed accounts insertion until the snapshot is processed to avoid reads while
@@ -248,21 +185,10 @@ pub async fn save_block(
             .lock()
             .expect("Failed to lock snapshot_processing_state")
     };
-
-    let closed_accounts_insert_handle: Option<JoinHandle<bool>> = if snapshot_processing_state
+    let closed_accounts_to_insert = (snapshot_processing_state
         == SnapshotProcessingState::Finished
-        || snapshot_processing_state == SnapshotProcessingState::FinishedAndCleanedUp
-    {
-        db_queries::insert_closed_accounts(
-            db.clone(),
-            closed_accounts_for_slot.clone(),
-            slot,
-            &config,
-            accounts_owner_map,
-        )
-    } else {
-        None
-    };
+        || snapshot_processing_state == SnapshotProcessingState::FinishedAndCleanedUp)
+        .then(|| closed_accounts_for_slot.clone());
 
     // Record the block data in the finalizer map (keyed by slot). It is held there until the slot
     // is finalized (via a finalized notification or the ancestor walk). For snapshot-repaired
@@ -285,33 +211,59 @@ pub async fn save_block(
     metrics::record_closed_accounts_per_slot(closed_account_for_slot_len);
     metrics::record_block_size(block_bytes_data);
 
-    // Update the "accounts" table
-    let mut tasks = JoinSet::new();
-    for (chunk, byte_size) in chunks {
-        let db = db.clone();
-        let config_clone = config.clone();
-        // TODO: Set concurrency limit
-        tasks.spawn(async move {
-            let _guard = metrics::TokioTaskCounterGuard::new("insert_accounts_chunk");
-
-            db_queries::insert_accounts_chunk(&db, chunk, byte_size, &config_clone).await
+    // Update the "accounts" table. The supply tracker starts these writes after
+    // its cache probe, so its miss read overlaps them.
+    let block_writes = async {
+        let closed_accounts_insert_handle = closed_accounts_to_insert.and_then(|closed| {
+            db_queries::insert_closed_accounts(
+                db.clone(),
+                closed,
+                slot,
+                &config,
+                accounts_owner_map,
+            )
         });
-    }
 
-    let mut block_writes_ok = tasks.join_all().await.into_iter().all(|inserted| inserted);
+        let mut tasks = JoinSet::new();
+        for (chunk, byte_size) in chunks {
+            let db = db.clone();
+            let config_clone = config.clone();
+            // TODO: Set concurrency limit
+            tasks.spawn(async move {
+                let _guard = metrics::TokioTaskCounterGuard::new("insert_accounts_chunk");
 
-    if let Some(handle) = closed_accounts_insert_handle {
-        match handle.await {
-            Ok(inserted) => block_writes_ok &= inserted,
-            Err(e) => {
-                tracing::error!(target: "save_block_closed_accounts_insert", "failed to insert closed accounts: {:?}", e);
-                block_writes_ok = false;
+                db_queries::insert_accounts_chunk(&db, chunk, byte_size, &config_clone).await
+            });
+        }
+
+        let mut block_writes_ok = tasks.join_all().await.into_iter().all(|inserted| inserted);
+
+        if let Some(handle) = closed_accounts_insert_handle {
+            match handle.await {
+                Ok(inserted) => block_writes_ok &= inserted,
+                Err(e) => {
+                    tracing::error!(target: "save_block_closed_accounts_insert", "failed to insert closed accounts: {:?}", e);
+                    block_writes_ok = false;
+                }
             }
         }
-    }
+        block_writes_ok
+    };
+    let (supply_outcome, block_writes_ok) = supply_tracker
+        .apply_block(
+            slot,
+            is_repaired,
+            supply_pending,
+            &stake_block,
+            block_writes,
+        )
+        .await;
 
     largest_accounts
         .commit_block(slot, largest_pending, db, &config)
+        .await;
+    non_circulating
+        .persist_block(&stake_block, db, &config)
         .await;
 
     // Wait until the chunk processing is finished to insert the slot (this ensures that gPA calls can only read from completed slots)
@@ -334,11 +286,7 @@ pub async fn save_block(
     )
     .await;
 
-    // Commit or fail closed. The tracker handles the gauges and the write-failure
-    // pinning. Persist the row it returns.
-    if let Some(commit) = supply_tracker.finish_block(slot, supply_outcome, block_writes_ok) {
-        supply::persist::persist_supply_row(db, &commit, supply_query_timeout).await;
-    }
+    supply_tracker.finish_block(slot, supply_outcome, block_writes_ok);
 
     let elapsed = start_time.elapsed().as_secs_f64();
     metrics::record_block_processing(elapsed, "block");

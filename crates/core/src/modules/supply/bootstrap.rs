@@ -3,19 +3,38 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-//! The two-pass bootstrap resolve. It reads each startup touch's balance at or
+//! The anchor seed and the two-pass bootstrap resolve. The seed sets the
+//! capitalization anchor. The resolve reads each startup touch's balance at or
 //! below the anchor slot by pubkey from `snapshot_accounts`, folds the window
-//! delta onto the capitalization anchor, and flips the tracker Live. Pass two
-//! runs under the block-writes lock so no live touch races the flip.
+//! delta onto the anchor, and flips the tracker Live. Pass two runs under the
+//! block-writes lock so no live touch races the flip.
 
+use crate::modules::supply::SEED_TIMEOUT;
 use crate::modules::supply::persist::persist_supply_row;
 use crate::modules::supply::prev::fetch_startup_balances;
-use crate::modules::supply::tracker::SupplyTracker;
+use crate::modules::supply::tracker::{SupplyCommit, SupplyTracker};
 use sea_orm::DatabaseConnection;
 use solana_pubkey::Pubkey;
-use std::time::Duration;
 
-const RESOLVE_QUERY_TIMEOUT: Duration = Duration::from_secs(60);
+/// Anchors the total on the snapshot bank capitalization and persists it as the
+/// first supply row. No-op when the tracker is disabled.
+pub async fn seed_anchor(
+    db: &DatabaseConnection,
+    tracker: &SupplyTracker,
+    slot: u64,
+    capitalization: u64,
+) {
+    if !tracker.is_enabled() {
+        return;
+    }
+    tracker.set_startup_total(slot, capitalization);
+    let seed = SupplyCommit {
+        slot,
+        total: capitalization,
+        non_circulating: None,
+    };
+    persist_supply_row(db, &seed, SEED_TIMEOUT).await;
+}
 
 /// Resolves the startup balances and flips the tracker Live. A read failure or an
 /// unresolved account leaves the tracker Bootstrapping, so it never publishes on
@@ -78,7 +97,7 @@ pub async fn finish_bootstrap(db: &DatabaseConnection, tracker: &SupplyTracker) 
         commit.total
     );
 
-    persist_supply_row(db, &commit, RESOLVE_QUERY_TIMEOUT).await;
+    persist_supply_row(db, &commit, SEED_TIMEOUT).await;
 }
 
 const RESOLVE_CHUNK: usize = 5_000;
@@ -90,7 +109,7 @@ async fn resolve(
 ) -> Result<std::collections::HashMap<Pubkey, u64>, sea_orm::DbErr> {
     let mut out = std::collections::HashMap::with_capacity(pubkeys.len());
     for chunk in pubkeys.chunks(RESOLVE_CHUNK) {
-        let resolved = fetch_startup_balances(db, chunk, startup_slot, RESOLVE_QUERY_TIMEOUT).await?;
+        let resolved = fetch_startup_balances(db, chunk, startup_slot, SEED_TIMEOUT).await?;
         out.extend(resolved);
     }
     Ok(out)
