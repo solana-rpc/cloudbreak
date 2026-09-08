@@ -151,19 +151,6 @@ pub async fn create_database_indexes(
         tracing::info!(target: "create_database_indexes", "created idx_snapshot_accounts_token_delegate in {} seconds (total accumulated)", start_time.elapsed().as_secs_f64());
     }
 
-    if cfg.idx_snapshot_accounts_stake_owner {
-        // Partial index on stake-owned rows for the getSupply non-circulating
-        // stake scan on the de-partitioned supply node. Covers ~1.45M rows.
-        db.execute_unprepared(
-            r#"
-                CREATE INDEX idx_snapshot_accounts_stake_owner ON snapshot_accounts (pubkey, slot DESC)
-                WHERE owner = '\x06a1d8179137542a983437bdfe2a7ab2557f535c8a78722b68a49dc000000000'::bytea;
-            "#,
-        )
-        .await?;
-        tracing::info!(target: "create_database_indexes", "created idx_snapshot_accounts_stake_owner in {} seconds (total accumulated)", start_time.elapsed().as_secs_f64());
-    }
-
     tracing::info!(target: "create_database_indexes", "finished creating database indexes in {} seconds", start_time.elapsed().as_secs_f64());
 
     Ok(())

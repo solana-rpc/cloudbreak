@@ -14,7 +14,7 @@
 //!   token program ids, [`MintRecord`], and the packed bytea codec.
 //! - `tracker.rs`: in-memory state (per-mint tops with the eviction reservoir
 //!   and the `dropped_floor`/stale soundness bookkeeping), the snapshot seed
-//!   path, `apply_block`, and the class-sentinel reseed.
+//!   path, `apply_block`, and the bootstrap class-sentinel seed.
 //! - `persist.rs`: write path (record upserts, stale and cleared-mint deletes,
 //!   `from_config`, outcome persistence).
 //! - `read.rs`: read path shared with the API ([`fetch_record`]).
@@ -36,9 +36,12 @@
 //!   or the GLA sentinels.
 //!
 //! The tracker is seeded from the startup snapshot pass and goes live when
-//! snapshot processing finishes. When neither section is enabled the handle is a
-//! no-op ([`LargestAccountsTracker::default()`]), so the indexer hooks cost
-//! nothing. The API enables each method from the same two sections in its own
+//! snapshot processing finishes, seeding the class sentinels from the
+//! non-circulating tracker's member balances at that moment. From then on each
+//! block's accounts are classified by the post-block membership, and a member
+//! whose lockup expired without a write arrives as a synthetic circulating
+//! update. When neither section is enabled the handle is a no-op
+//! ([`LargestAccountsTracker::default()`]), so the indexer hooks cost nothing. The API enables each method from the same two sections in its own
 //! config and routes GTLA on record presence: a persisted record means the mint
 //! is tracked, and no record returns a fast error with no fallback table scan.
 //! There is no shared enablement state in the database.
@@ -48,7 +51,6 @@ mod prune;
 mod read;
 mod tracker;
 
-pub(crate) use persist::persist_largest_outcome;
 pub use prune::{prune_largest_accounts, spawn_largest_accounts_pruner};
 pub use read::fetch_record;
 pub use tracker::{BlockOutcome, LargestAccountsSeed, LargestAccountsTracker, PendingLargestAccount};
