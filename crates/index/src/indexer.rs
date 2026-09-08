@@ -98,8 +98,8 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
         AccountOwnerMap::default()
     };
 
-    // Validates prerequisites, records tracked mints in environment_info, and clears
-    // stale largest_accounts rows. Disabled tracker when the feature is off.
+    // Validates prerequisites and clears stale largest_accounts rows. Disabled
+    // tracker when neither largest-accounts section is enabled.
     let largest_accounts = LargestAccountsTracker::from_config(&db, &config).await;
 
     // The supply tracker keeps the running total-supply figure for getSupply. It
@@ -109,10 +109,9 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
     let supply_tracker = supply::persist::from_config(&db, &config).await;
 
     // The non-circulating tracker powers the getLargestAccounts circulating/non-circulating
-    // filter. It is enabled with largest-accounts (which already requires a full index, the
-    // snapshot section, and the owner map). The supply tracker also needs the
-    // recomputer's membership set, so it enables the tracker too.
-    let non_circulating = if largest_accounts.is_enabled() || supply_tracker.is_enabled() {
+    // filter, so it follows the [largest-accounts] SOL section. The supply tracker also needs
+    // the recomputer's membership set, so it enables the tracker too.
+    let non_circulating = if largest_accounts.sol_tracking_enabled() || supply_tracker.is_enabled() {
         NonCirculatingTracker::new()
     } else {
         NonCirculatingTracker::default()
@@ -126,9 +125,8 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
         UpdatedAccountsDuringStartup::new(snapshot_processing_state.clone(), health.clone());
 
     let (prune_slot_tx, prune_slot_rx) = tokio::sync::watch::channel(0u64);
-    if config.largest_accounts_enabled() {
-        largest_accounts::spawn_largest_accounts_pruner(db.clone(), config.clone(), prune_slot_rx);
-    }
+    // No-op when neither largest-accounts section is enabled.
+    largest_accounts::spawn_largest_accounts_pruner(db.clone(), config.clone(), prune_slot_rx);
 
     // The cache sweeper wakes on each finalize-slot change and evicts stale
     // unpinned entries off the block path. No-op when supply is disabled.
@@ -204,7 +202,6 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
         db.clone(),
         config.clone(),
         indexer_state.non_circulating.clone(),
-        indexer_state.accounts_owner_map.clone(),
         indexer_state.largest_accounts.clone(),
         indexer_state.supply_tracker.clone(),
     );

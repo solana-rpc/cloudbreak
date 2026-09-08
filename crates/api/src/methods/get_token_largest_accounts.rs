@@ -95,75 +95,25 @@ pub async fn get_token_largest_accounts(
             mint: pubkey.to_string(),
         })?;
 
-    let tracked = state
-        .largest_accounts_mints
-        .as_ref()
-        .is_some_and(|mints| mints.contains(&pubkey));
-    if tracked {
-        let rows = fetch_largest_record(state, &pubkey, latest_slot).await?;
-        if !rows.is_empty() {
-            return Ok(RpcResponse {
-                context: RpcResponseContext {
-                    slot: latest_slot,
-                    api_version: None,
-                },
-                value: rows
-                    .into_iter()
-                    .map(|(address, amount)| RpcTokenAccountBalance {
-                        address: address.to_string(),
-                        amount: token_amount_to_ui_amount_v3(amount, additional_data),
-                    })
-                    .collect(),
-            });
-        }
-    }
-
-    let sql_template = include_str!("../db/getTokenLargestAccounts.sql");
-    let sql = sql_template.replace("$1", &mint_hex);
-    let sql = sql.replace("$2", &latest_slot.to_string());
-    let sql = db_query::add_trace_traceparent_to_query(&sql);
-
-    tracing::debug!(target: "get_token_largest_accounts_sql", "## sql: {}", sql);
-
-    let holder_rows = timeout(state.queries_timeout, async {
-        let span = tracing::info_span!("get_token_largest_accounts_db");
-        sqlx::raw_sql(&sql).fetch_all(pool).instrument(span).await
-    })
-    .await
-    .map_err(|_elapsed| {
-        tracing::error!("getTokenLargestAccounts holder query timed out");
-        RpcError::InternalError
-    })?
-    .map_err(|e| {
-        tracing::error!("Database query error: {}", e);
-        RpcError::InternalError
-    })?;
-
-    let mut value = Vec::with_capacity(holder_rows.len());
-    for row in &holder_rows {
-        let address_bytes: Vec<u8> = row.get("pubkey");
-        let address = Pubkey::try_from(address_bytes.as_slice())
-            .map_err(|_| RpcError::InternalError)?
-            .to_string();
-
-        let amount_bytes: Vec<u8> = row.get("amount");
-        let amount_array: [u8; 8] = amount_bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| RpcError::InternalError)?;
-        let amount = u64::from_le_bytes(amount_array);
-
-        value.push(RpcTokenAccountBalance {
-            address,
-            amount: token_amount_to_ui_amount_v3(amount, additional_data),
+    // Record presence is the tracked-mints signal: the indexer persists a record
+    // for exactly the mints it tracks, so an absent record means "not tracked".
+    let Some(rows) = fetch_largest_record(state, &pubkey, latest_slot).await? else {
+        return Err(RpcError::KeyExcludedFromSecondaryIndex {
+            key: pubkey.to_string(),
         });
-    }
+    };
 
     Ok(RpcResponse {
         context: RpcResponseContext {
             slot: latest_slot,
             api_version: None,
         },
-        value,
+        value: rows
+            .into_iter()
+            .map(|(address, amount)| RpcTokenAccountBalance {
+                address: address.to_string(),
+                amount: token_amount_to_ui_amount_v3(amount, additional_data),
+            })
+            .collect(),
     })
 }
