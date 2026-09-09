@@ -3,8 +3,9 @@
 
 use super::{MintRecord, encode_record};
 use super::tracker::{BlockOutcome, LargestAccountsTracker, PendingLargestAccount};
-use crate::metrics;
 use crate::IndexConfig;
+use crate::metrics;
+use crate::modules::non_circulating::NonCirculatingTracker;
 use sea_orm::{
     ConnectionTrait, DatabaseBackend, DatabaseConnection, DbErr, Statement, TransactionTrait,
 };
@@ -139,14 +140,19 @@ impl LargestAccountsTracker {
         tracker
     }
 
-    /// Finish bootstrap and persist the resulting records. Mints that fail to
-    /// persist are marked stale. No-op when the tracker is disabled.
-    pub async fn finish_bootstrap_and_persist(&self, db: &DatabaseConnection) {
+    /// Finish bootstrap, with the class sentinels seeded from the live
+    /// non-circulating members, and persist the resulting records. Mints that
+    /// fail to persist are marked stale. No-op when the tracker is disabled.
+    pub async fn finish_bootstrap_and_persist(
+        &self,
+        db: &DatabaseConnection,
+        non_circulating: &NonCirculatingTracker,
+    ) {
         if !self.is_enabled() {
             return;
         }
 
-        let outcome = self.finish_bootstrap();
+        let outcome = self.finish_bootstrap(&non_circulating.member_balances());
         for mint in &outcome.newly_stale {
             tracing::error!(
                 target: "largest_accounts",

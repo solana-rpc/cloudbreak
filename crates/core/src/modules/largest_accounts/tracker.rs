@@ -109,9 +109,7 @@ enum Status {
 }
 
 /// All mutable tracker state behind the mutex: per-mint tops, the reverse
-/// holder→mint index, the bootstrap-only tombstones and seed reservoir, and the
-/// newest (slot, write_version) seen per non-circulating member since the last
-/// class-sentinel seed.
+/// holder→mint index, and the bootstrap-only tombstones and seed reservoir.
 #[derive(Default)]
 struct TrackerState {
     status: Status,
@@ -120,28 +118,14 @@ struct TrackerState {
     member_index: HashMap<Pubkey, Pubkey>,
     tombstones: HashMap<Pubkey, (u64, u64)>,
     seed_reservoir: HashMap<Pubkey, Vec<SeedAccount>>,
-    member_stamps: HashMap<Pubkey, (u64, u64)>,
-}
-
-fn record_stamp(
-    stamps: &mut HashMap<Pubkey, (u64, u64)>,
-    pubkey: Pubkey,
-    slot: u64,
-    write_version: u64,
-) {
-    let entry = stamps.entry(pubkey).or_insert((slot, write_version));
-    if (slot, write_version) > *entry {
-        *entry = (slot, write_version);
-    }
 }
 
 impl TrackerState {
     fn record_tombstone(&mut self, pubkey: Pubkey, slot: u64, write_version: u64) {
-        record_stamp(&mut self.tombstones, pubkey, slot, write_version);
-    }
-
-    fn record_member_stamp(&mut self, pubkey: Pubkey, slot: u64, write_version: u64) {
-        record_stamp(&mut self.member_stamps, pubkey, slot, write_version);
+        let entry = self.tombstones.entry(pubkey).or_insert((slot, write_version));
+        if (slot, write_version) > *entry {
+            *entry = (slot, write_version);
+        }
     }
 
     fn remove_member(
@@ -290,6 +274,69 @@ impl TrackerState {
             }
         }
         top.refresh_cached_min();
+    }
+
+    /// Seeds the class sentinels at the bootstrap flip: every member with a
+    /// balance enters the non-circulating top, and the SOL top minus the
+    /// members becomes the circulating top. A balance is stamped
+    /// `(slot, u64::MAX)`: it is the final state of that slot, so it outranks
+    /// the same write routed to the circulating top before Live.
+    fn seed_class_sentinels(
+        &mut self,
+        balances: &[NonCirculatingBalance],
+        k: usize,
+        touched: &mut HashSet<Pubkey>,
+    ) {
+        let members: HashSet<Pubkey> = balances.iter().map(|balance| balance.pubkey).collect();
+        for balance in balances {
+            self.remove_member(
+                CIRCULATING_SENTINEL_MINT,
+                balance.pubkey,
+                balance.slot,
+                u64::MAX,
+                touched,
+            );
+            if balance.lamports == 0 {
+                continue;
+            }
+            self.apply_update(
+                NON_CIRCULATING_SENTINEL_MINT,
+                balance.pubkey,
+                balance.lamports,
+                balance.slot,
+                u64::MAX,
+                false,
+                false,
+                k,
+                touched,
+            );
+        }
+        let Some(sol) = self.mints.get(&SOL_SENTINEL_MINT) else {
+            return;
+        };
+        let sol_floor = sol.dropped_floor;
+        let candidates: Vec<(Pubkey, Entry)> = sol
+            .entries
+            .iter()
+            .filter(|(pubkey, _)| !members.contains(*pubkey))
+            .map(|(pubkey, entry)| (*pubkey, *entry))
+            .collect();
+        if let Some(top) = self.mints.get_mut(&CIRCULATING_SENTINEL_MINT) {
+            top.dropped_floor = sol_floor;
+        }
+        for (pubkey, entry) in candidates {
+            self.apply_update(
+                CIRCULATING_SENTINEL_MINT,
+                pubkey,
+                entry.amount,
+                entry.slot,
+                entry.write_version,
+                false,
+                false,
+                k,
+                touched,
+            );
+        }
     }
 
     fn emit(&mut self, mint: Pubkey, slot: u64, outcome: &mut BlockOutcome) {
@@ -563,9 +610,6 @@ impl LargestAccountsTracker {
             {
                 state.remove_member(current_mint, pubkey, slot, update.write_version, &mut touched);
             }
-            if update.non_circulating {
-                state.record_member_stamp(pubkey, slot, update.write_version);
-            }
             if update.lamports == 0 {
                 if bootstrapping {
                     state.record_tombstone(pubkey, slot, update.write_version);
@@ -638,7 +682,9 @@ impl LargestAccountsTracker {
         outcome
     }
 
-    pub fn finish_bootstrap(&self) -> BlockOutcome {
+    /// Applies the seed reservoir, seeds the class sentinels from the
+    /// non-circulating member balances, and flips Live.
+    pub fn finish_bootstrap(&self, non_circulating: &[NonCirculatingBalance]) -> BlockOutcome {
         let Some(shared) = &self.0 else {
             return BlockOutcome::default();
         };
@@ -664,6 +710,9 @@ impl LargestAccountsTracker {
                 );
             }
         }
+        if let Some(k) = shared.sol_k {
+            state.seed_class_sentinels(non_circulating, k, &mut touched);
+        }
         state.tombstones = HashMap::new();
         state.status = Status::Live;
         let mints: Vec<Pubkey> = state.mints.keys().copied().collect();
@@ -681,156 +730,6 @@ impl LargestAccountsTracker {
         self.0
             .as_deref()
             .is_some_and(|shared| shared.state().status == Status::Live)
-    }
-
-    /// Reseeds the circulating/non-circulating sentinels from a freshly recomputed
-    /// non-circulating member set and its balances, returning the records to persist.
-    /// A fetched balance is skipped when the tracker has applied a newer update for
-    /// that member, so a database row that predates a close is never re-seeded.
-    pub fn seed_class_sentinels(
-        &self,
-        members: &HashSet<Pubkey>,
-        balances: &[NonCirculatingBalance],
-    ) -> Option<BlockOutcome> {
-        let shared = self.0.as_deref()?;
-        let sentinel_k = shared.sol_k?;
-        let mut state = shared.state();
-        if state.status != Status::Live {
-            return None;
-        }
-        let mut touched = HashSet::new();
-        // Class moves outrank every entry the tracker holds, up to the newest applied slot.
-        let (removal_slot, removal_write_version) = (state.max_applied_slot, u64::MAX);
-        let stale_non_circulating: Vec<Pubkey> = state
-            .mints
-            .get(&NON_CIRCULATING_SENTINEL_MINT)
-            .map(|top| {
-                top.entries
-                    .keys()
-                    .filter(|pubkey| !members.contains(pubkey))
-                    .copied()
-                    .collect()
-            })
-            .unwrap_or_default();
-        for pubkey in stale_non_circulating {
-            state.remove_member(
-                NON_CIRCULATING_SENTINEL_MINT,
-                pubkey,
-                removal_slot,
-                removal_write_version,
-                &mut touched,
-            );
-        }
-        let stale_circulating: Vec<Pubkey> = state
-            .mints
-            .get(&CIRCULATING_SENTINEL_MINT)
-            .map(|top| {
-                top.entries
-                    .keys()
-                    .filter(|pubkey| members.contains(pubkey))
-                    .copied()
-                    .collect()
-            })
-            .unwrap_or_default();
-        for pubkey in stale_circulating {
-            state.remove_member(
-                CIRCULATING_SENTINEL_MINT,
-                pubkey,
-                removal_slot,
-                removal_write_version,
-                &mut touched,
-            );
-        }
-        if let Some(top) = state.mints.get_mut(&NON_CIRCULATING_SENTINEL_MINT) {
-            top.dropped_floor = 0;
-        }
-        let mut seeded: HashSet<Pubkey> = HashSet::new();
-        for balance in balances {
-            if balance.lamports == 0 || !members.contains(&balance.pubkey) {
-                continue;
-            }
-            if state
-                .member_stamps
-                .get(&balance.pubkey)
-                .is_some_and(|(stamp_slot, _)| *stamp_slot > balance.slot)
-            {
-                continue;
-            }
-            seeded.insert(balance.pubkey);
-            state.apply_update(
-                NON_CIRCULATING_SENTINEL_MINT,
-                balance.pubkey,
-                balance.lamports,
-                balance.slot,
-                0,
-                false,
-                false,
-                sentinel_k,
-                &mut touched,
-            );
-        }
-        // A member with neither a positive fetched balance nor a tracker update
-        // since the last seed has no live source, so its entry is stale.
-        let unsourced: Vec<Pubkey> = state
-            .mints
-            .get(&NON_CIRCULATING_SENTINEL_MINT)
-            .map(|top| {
-                top.entries
-                    .keys()
-                    .filter(|pubkey| {
-                        !seeded.contains(pubkey) && !state.member_stamps.contains_key(pubkey)
-                    })
-                    .copied()
-                    .collect()
-            })
-            .unwrap_or_default();
-        for pubkey in unsourced {
-            state.remove_member(
-                NON_CIRCULATING_SENTINEL_MINT,
-                pubkey,
-                removal_slot,
-                removal_write_version,
-                &mut touched,
-            );
-        }
-        state.member_stamps = HashMap::new();
-        let sol_floor = state
-            .mints
-            .get(&SOL_SENTINEL_MINT)
-            .map(|top| top.dropped_floor)
-            .unwrap_or(0);
-        let candidates: Vec<(Pubkey, Entry)> = state
-            .mints
-            .get(&SOL_SENTINEL_MINT)
-            .map(|top| {
-                top.entries
-                    .iter()
-                    .filter(|(pubkey, _)| !members.contains(*pubkey))
-                    .map(|(pubkey, entry)| (*pubkey, *entry))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if let Some(top) = state.mints.get_mut(&CIRCULATING_SENTINEL_MINT) {
-            top.dropped_floor = sol_floor;
-        }
-        for (pubkey, entry) in candidates {
-            state.apply_update(
-                CIRCULATING_SENTINEL_MINT,
-                pubkey,
-                entry.amount,
-                entry.slot,
-                entry.write_version,
-                false,
-                false,
-                sentinel_k,
-                &mut touched,
-            );
-        }
-        let effective_slot = state.max_applied_slot;
-        let mut outcome = BlockOutcome::default();
-        state.emit(NON_CIRCULATING_SENTINEL_MINT, effective_slot, &mut outcome);
-        state.emit(CIRCULATING_SENTINEL_MINT, effective_slot, &mut outcome);
-        Some(outcome)
     }
 
     pub fn mark_mint_stale(&self, mint: &Pubkey) -> bool {
@@ -858,11 +757,13 @@ impl LargestAccountsTracker {
 
     /// Folds one block's accounts into a per-account pending map (native-SOL
     /// lamports plus tracked SPL token balances), keeping the highest write
-    /// version per pubkey. Empty when the tracker is disabled.
+    /// version per pubkey, plus one circulating update per member whose lockup
+    /// the block expired. Empty when the tracker is disabled.
     pub fn build_block_pending(
         &self,
         accounts: &[SubscribeUpdateAccountInfo],
         non_circulating: &NonCirculatingTracker,
+        expired: &[(Pubkey, u64)],
     ) -> HashMap<Pubkey, PendingLargestAccount> {
         let mut pending: HashMap<Pubkey, PendingLargestAccount> = HashMap::new();
         if !self.is_enabled() {
@@ -902,6 +803,17 @@ impl LargestAccountsTracker {
                     }
                 }
             }
+        }
+
+        // An expired member was not written in the block, so its class move
+        // rides a synthetic update below any write at this slot.
+        for (pubkey, lamports) in expired {
+            pending.entry(*pubkey).or_insert(PendingLargestAccount {
+                write_version: 0,
+                lamports: *lamports,
+                non_circulating: false,
+                token: None,
+            });
         }
 
         pending
@@ -958,7 +870,7 @@ mod tests {
     }
 
     fn go_live(tracker: &LargestAccountsTracker) {
-        tracker.finish_bootstrap();
+        tracker.finish_bootstrap(&[]);
     }
 
     fn token_rows(outcome: &BlockOutcome) -> Option<&Vec<(Pubkey, u64)>> {
@@ -1073,7 +985,7 @@ mod tests {
         seed.observe(pk(200), pk(1), 1_000_000, 150, 3);
         seed.observe(pk(200), pk(2), 700, 150, 3);
         tracker.merge_seed(seed);
-        let outcome = tracker.finish_bootstrap();
+        let outcome = tracker.finish_bootstrap(&[]);
         let rows = token_rows(&outcome).unwrap();
         assert_eq!(rows[0], (pk(2), 700));
         assert!(rows.contains(&(pk(1), 5)));
@@ -1086,7 +998,7 @@ mod tests {
         let mut seed = tracker.new_seed().unwrap();
         seed.observe(pk(200), pk(1), 1_000_000, 150, 3);
         tracker.merge_seed(seed);
-        let outcome = tracker.finish_bootstrap();
+        let outcome = tracker.finish_bootstrap(&[]);
         assert!(token_rows(&outcome).is_none());
     }
 
@@ -1100,7 +1012,7 @@ mod tests {
         full.observe(pk(200), pk(1), 1_000_000, 150, 1);
         full.observe(pk(200), pk(2), 10, 150, 1);
         tracker.merge_seed(full);
-        let outcome = tracker.finish_bootstrap();
+        let outcome = tracker.finish_bootstrap(&[]);
         let rows = token_rows(&outcome).unwrap();
         assert_eq!(rows, &vec![(pk(2), 10)]);
     }
@@ -1146,91 +1058,38 @@ mod tests {
     }
 
     #[test]
-    fn closed_member_is_not_reseeded_from_stale_balance() {
+    fn bootstrap_seeds_class_sentinels_from_member_balances() {
         let tracker = tracker(25);
-        go_live(&tracker);
+        // Before Live every account routes to circulating.
         tracker.apply_block(
             100,
-            [
-                (pk(1), pending_non_circ(1000, 1)),
-                (pk(2), pending_non_circ(500, 1)),
-            ]
-            .into(),
+            [(pk(1), pending_sol(1000, 1)), (pk(2), pending_sol(500, 1))].into(),
         );
-        tracker.apply_block(101, [(pk(1), pending_non_circ(0, 2))].into());
-        let members: HashSet<Pubkey> = [pk(1), pk(2)].into_iter().collect();
-        let stale = [balance(pk(1), 100, 1000), balance(pk(2), 100, 500)];
-        let outcome = tracker.seed_class_sentinels(&members, &stale).unwrap();
-        assert!(sentinel_rows(&outcome, &NON_CIRCULATING_SENTINEL_MINT).is_none());
-        let outcome = tracker.apply_block(102, [(pk(3), pending_non_circ(1, 3))].into());
+        let outcome = tracker.finish_bootstrap(&[balance(pk(1), 100, 1000)]);
         let rows = sentinel_rows(&outcome, &NON_CIRCULATING_SENTINEL_MINT).unwrap();
-        assert_eq!(rows, &vec![(pk(2), 500), (pk(3), 1)]);
-    }
-
-    #[test]
-    fn reopened_member_is_seeded_from_newer_balance() {
-        let tracker = tracker(25);
-        go_live(&tracker);
-        tracker.apply_block(100, [(pk(1), pending_non_circ(1000, 1))].into());
-        tracker.apply_block(101, [(pk(1), pending_non_circ(0, 2))].into());
-        let members: HashSet<Pubkey> = [pk(1)].into_iter().collect();
-        let outcome = tracker
-            .seed_class_sentinels(&members, &[balance(pk(1), 102, 700)])
-            .unwrap();
-        let rows = sentinel_rows(&outcome, &NON_CIRCULATING_SENTINEL_MINT).unwrap();
-        assert_eq!(rows, &vec![(pk(1), 700)]);
-    }
-
-    #[test]
-    fn decreased_member_keeps_tracker_balance_over_stale_balance() {
-        let tracker = tracker(25);
-        go_live(&tracker);
-        tracker.apply_block(
-            100,
-            [
-                (pk(1), pending_non_circ(1000, 1)),
-                (pk(2), pending_non_circ(500, 1)),
-            ]
-            .into(),
-        );
-        tracker.apply_block(101, [(pk(1), pending_non_circ(300, 2))].into());
-        let members: HashSet<Pubkey> = [pk(1), pk(2)].into_iter().collect();
-        let stale = [balance(pk(1), 100, 1000), balance(pk(2), 100, 500)];
-        tracker.seed_class_sentinels(&members, &stale).unwrap();
-        let outcome = tracker.apply_block(102, [(pk(3), pending_non_circ(1, 3))].into());
-        let rows = sentinel_rows(&outcome, &NON_CIRCULATING_SENTINEL_MINT).unwrap();
-        assert_eq!(rows, &vec![(pk(2), 500), (pk(1), 300), (pk(3), 1)]);
-    }
-
-    #[test]
-    fn member_without_balance_or_update_is_evicted_on_seed() {
-        let tracker = tracker(25);
-        go_live(&tracker);
-        tracker.apply_block(
-            100,
-            [
-                (pk(1), pending_non_circ(1000, 1)),
-                (pk(2), pending_non_circ(500, 1)),
-            ]
-            .into(),
-        );
-        let members: HashSet<Pubkey> = [pk(1), pk(2)].into_iter().collect();
-        let fresh = [balance(pk(1), 100, 1000), balance(pk(2), 100, 500)];
-        let outcome = tracker.seed_class_sentinels(&members, &fresh).unwrap();
-        assert!(sentinel_rows(&outcome, &NON_CIRCULATING_SENTINEL_MINT).is_none());
-        let outcome = tracker
-            .seed_class_sentinels(&members, &[balance(pk(2), 100, 500)])
-            .unwrap();
-        let rows = sentinel_rows(&outcome, &NON_CIRCULATING_SENTINEL_MINT).unwrap();
+        assert_eq!(rows, &vec![(pk(1), 1000)]);
+        let rows = sentinel_rows(&outcome, &CIRCULATING_SENTINEL_MINT).unwrap();
         assert_eq!(rows, &vec![(pk(2), 500)]);
     }
 
     #[test]
-    fn class_move_outranks_update_applied_after_recompute() {
+    fn zero_balance_member_is_not_seeded() {
+        let tracker = tracker(25);
+        tracker.apply_block(100, [(pk(1), pending_sol(1000, 1))].into());
+        tracker.apply_block(101, [(pk(1), pending_sol(0, 2))].into());
+        let outcome = tracker.finish_bootstrap(&[balance(pk(1), 101, 0)]);
+        assert!(sentinel_rows(&outcome, &NON_CIRCULATING_SENTINEL_MINT).is_none());
+        assert!(sentinel_rows(&outcome, &CIRCULATING_SENTINEL_MINT).is_none());
+    }
+
+    #[test]
+    fn expired_member_moves_to_circulating() {
         let tracker = tracker(25);
         go_live(&tracker);
         tracker.apply_block(100, [(pk(1), pending_non_circ(1000, 1))].into());
-        let outcome = tracker.seed_class_sentinels(&HashSet::new(), &[]).unwrap();
+        let pending =
+            tracker.build_block_pending(&[], &NonCirculatingTracker::default(), &[(pk(1), 1000)]);
+        let outcome = tracker.apply_block(101, pending);
         assert!(outcome.cleared.contains(&NON_CIRCULATING_SENTINEL_MINT));
         let rows = sentinel_rows(&outcome, &CIRCULATING_SENTINEL_MINT).unwrap();
         assert_eq!(rows, &vec![(pk(1), 1000)]);

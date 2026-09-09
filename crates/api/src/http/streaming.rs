@@ -8,7 +8,7 @@
 //! This module wraps a `Stream<Item = Result<RpcKeyedAccount, RpcError>>` in
 //! a hyper-compatible `BoxBody` that emits the JSON-RPC envelope incrementally:
 //!
-//! ```
+//! ```text
 //! {"jsonrpc":"2.0","result":[<acc1>,<acc2>,...,<accN>],"id":<id>}
 //! ```
 //!

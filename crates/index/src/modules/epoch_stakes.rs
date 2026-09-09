@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use cloudbreak_core::modules::non_circulating::LATEST_BY_OWNER_SQL;
 use cloudbreak_core::modules::service_health::is_healthy;
 use cloudbreak_core::{IndexConfig, STAKE_PROGRAM_ID, VOTE_PROGRAM_ID};
 use cloudbreak_snapshot::persist_epoch_stakes;
@@ -18,6 +17,20 @@ use yellowstone_grpc_proto::geyser::CommitmentLevel;
 use crate::metrics;
 
 const SLOTS_PER_EPOCH: u64 = 432_000;
+
+/// Latest live state per account for a given owner, across the live and snapshot tables.
+const LATEST_BY_OWNER_SQL: &str = r#"
+WITH latest AS (
+    SELECT DISTINCT ON (pubkey) pubkey, data, lamports
+    FROM (
+        SELECT pubkey, slot, data, lamports FROM accounts WHERE owner = $1
+        UNION ALL
+        SELECT pubkey, slot, data, lamports FROM snapshot_accounts WHERE owner = $1
+    ) AS u
+    ORDER BY pubkey, slot DESC
+)
+SELECT pubkey, data FROM latest WHERE lamports > 0
+"#;
 /// Mainnet `reduce_stake_warmup_cooldown` feature activation epoch (slot 244_080_000).
 /// Equivalent to `Some(0)` for any current epoch (rate is 9% past this epoch).
 const NEW_RATE_ACTIVATION_EPOCH: Option<u64> = Some(565);

@@ -408,6 +408,10 @@ pub struct IndexConfig {
     #[serde(default)]
     #[serde(rename = "accounts-owner-map-enabled")]
     pub accounts_owner_map_enabled: bool,
+    /// getSupply with the hot-accounts cache. Requires the owner map off, owner
+    /// partitioning off, a snapshot section, and an empty programs filter.
+    #[serde(default)]
+    pub supply: Option<SupplyConfig>,
     /// The indexer maintains the `getLargestAccounts` sentinel tops when this
     /// section is present with `enabled = true`.
     #[serde(rename = "largest-accounts")]
@@ -416,6 +420,24 @@ pub struct IndexConfig {
     /// section is present with `enabled = true`.
     #[serde(rename = "token-largest-accounts")]
     pub token_largest_accounts: Option<TokenLargestAccountsConfig>,
+}
+
+/// The `[supply]` section. Enabled by presence with `enabled = true`.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct SupplyConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Accounts kept resident in the hot-accounts map, about 65 bytes each.
+    /// Stake accounts live in the non-circulating stake map instead.
+    #[serde(rename = "hot-accounts", default = "SupplyConfig::default_hot_accounts")]
+    pub hot_accounts: usize,
+}
+
+impl SupplyConfig {
+    const fn default_hot_accounts() -> usize {
+        1_000_000
+    }
 }
 
 /// `[largest-accounts]` (getLargestAccounts): enables the
@@ -517,6 +539,10 @@ impl IndexConfig {
         .into_iter()
         .flatten()
         .min()
+    }
+
+    pub fn supply_enabled(&self) -> bool {
+        self.supply.as_ref().is_some_and(|supply| supply.enabled)
     }
 }
 
@@ -703,6 +729,10 @@ pub struct ApiConfig {
     pub gpa_cache: Option<GpaCacheConfig>,
     #[serde(rename = "genesis-hash", default = "ApiConfig::default_genesis_hash")]
     pub genesis_hash: String,
+    /// Serves getSupply from the supply ring. Set it together with the indexer's
+    /// `[supply]` section.
+    #[serde(default)]
+    pub supply: Option<MethodSection>,
     /// The API serves `getLargestAccounts` when this section is present with
     /// `enabled = true`. Must match the indexer's `[largest-accounts]` state
     /// (the nodes are co-deployed).
@@ -1355,6 +1385,10 @@ impl ApiConfig {
             self.server.port.unwrap_or(DEFAULT_API_SERVER_PORT)
         ))
         .expect("error getting endpoint")
+    }
+
+    pub fn supply_enabled(&self) -> bool {
+        self.supply.as_ref().is_some_and(|supply| supply.enabled)
     }
 }
 

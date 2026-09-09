@@ -2,6 +2,17 @@
 finalize-slot-buffer-size = 1000
 accounts-owner-map-enabled = false
 
+# Maintains the running total-supply figure served by getSupply from a bounded
+# hot-accounts cache. Requires an empty [programs] filter,
+# accounts-owner-map-enabled = false, owner partitioning off, and [snapshot].
+# Runs on a dedicated supply-only instance. Set it together with the API
+# [supply] section.
+# [supply]
+# enabled = false
+# Accounts kept resident in the hot-accounts map (~65 bytes each). Stake
+# accounts live in the non-circulating stake map instead.
+# hot-accounts = 1000000
+
 [snapshot]
 accounts-file-concurency = 32
 # Max consecutive gap-filling iterations allowed to fail fetching a covering

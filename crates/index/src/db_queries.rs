@@ -63,13 +63,14 @@ pub fn insert_closed_accounts(
     slot: u64,
     config: &IndexConfig,
     accounts_owner_map: AccountOwnerMap,
-) -> Option<JoinHandle<()>> {
+) -> Option<JoinHandle<bool>> {
     let query_timeout = Duration::from_secs(config.database.save_block_queries_timeout);
 
     let handle = tokio::spawn(async move {
         let _guard = metrics::TokioTaskCounterGuard::new("insert_closed_accounts");
 
         let start_time = Instant::now();
+        let mut inserted = true;
 
         if accounts_owner_map.is_enabled() {
             let result = accounts_owner_map.save_closed_accounts(pubkeys, slot).await;
@@ -80,6 +81,7 @@ pub fn insert_closed_accounts(
                 Err(e) => {
                     tracing::error!(target: "save_closed_accounts_with_map", "failed to save closed accounts with map: {}", e);
                     metrics::increment_db_errors();
+                    inserted = false;
                 }
             }
         } else {
@@ -131,6 +133,7 @@ pub fn insert_closed_accounts(
                             e
                         );
                         metrics::increment_db_errors();
+                        inserted = false;
                     }
                 }
             }
@@ -138,6 +141,8 @@ pub fn insert_closed_accounts(
 
         metrics::INSERT_CLOSED_ACCOUNTS_PER_SLOT_HISTOGRAM
             .observe(start_time.elapsed().as_micros() as f64 / 1000.0);
+
+        inserted
     });
 
     Some(handle)
@@ -394,6 +399,7 @@ pub async fn insert_recent_blockhash(
     }
 }
 
+
 /// The latest persisted slot for each commitment level, plus the finalized→confirmed lag.
 ///
 /// The `slots` table holds exactly one row per commitment (its primary key), updated to the
@@ -444,7 +450,7 @@ pub async fn insert_accounts_chunk(
     chunk: Vec<accounts::ActiveModel>,
     byte_size: usize,
     config: &IndexConfig,
-) {
+) -> bool {
     let query_timeout = Duration::from_secs(config.database.save_block_queries_timeout);
 
     let start_time = Instant::now();
@@ -461,17 +467,23 @@ pub async fn insert_accounts_chunk(
         Err(sea_orm::DbErr::RecordNotInserted)
     });
 
-    match result {
-        Ok(res) => tracing::debug!("upsert_accounts_batched: {}", res),
+    let inserted = match result {
+        Ok(res) => {
+            tracing::debug!("upsert_accounts_batched: {}", res);
+            true
+        }
         Err(e) => {
             tracing::error!("upsert_accounts_batched ERROR: {}", e);
             metrics::increment_db_errors();
+            false
         }
-    }
+    };
 
     let elapsed = start_time.elapsed().as_secs_f64();
     if elapsed > 0.250 {
         tracing::debug!(target: "slow_chunk", "slow chunk: len: {}, size: {}", chunk_len, byte_size);
     }
     metrics::record_chunk_processing(elapsed, "block");
+
+    inserted
 }

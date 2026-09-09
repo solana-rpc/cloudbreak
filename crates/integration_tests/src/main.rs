@@ -12,6 +12,7 @@ mod compare_accounts_by_mint_vs_cluster;
 mod compare_genesis_hash;
 mod compare_largest_accounts;
 mod compare_program_accounts;
+mod compare_supply;
 mod compare_token_largest_accounts;
 mod compare_version;
 mod compare_vote_accounts;
@@ -47,6 +48,8 @@ enum Commands {
     CompareLargestAccounts(compare_largest_accounts::Args),
     /// Validate getTokenLargestAccounts against per-account getAccountInfo on the same node
     CompareTokenLargestAccounts(compare_token_largest_accounts::Args),
+    /// Validate getSupply against getMultipleAccounts (independent read path) on the same node
+    CompareSupply(compare_supply::Args),
     /// Compare getGenesisHash between two RPC endpoints (exact equality)
     CompareGenesisHash(compare_genesis_hash::Args),
     /// Compare getVersion: cloudbreak's composite string should embed the cluster's solana-core
@@ -73,6 +76,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::CompareTokenLargestAccounts(args) => {
             compare_token_largest_accounts::run(&args).await?
         }
+        Commands::CompareSupply(args) => compare_supply::run(&args).await?,
         Commands::CompareGenesisHash(args) => compare_genesis_hash::run(&args).await?,
         Commands::CompareVersion(args) => compare_version::run(&args).await?,
         Commands::Benchmark(args) => benchmark::run(&args).await?,
