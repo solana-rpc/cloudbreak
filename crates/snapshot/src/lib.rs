@@ -349,9 +349,10 @@ async fn process_downloaded_snapshot(
                     let pubkey = account.pubkey.to_bytes().to_vec();
                     let owner = account.owner.to_bytes().to_vec();
 
-                    // Records the owner for the owner-map nodes; a no-op with the
-                    // owner map off, which is the supply node's configuration.
-                    accounts_owner_map.upsert_account(&pubkey, &owner, account_file_slot);
+                    // Add non closed accounts to the accounts owner map (if enabled)
+                    if account.lamports > 0 {
+                        accounts_owner_map.upsert_account(&pubkey, &owner, account_file_slot);
+                    }
 
                     let account_update = SubscribeUpdateAccount {
                         account: Some(SubscribeUpdateAccountInfo {

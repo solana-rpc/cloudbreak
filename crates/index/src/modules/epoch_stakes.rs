@@ -21,7 +21,7 @@ const SLOTS_PER_EPOCH: u64 = 432_000;
 /// Latest live state per account for a given owner, across the live and snapshot tables.
 const LATEST_BY_OWNER_SQL: &str = r#"
 WITH latest AS (
-    SELECT DISTINCT ON (pubkey) pubkey, slot, data, lamports
+    SELECT DISTINCT ON (pubkey) pubkey, data, lamports
     FROM (
         SELECT pubkey, slot, data, lamports FROM accounts WHERE owner = $1
         UNION ALL
@@ -29,7 +29,7 @@ WITH latest AS (
     ) AS u
     ORDER BY pubkey, slot DESC
 )
-SELECT pubkey, slot, data, lamports FROM latest WHERE lamports > 0
+SELECT pubkey, data FROM latest WHERE lamports > 0
 "#;
 /// Mainnet `reduce_stake_warmup_cooldown` feature activation epoch (slot 244_080_000).
 /// Equivalent to `Some(0)` for any current epoch (rate is 9% past this epoch).
