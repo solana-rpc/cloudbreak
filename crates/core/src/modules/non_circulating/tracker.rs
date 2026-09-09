@@ -156,6 +156,10 @@ struct State {
     slot: u64,
     accounts: HashMap<Pubkey, StakeEntry>,
     membership: Membership,
+    /// Newest slot at which a live block wrote a pubkey the seed had not
+    /// reached yet, under an owner other than the stake program. Blocks a
+    /// stale snapshot seed from resurrecting it. Dropped at the Live flip.
+    seed_shadow: HashMap<Pubkey, u64>,
 }
 
 struct Shared {
@@ -228,6 +232,7 @@ impl NonCirculatingTracker {
                     members: pinned.clone(),
                     ..Membership::default()
                 },
+                seed_shadow: HashMap::new(),
             }),
             pinned,
             withdraw_authorities: WITHDRAW_AUTHORITY.iter().copied().collect(),
@@ -327,9 +332,12 @@ impl NonCirculatingTracker {
         }
         let entry = shared.entry_from_account(stake_owned, pinned, lamports, data, slot);
         let mut state = shared.state();
+        let shadowed = state.seed_shadow.get(pubkey).copied();
         match state.accounts.entry(*pubkey) {
             Entry::Vacant(vacant) => {
-                vacant.insert(entry);
+                if shadowed.is_none_or(|seen| seen < slot) {
+                    vacant.insert(entry);
+                }
             }
             Entry::Occupied(mut occupied) if occupied.get().slot < slot => {
                 occupied.insert(entry);
@@ -359,6 +367,7 @@ impl NonCirculatingTracker {
         state
             .accounts
             .retain(|_, entry| entry.stake_owned() || entry.has(StakeEntry::PINNED));
+        state.seed_shadow = HashMap::new();
         for (pubkey, entry) in state.accounts.iter_mut() {
             state.membership.place(*pubkey, entry);
         }
@@ -399,6 +408,7 @@ impl NonCirculatingTracker {
         let State {
             accounts: map,
             membership,
+            seed_shadow,
             ..
         } = state;
 
@@ -422,6 +432,11 @@ impl NonCirculatingTracker {
             match map.entry(pubkey) {
                 Entry::Vacant(vacant) => {
                     if !stake_owned && !pinned {
+                        // Shadow the drop so an older seed cannot resurrect it.
+                        if !live {
+                            let seen = seed_shadow.entry(pubkey).or_insert(slot);
+                            *seen = (*seen).max(slot);
+                        }
                         continue;
                     }
                     let mut entry = shared.entry_from_account(
