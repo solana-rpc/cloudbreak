@@ -3,41 +3,172 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-//! Non-circulating membership: the in-memory set plus the background recomputer
-//! that resolves it.
+//! Real-time non-circulating membership from an in-memory stake map.
 //!
-//! The recomputer periodically resolves which accounts are non-circulating and
-//! calls [`NonCirculatingTracker::set_members`]. The block ingest path reads it
-//! with [`NonCirculatingTracker::is_non_circulating`] to classify each account
-//! for the `getLargestAccounts` circulating/non-circulating filter. It also
-//! fetches the members' balances to seed the largest-accounts class sentinels.
+//! # What it does
+//!
+//! Agave's non-circulating set is the pinned account list plus every stake
+//! account whose lockup is in force or whose withdrawer is a listed authority.
+//! This module keeps one 40-byte record per stake account (and per pinned
+//! account) in memory, evaluates membership against the Clock sysvar as each
+//! block arrives, and keeps a running sum of the members' lamports. Lockup
+//! expiry has no on-chain event, so members whose lockup can expire sit in one
+//! of two ordered sets keyed by their expiry, and the head of each set is
+//! popped as the clock passes it.
+//!
+//! The map is also the previous-balance source for stake pubkeys in the
+//! getSupply delta. It reports the summed stake delta and the pubkeys it
+//! handled per block, and the supply hot cache skips those pubkeys.
+//!
+//! # Layout
+//!
+//! - `mod.rs`: the handle re-export, the [`StakeEntry`] record and its flags,
+//!   the per-block [`StakeBlock`] outcome, and the debug views.
+//! - `tracker.rs`: the state behind one mutex, `apply_block`, the snapshot seed,
+//!   and the bootstrap flip.
+//! - `persist.rs`: `from_config`, the member-list upsert, and the two persist
+//!   entry points.
+//! - `read.rs`: the member-list read the API shares.
+//! - `lists.rs`: Agave's pinned account and withdraw-authority lists.
+//!
+//! # Runtime model
+//!
+//! Enabled when `[largest-accounts]` or `[supply]` is on. The snapshot pass
+//! seeds every stake and pinned account and the Clock sysvar through
+//! `seed_account`. `finish_bootstrap` evaluates every entry once, builds the
+//! expiry sets and the running sum, and flips Live. Before Live the tracker
+//! serves nothing: `is_non_circulating` is false and `total` is `None`.
+//!
+//! Per block, `apply_block` advances the clock from the block's Clock sysvar,
+//! pops the expiries the new clock reaches, then folds every account: a
+//! stake-owned or pinned account is parsed and replaces its entry, and any
+//! other write to a pubkey already in the map turns the entry into a tombstone.
+//! A membership flip moves the pubkey between the sets and the running sum.
+//! GLA reads the post-block membership through `is_non_circulating` and gets
+//! the expiries the block did not write as `StakeBlock::expired`.
+//!
+//! # Newest slot wins
+//!
+//! Every entry carries the slot of its last write. A write at or below it is
+//! ignored, so a replayed or repaired block never moves an entry backwards. The
+//! clock only advances. A tombstone keeps its stamp for the same reason, and
+//! every later write to that pubkey refreshes it.
+//!
+//! # Ownership of a pubkey in the supply delta
+//!
+//! The map owns a pubkey while its entry is stake-owned. It reports the delta of
+//! every write to an owned entry in `StakeBlock::delta` and the pubkey in
+//! `StakeBlock::handled`, including a write that closes the account, and
+//! including a stale write, which contributes zero. A stake-owned write to a
+//! pubkey the map does not own inserts it with no delta and leaves the pubkey
+//! to the supply tracker for that block, which resolves the previous balance
+//! through its own cache and miss read and then drops it from the cache. So a
+//! pubkey is never a balance source in both places.
+//!
+//! # Membership and Agave
+//!
+//! Agave evaluates the lockup against the bank clock at the requested
+//! commitment. This tracker evaluates against the confirmed block's clock and
+//! the API serves the persisted row, so an account whose lockup expires inside
+//! the confirmed-to-finalized window is classified differently by the two for
+//! up to about 32 slots. The clock arrives with the Clock sysvar in the block.
+//! A block without it leaves expiries to the next block that carries one.
+//!
+//! # Footprint
+//!
+//! The record is 40 bytes with natural alignment, 73 bytes per hashmap bucket
+//! with the 32-byte key [est]. The map is pre-sized to
+//! [`STAKE_ACCOUNTS_CAPACITY`], which rounds to 2^21 buckets, about 153 MB
+//! [est] against the 1.435M stake accounts measured live. The two expiry sets
+//! hold about 3,134 members [measured], under 0.4 MB. Tombstones stay in the
+//! map after a close so their stamp keeps guarding repaired blocks, and are
+//! purged at bootstrap.
 
 pub mod lists;
+mod persist;
+pub mod read;
+mod tracker;
 
-use std::collections::HashSet;
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
+pub use tracker::NonCirculatingTracker;
 
-use futures::TryStreamExt;
-use sea_orm::{
-    ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement, StreamTrait, Value,
-    sea_query::ArrayType,
-};
+use serde::Serialize;
 use solana_program::clock::Clock;
 use solana_pubkey::Pubkey;
-use solana_stake_interface::state::StakeStateV2;
-use tokio::task::JoinHandle;
-use tokio::time::Instant;
+use std::collections::HashSet;
 
-use crate::metrics::TokioTaskCounterGuard;
-use crate::modules::account_owner_map::AccountOwnerMap;
-use crate::modules::largest_accounts::{LargestAccountsTracker, persist_largest_outcome};
-use crate::modules::service_health::is_healthy;
-use crate::{IndexConfig, STAKE_PROGRAM_ID};
-use lists::{NON_CIRCULATING_ACCOUNTS, WITHDRAW_AUTHORITY};
+/// Pre-sized item capacity of the stake map: 1.435M stake accounts measured on
+/// mainnet plus headroom, rounding to 2^21 buckets.
+pub const STAKE_ACCOUNTS_CAPACITY: usize = 1_500_000;
 
-/// One non-circulating holder's balance at a slot. The recomputer fetches these
-/// to seed the largest-accounts class sentinels.
+pub const CLOCK_SYSVAR_ID: Pubkey =
+    Pubkey::from_str_const("SysvarC1ock11111111111111111111111111111111");
+
+/// One stake or pinned account as the map holds it. `flags` carries the
+/// ownership, the parse result, the two list memberships, the evaluated
+/// membership, and which expiry set the entry sits in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StakeEntry {
+    pub lamports: u64,
+    pub lockup_unix_timestamp: i64,
+    pub lockup_epoch: u64,
+    pub slot: u64,
+    pub flags: u8,
+}
+
+impl StakeEntry {
+    /// The last write's owner is the Stake program: the map owns the pubkey.
+    pub const STAKE_OWNED: u8 = 1 << 0;
+    /// The data parsed as `Initialized` or `Stake`, so the lockup fields are set.
+    pub const LOCKUP: u8 = 1 << 1;
+    /// The withdrawer is in `WITHDRAW_AUTHORITY`.
+    pub const LISTED_WITHDRAWER: u8 = 1 << 2;
+    /// The pubkey is in `NON_CIRCULATING_ACCOUNTS`.
+    pub const PINNED: u8 = 1 << 3;
+    /// Currently non-circulating.
+    pub const MEMBER: u8 = 1 << 4;
+    pub(crate) const IN_BY_EPOCH: u8 = 1 << 5;
+    pub(crate) const IN_BY_TIMESTAMP: u8 = 1 << 6;
+
+    pub fn has(&self, flag: u8) -> bool {
+        self.flags & flag != 0
+    }
+
+    pub fn stake_owned(&self) -> bool {
+        self.has(Self::STAKE_OWNED)
+    }
+
+    pub fn member(&self) -> bool {
+        self.has(Self::MEMBER)
+    }
+
+    /// Agave's rule: a pinned account, or a stake account whose lockup is in
+    /// force or whose withdrawer is listed. The custodian is not consulted.
+    pub fn evaluate(&self, clock: &BlockClock) -> bool {
+        self.has(Self::PINNED)
+            || (self.stake_owned()
+                && self.has(Self::LOCKUP)
+                && (self.has(Self::LISTED_WITHDRAWER)
+                    || self.lockup_unix_timestamp > clock.unix_timestamp
+                    || self.lockup_epoch > clock.epoch))
+    }
+}
+
+/// What one block did to the stake map, consumed by the supply tracker and GLA.
+#[derive(Debug, Default)]
+pub struct StakeBlock {
+    /// The summed lamport delta over every pubkey in `handled`.
+    pub delta: i128,
+    /// The pubkeys whose previous balance came from the map. The supply
+    /// tracker skips them.
+    pub handled: HashSet<Pubkey>,
+    /// Members whose lockup the block's clock expired, with their lamports.
+    /// They were not written in the block, so GLA moves them itself.
+    pub expired: Vec<(Pubkey, u64)>,
+    /// True when any account joined or left, so the member list is re-persisted.
+    pub members_changed: bool,
+}
+
+/// One member's balance at a slot, as GLA's bootstrap class seed reads it.
 #[derive(Clone, Debug)]
 pub struct NonCirculatingBalance {
     pub pubkey: Pubkey,
@@ -45,309 +176,67 @@ pub struct NonCirculatingBalance {
     pub lamports: u64,
 }
 
-/// Cheap-clone handle to the non-circulating membership set. The default
-/// (`None`) means the feature is disabled and every operation is a no-op.
-#[derive(Clone, Default)]
-pub struct NonCirculatingTracker(Option<Arc<RwLock<Option<HashSet<Pubkey>>>>>);
-
-impl NonCirculatingTracker {
-    pub fn new() -> Self {
-        Self(Some(Arc::new(RwLock::new(None))))
-    }
-
-    pub fn is_enabled(&self) -> bool {
-        self.0.is_some()
-    }
-
-    pub fn is_non_circulating(&self, pubkey: &Pubkey) -> bool {
-        let Some(inner) = &self.0 else { return false };
-        inner
-            .read()
-            .expect("Failed to read non-circulating members")
-            .as_ref()
-            .is_some_and(|members| members.contains(pubkey))
-    }
-
-    pub fn set_members(&self, accounts: Vec<Pubkey>) {
-        let Some(inner) = &self.0 else { return };
-        let members: HashSet<Pubkey> = accounts.into_iter().collect();
-        *inner
-            .write()
-            .expect("Failed to write non-circulating members") = Some(members);
-    }
+/// An O(1) copy of the tracker state for the debug endpoint, plus the heads of
+/// the two expiry sets bounded by the request's limit.
+#[derive(Serialize)]
+pub struct NonCirculatingSummary {
+    pub status: &'static str,
+    pub slot: u64,
+    pub clock: Option<BlockClock>,
+    pub members: usize,
+    pub non_circulating_lamports: u64,
+    pub stake_accounts: usize,
+    pub by_epoch: usize,
+    pub by_timestamp: usize,
+    pub epoch_heads: Vec<(u64, String)>,
+    pub timestamp_heads: Vec<(i64, String)>,
 }
 
-const POLL_INTERVAL: Duration = Duration::from_secs(60);
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(600);
-
-const SYSVAR_OWNER_ID: Pubkey =
-    Pubkey::from_str_const("Sysvar1111111111111111111111111111111111111");
-const CLOCK_SYSVAR_ID: Pubkey =
-    Pubkey::from_str_const("SysvarC1ock11111111111111111111111111111111");
-
-/// Latest live state per account for a given owner, across the live and snapshot tables.
-pub const LATEST_BY_OWNER_SQL: &str = r#"
-WITH latest AS (
-    SELECT DISTINCT ON (pubkey) pubkey, data, lamports
-    FROM (
-        SELECT pubkey, slot, data, lamports FROM accounts WHERE owner = $1
-        UNION ALL
-        SELECT pubkey, slot, data, lamports FROM snapshot_accounts WHERE owner = $1
-    ) AS u
-    ORDER BY pubkey, slot DESC
-)
-SELECT pubkey, data FROM latest WHERE lamports > 0
-"#;
-
-const LATEST_ACCOUNT_ROW_SQL: &str = r#"
-            SELECT lamports, slot FROM (
-                SELECT lamports, slot FROM accounts
-                WHERE owner = v.owner AND pubkey = v.pubkey
-                UNION ALL
-                SELECT lamports, slot FROM snapshot_accounts
-                WHERE owner = v.owner AND pubkey = v.pubkey
-            ) u
-            ORDER BY slot DESC
-            LIMIT 1
-"#;
-
-/// Spawns the background task that periodically recomputes the non-circulating
-/// membership set and, when largest-accounts is enabled, seeds its class
-/// sentinels. No-op when the tracker is disabled.
-pub fn spawn_non_circulating_recomputer(
-    db: DatabaseConnection,
-    config: IndexConfig,
-    non_circulating: NonCirculatingTracker,
-    accounts_owner_map: AccountOwnerMap,
-    largest_accounts: LargestAccountsTracker,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let _guard = TokioTaskCounterGuard::new("non_circulating_recomputer");
-
-        if !non_circulating.is_enabled() {
-            return;
-        }
-
-        let mut interval = tokio::time::interval(POLL_INTERVAL);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut last_recompute: Option<Instant> = None;
-        let mut next_lockup_expiry: Option<i64> = None;
-        let mut class_sentinels_seeded = !largest_accounts.is_enabled();
-        loop {
-            interval.tick().await;
-
-            if !is_healthy(&db).await {
-                continue;
-            }
-
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
-            let expiry_due = next_lockup_expiry.is_some_and(|ts| now >= ts);
-            let seed_due = !class_sentinels_seeded && largest_accounts.is_live();
-
-            if !expiry_due
-                && !seed_due
-                && last_recompute.is_some_and(|last| last.elapsed() < HEARTBEAT_INTERVAL)
-            {
-                continue;
-            }
-
-            let (slot, accounts, next_expiry) = match recompute(&db).await {
-                Ok(result) => result,
-                Err(e) => {
-                    tracing::error!(
-                        target: "non_circulating_recomputer",
-                        "failed to recompute non-circulating membership: {:?}",
-                        e
-                    );
-                    continue;
-                }
-            };
-            let members: Vec<(Pubkey, Pubkey)> = accounts
-                .iter()
-                .filter_map(|pubkey| {
-                    accounts_owner_map
-                        .get_owner(pubkey)
-                        .map(|owner| (owner, *pubkey))
-                })
-                .collect();
-            let balances = match fetch_non_circulating_balances(&db, &members).await {
-                Ok(balances) => balances,
-                Err(e) => {
-                    tracing::error!(
-                        target: "non_circulating_recomputer",
-                        "failed to fetch non-circulating balances: {:?}",
-                        e
-                    );
-                    continue;
-                }
-            };
-
-            last_recompute = Some(Instant::now());
-            next_lockup_expiry = next_expiry;
-            let member_set: HashSet<Pubkey> = accounts.iter().copied().collect();
-            non_circulating.set_members(accounts);
-            if let Some(outcome) =
-                largest_accounts.seed_class_sentinels(slot, &member_set, &balances)
-            {
-                persist_largest_outcome(&largest_accounts, outcome, slot, &db, &config).await;
-                class_sentinels_seeded = true;
-            }
-        }
-    })
+/// The three Clock sysvar fields membership depends on, as the last block set
+/// them. The slot orders clocks so one never regresses.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct BlockClock {
+    pub slot: u64,
+    pub epoch: u64,
+    pub unix_timestamp: i64,
 }
 
-async fn recompute(
-    db: &DatabaseConnection,
-) -> Result<(u64, Vec<Pubkey>, Option<i64>), anyhow::Error> {
-    let start_time = Instant::now();
-    let clock = read_clock(db)
-        .await
-        .ok_or_else(|| anyhow::anyhow!("Clock sysvar not found in index"))?;
-
-    let withdraw_authorities: HashSet<Pubkey> = WITHDRAW_AUTHORITY.iter().copied().collect();
-    let mut set: HashSet<Pubkey> = NON_CIRCULATING_ACCOUNTS.iter().copied().collect();
-    let mut next_expiry: Option<i64> = None;
-
-    let mut stream = db
-        .stream(Statement::from_sql_and_values(
-            DatabaseBackend::Postgres,
-            LATEST_BY_OWNER_SQL,
-            [STAKE_PROGRAM_ID.to_bytes().to_vec().into()],
-        ))
-        .await?;
-    while let Some(row) = stream.try_next().await? {
-        let pubkey_bytes: Vec<u8> = row.try_get("", "pubkey")?;
-        let data: Vec<u8> = row.try_get("", "data")?;
-        let Ok(pubkey) = Pubkey::try_from(pubkey_bytes.as_slice()) else {
-            continue;
-        };
-        let Ok(state) = bincode::deserialize::<StakeStateV2>(&data) else {
-            continue;
-        };
-        let meta = match state {
-            StakeStateV2::Initialized(meta) => meta,
-            StakeStateV2::Stake(meta, _stake, _flags) => meta,
-            _ => continue,
-        };
-        let in_force = meta.lockup.is_in_force(&clock, None);
-        if in_force
-            && meta.lockup.epoch <= clock.epoch
-            && meta.lockup.unix_timestamp > clock.unix_timestamp
-        {
-            let ts = meta.lockup.unix_timestamp;
-            next_expiry = Some(next_expiry.map_or(ts, |current| current.min(ts)));
-        }
-        if in_force || withdraw_authorities.contains(&meta.authorized.withdrawer) {
-            set.insert(pubkey);
+impl From<Clock> for BlockClock {
+    fn from(clock: Clock) -> Self {
+        Self {
+            slot: clock.slot,
+            epoch: clock.epoch,
+            unix_timestamp: clock.unix_timestamp,
         }
     }
-
-    tracing::debug!(
-        target: "non_circulating_recomputer",
-        "recomputed membership ({} accounts) in {:.3}s",
-        set.len(),
-        start_time.elapsed().as_secs_f64()
-    );
-    Ok((clock.slot, set.into_iter().collect(), next_expiry))
 }
 
-async fn read_clock(db: &DatabaseConnection) -> Option<Clock> {
-    let row = db
-        .query_one(Statement::from_sql_and_values(
-            DatabaseBackend::Postgres,
-            r#"
-            SELECT data FROM (
-                SELECT slot, data, lamports FROM accounts
-                    WHERE owner = $1 AND pubkey = $2
-                UNION ALL
-                SELECT slot, data, lamports FROM snapshot_accounts
-                    WHERE owner = $1 AND pubkey = $2
-            ) AS u
-            WHERE lamports > 0
-            ORDER BY slot DESC
-            LIMIT 1
-            "#,
-            [
-                SYSVAR_OWNER_ID.to_bytes().to_vec().into(),
-                CLOCK_SYSVAR_ID.to_bytes().to_vec().into(),
-            ],
-        ))
-        .await
-        .ok()
-        .flatten()?;
-
-    let data: Vec<u8> = row.try_get("", "data").ok()?;
-    bincode::deserialize::<Clock>(&data).ok()
+/// One map entry with its flags unpacked, for the debug endpoint.
+#[derive(Serialize)]
+pub struct StakeEntryView {
+    pub lamports: u64,
+    pub lockup_unix_timestamp: i64,
+    pub lockup_epoch: u64,
+    pub slot: u64,
+    pub stake_owned: bool,
+    pub lockup: bool,
+    pub listed_withdrawer: bool,
+    pub pinned: bool,
+    pub member: bool,
 }
 
-/// Fetches the latest lamports/slot for each `(owner, pubkey)` member, routed by
-/// owner so the query prunes to the owner's partition.
-async fn fetch_non_circulating_balances(
-    db: &DatabaseConnection,
-    members: &[(Pubkey, Pubkey)],
-) -> Result<Vec<NonCirculatingBalance>, sea_orm::DbErr> {
-    if members.is_empty() {
-        return Ok(Vec::new());
+impl From<StakeEntry> for StakeEntryView {
+    fn from(entry: StakeEntry) -> Self {
+        Self {
+            lamports: entry.lamports,
+            lockup_unix_timestamp: entry.lockup_unix_timestamp,
+            lockup_epoch: entry.lockup_epoch,
+            slot: entry.slot,
+            stake_owned: entry.stake_owned(),
+            lockup: entry.has(StakeEntry::LOCKUP),
+            listed_withdrawer: entry.has(StakeEntry::LISTED_WITHDRAWER),
+            pinned: entry.has(StakeEntry::PINNED),
+            member: entry.member(),
+        }
     }
-
-    let (owners, pubkeys) = owner_pubkey_arrays(members);
-
-    let rows = db
-        .query_all(Statement::from_sql_and_values(
-            DatabaseBackend::Postgres,
-            format!(
-                r#"
-            SELECT v.pubkey, latest.lamports, latest.slot
-            FROM unnest($1::bytea[], $2::bytea[]) AS v(owner, pubkey)
-            JOIN LATERAL ({LATEST_ACCOUNT_ROW_SQL}) latest ON true
-            "#
-            ),
-            [owners, pubkeys],
-        ))
-        .await?;
-
-    rows.into_iter()
-        .map(|row| {
-            let pubkey = parse_pubkey(row.try_get("", "pubkey")?)?;
-            let lamports: i64 = row.try_get("", "lamports")?;
-            let slot: i64 = row.try_get("", "slot")?;
-            Ok(NonCirculatingBalance {
-                pubkey,
-                slot: slot as u64,
-                lamports: lamports as u64,
-            })
-        })
-        .collect()
-}
-
-fn bytea_array(items: Vec<Vec<u8>>) -> Value {
-    Value::Array(
-        ArrayType::Bytes,
-        Some(Box::new(
-            items
-                .into_iter()
-                .map(|bytes| Value::Bytes(Some(Box::new(bytes))))
-                .collect(),
-        )),
-    )
-}
-
-fn parse_pubkey(bytes: Vec<u8>) -> Result<Pubkey, sea_orm::DbErr> {
-    Pubkey::try_from(bytes.as_slice())
-        .map_err(|_| sea_orm::DbErr::Custom("invalid pubkey bytes in query result".to_string()))
-}
-
-fn owner_pubkey_arrays(pairs: &[(Pubkey, Pubkey)]) -> (Value, Value) {
-    let owners = pairs
-        .iter()
-        .map(|(owner, _)| owner.to_bytes().to_vec())
-        .collect();
-    let pubkeys = pairs
-        .iter()
-        .map(|(_, pubkey)| pubkey.to_bytes().to_vec())
-        .collect();
-    (bytea_array(owners), bytea_array(pubkeys))
 }

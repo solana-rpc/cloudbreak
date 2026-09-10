@@ -20,6 +20,8 @@ use cloudbreak_core::{
     modules::{
         account_owner_map::AccountOwnerMap,
         largest_accounts::LargestAccountsTracker,
+        non_circulating::NonCirculatingTracker,
+        supply::{self, SupplyTracker},
     },
 };
 
@@ -44,6 +46,7 @@ const DB_ACCOUNTS_BATCH_SIZE: usize = 200;
 /// If slot is not provided it will just download the latest available full and incremental snapshots
 ///
 /// Safety Note: This function should be run in a separate thread to avoid blocking the main thread
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     config: SnapshotConfig,
     received_slot: Option<u64>,
@@ -51,6 +54,8 @@ pub async fn run(
     buffer_size: Option<Arc<Mutex<usize>>>,
     accounts_owner_map: AccountOwnerMap,
     largest_accounts: LargestAccountsTracker,
+    non_circulating: NonCirculatingTracker,
+    supply_tracker: SupplyTracker,
 ) -> Result<()> {
     let start_time = Instant::now();
 
@@ -79,6 +84,8 @@ pub async fn run(
         config.clone(),
         accounts_owner_map.clone(),
         largest_accounts.clone(),
+        non_circulating.clone(),
+        supply_tracker.clone(),
     );
 
     // Process incremental snapshot only if needed
@@ -91,6 +98,8 @@ pub async fn run(
             config.clone(),
             accounts_owner_map.clone(),
             largest_accounts.clone(),
+            non_circulating.clone(),
+            supply_tracker.clone(),
         )
         .await??;
 
@@ -114,7 +123,13 @@ pub async fn run(
     db_queries::clean_up_closed_accounts(&database).await?;
     db_queries::create_database_indexes(&database, &config.pg_indexes).await?;
 
-    largest_accounts.finish_bootstrap_and_persist(&database).await;
+    // Membership flips first: GLA seeds its class sentinels from it, and every
+    // supply commit reads its running sum.
+    non_circulating.finish_bootstrap_and_persist(&database).await;
+    largest_accounts
+        .finish_bootstrap_and_persist(&database, &non_circulating)
+        .await;
+    supply::bootstrap::finish_bootstrap(&database, &supply_tracker).await;
 
     tracing::info!(
         "Total snapshot processing time after cleanup: {} secs",
@@ -124,6 +139,7 @@ pub async fn run(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn download_and_process_snapshot(
     sidecar_endpoint: String,
     snapshot_data: SnapshotData,
@@ -132,6 +148,8 @@ fn download_and_process_snapshot(
     config: SnapshotConfig,
     accounts_owner_map: AccountOwnerMap,
     largest_accounts: LargestAccountsTracker,
+    non_circulating: NonCirculatingTracker,
+    supply_tracker: SupplyTracker,
 ) -> JoinHandle<Result<()>> {
     let db_clone = database.clone();
 
@@ -151,9 +169,12 @@ fn download_and_process_snapshot(
         process_downloaded_snapshot(
             &db_clone,
             snapshot_data,
+            snapshot_type,
             config,
             accounts_owner_map,
             largest_accounts,
+            non_circulating,
+            supply_tracker,
         )
         .await?;
 
@@ -162,12 +183,16 @@ fn download_and_process_snapshot(
 }
 
 /// Note: this function uses `jobs` as a concurrency limit for spawning new tasks
+#[allow(clippy::too_many_arguments)]
 async fn process_downloaded_snapshot(
     database: &DatabaseConnection,
     snapshot_data: SnapshotData,
+    _snapshot_type: SnapshotType,
     config: SnapshotConfig,
     accounts_owner_map: AccountOwnerMap,
     largest_accounts: LargestAccountsTracker,
+    non_circulating: NonCirculatingTracker,
+    supply_tracker: SupplyTracker,
 ) -> Result<()> {
     let start_time = Instant::now();
     let total_accounts_files_opening_time_micros = Arc::new(Mutex::new(0));
@@ -177,11 +202,20 @@ async fn process_downloaded_snapshot(
     let sidecar::UnpackedSnapshot {
         account_files: solana_snapshot,
         stake_data,
+        bank_info,
     } = sidecar::unpack_compressed_snapshot(path, &base_dir, snapshot_data.slot)?;
 
     if let Err(e) = db_queries::persist_epoch_stakes(database, &stake_data).await {
         tracing::error!("Failed to persist epoch stakes from snapshot: {:?}", e);
     }
+
+    supply::bootstrap::seed_anchor(
+        database,
+        &supply_tracker,
+        bank_info.slot,
+        bank_info.capitalization,
+    )
+    .await;
 
     let mut account_file_workers: JoinSet<Result<()>> = JoinSet::new();
     let accounts_file_concurency = config.accounts_file_concurency.unwrap_or(32);
@@ -250,6 +284,7 @@ async fn process_downloaded_snapshot(
 
         let accounts_owner_map = accounts_owner_map.clone();
         let largest_accounts = largest_accounts.clone();
+        let non_circulating = non_circulating.clone();
 
         account_file_workers.spawn(async move {
             let start_time = Instant::now();
@@ -292,6 +327,16 @@ async fn process_downloaded_snapshot(
                             write_version,
                         );
                     }
+
+                    // Seeds the stake map, the pinned accounts and the clock.
+                    // No-op unless a class-aware feature is on.
+                    non_circulating.seed_account(
+                        account.pubkey(),
+                        account.owner,
+                        account.lamports,
+                        account.data,
+                        account_file_slot,
+                    );
 
                     if !programs_include.is_empty() {
                         if !programs_include.contains(account.owner) {

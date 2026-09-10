@@ -11,7 +11,7 @@ use hyper::{Request, StatusCode};
 use serde::Serialize;
 use solana_commitment_config::CommitmentConfig;
 use solana_rpc_client_api::config::{
-    RpcAccountInfoConfig, RpcContextConfig, RpcSimulateTransactionConfig,
+    RpcAccountInfoConfig, RpcContextConfig, RpcSimulateTransactionConfig, RpcSupplyConfig,
 };
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -157,6 +157,13 @@ async fn process_single_request(
             let config: Option<methods::vote_accounts::GetVoteAccountsConfig> =
                 extract_param(&rpc_request.params, 0).ok().flatten();
             let result = methods::vote_accounts::get_vote_accounts(state, config).await;
+            json_serialize_response(id, result, ctx).await
+        }
+        // A node with supply disabled falls through to the method-not-found arm.
+        "getSupply" if state.supply_enabled => {
+            let config: Option<RpcSupplyConfig> =
+                extract_param(&rpc_request.params, 0).ok().flatten();
+            let result = methods::get_supply::get_supply(state, config).await;
             json_serialize_response(id, result, ctx).await
         }
         "simulateTransaction" => {
@@ -476,6 +483,12 @@ async fn process_single_request(
             json_response
         }
         "getLargestAccounts" => {
+            // Disabled method: clean JSON-RPC "Method not found".
+            if !state.largest_accounts.enabled {
+                let err = RpcError::MethodNotFound;
+                return make_error_response(id, err.to_numeric_code(), err.to_string());
+            }
+
             let start_time = Instant::now();
 
             let config: Option<solana_rpc_client_api::config::RpcLargestAccountsConfig> =
@@ -513,6 +526,12 @@ async fn process_single_request(
             json_response
         }
         "getTokenLargestAccounts" => {
+            // Disabled method: clean JSON-RPC "Method not found".
+            if !state.token_largest_accounts.enabled {
+                let err = RpcError::MethodNotFound;
+                return make_error_response(id, err.to_numeric_code(), err.to_string());
+            }
+
             let start_time = Instant::now();
 
             let pubkey: String = match extract_param(&rpc_request.params, 0) {

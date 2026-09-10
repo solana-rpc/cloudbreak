@@ -27,9 +27,11 @@ use crate::metrics::TokioTaskCounterGuard;
 
 mod accounts_owner_map;
 pub mod finalizer;
+pub mod non_circulating;
 mod params;
 mod prometheus;
 pub mod self_healing;
+pub mod supply;
 
 /// Routes an operational HTTP request to the matching endpoint handler.
 async fn route(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
@@ -37,6 +39,8 @@ async fn route(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallib
         "/metrics" => prometheus::handle(),
         "/debug/modules/finalizer" => finalizer::handle(req.uri().query()).await,
         "/debug/modules/self_healing" => self_healing::handle(req.uri().query()).await,
+        "/debug/modules/supply" => supply::handle(req.uri().query()),
+        "/debug/modules/non_circulating" => non_circulating::handle(req.uri().query()),
         "/debug/accounts_owner_map" => accounts_owner_map::handle(),
         _ => Ok(not_found()),
     }

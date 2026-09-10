@@ -38,3 +38,14 @@ max-batch-size = 512
 max-queue-size = 2048
 track-idle-time = false
 span-filter = ["gpa_rpc", "gpa_db", "gpa_encode"]
+
+# getLargestAccounts (GLA) and getTokenLargestAccounts (GTLA) are served only
+# when their section is present with enabled = true, and only when the co-deployed
+# indexer enables the same section. Both are commented out (disabled) by default.
+# A request for a not-enabled method returns JSON-RPC -32601 Method not found.
+# Uncomment to enable, matching the indexer's sections.
+# [largest-accounts]
+# enabled = true
+
+# [token-largest-accounts]
+# enabled = true
