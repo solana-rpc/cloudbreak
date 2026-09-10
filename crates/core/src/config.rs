@@ -460,6 +460,12 @@ pub struct IndexConfig {
     pub accounts_owner_map_enabled: bool,
     #[serde(rename = "largest-accounts")]
     pub largest_accounts: Option<LargestAccountsConfig>,
+    /// Finalized slots between cleanup drains. 1 drains every slot.
+    #[serde(
+        rename = "cleanup-interval-slots",
+        default = "IndexConfig::default_cleanup_interval_slots"
+    )]
+    pub cleanup_interval_slots: u64,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -516,6 +522,10 @@ impl IndexConfig {
 
     fn default_finalize_slot_buffer_size() -> usize {
         1000
+    }
+
+    const fn default_cleanup_interval_slots() -> u64 {
+        1
     }
 
     pub fn largest_accounts_enabled(&self) -> bool {
@@ -980,6 +990,15 @@ pub struct QueryTrackerConfig {
         default = "QueryTrackerConfig::default_indexer_metrics_threshold"
     )]
     pub indexer_metrics_threshold: u64,
+    /// If `cloudbreak_cleanup_lag_slots` exceeds this, CREATE and DROP INDEX are deferred.
+    /// The indexer's finalize queue stops reflecting database pressure once cleanup is
+    /// decoupled from the finalize worker, so this gauge is the second signal. An indexer
+    /// that does not publish it reads as no pressure.
+    #[serde(
+        rename = "indexer-cleanup-lag-threshold",
+        default = "QueryTrackerConfig::default_indexer_cleanup_lag_threshold"
+    )]
+    pub indexer_cleanup_lag_threshold: u64,
     /// Optional cap on the total number of indexes on the target table.
     #[serde(rename = "max-auto-indexes", default)]
     pub max_auto_indexes: Option<usize>,
@@ -1277,6 +1296,10 @@ impl QueryTrackerConfig {
         5
     }
 
+    const fn default_indexer_cleanup_lag_threshold() -> u64 {
+        32
+    }
+
     pub fn deserialize_indexer_metrics<'de, D>(deserializer: D) -> Result<String, D::Error>
     where
         D: Deserializer<'de>,
@@ -1303,6 +1326,7 @@ impl Default for QueryTrackerConfig {
             excluded_programs: Vec::new(),
             indexer_metrics: String::default(),
             indexer_metrics_threshold: Self::default_indexer_metrics_threshold(),
+            indexer_cleanup_lag_threshold: Self::default_indexer_cleanup_lag_threshold(),
             max_auto_indexes: None,
             index_eviction_enabled: Self::default_index_eviction_enabled(),
             mark_unhealthy_for_eviction: Self::default_mark_unhealthy_for_eviction(),

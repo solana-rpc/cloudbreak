@@ -274,6 +274,11 @@ lazy_static::lazy_static! {
         "cloudbreak_finalize_slot_handler_queue_size", "Size of the finalize slot handler queue"
     )
     .expect("Failed to create finalize slot handler queue size gauge");
+
+    pub static ref CLEANUP_LAG_SLOTS: IntGauge = IntGauge::new(
+        "cloudbreak_cleanup_lag_slots", "Finalized slots since the oldest unprocessed cleanup enqueue"
+    )
+    .expect("Failed to create cleanup lag slots gauge");
 }
 
 pub fn record_block_processing(elapsed: f64, origin: &str) {
@@ -384,5 +389,6 @@ pub fn register_collectors() {
         register!(FINALIZE_SLOT_DELETED_ACCOUNTS);
         register!(LARGEST_ACCOUNTS_DB_ERRORS);
         register!(LARGEST_ACCOUNTS_STALE_MINTS);
+        register!(CLEANUP_LAG_SLOTS);
     });
 }

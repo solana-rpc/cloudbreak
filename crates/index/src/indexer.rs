@@ -121,12 +121,22 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
         largest_accounts::spawn_largest_accounts_pruner(db.clone(), config.clone(), prune_slot_rx);
     }
 
+    // The finalize worker hands each slot's cleanup keys here and returns.
+    let cleanup = modules::cleanup::CleanupHandle::new(config.cleanup_interval_slots);
+    modules::cleanup::spawn_cleanup_drainer(
+        cleanup.clone(),
+        Arc::new(db.clone()),
+        updated_accounts_during_startup.clone(),
+        Duration::from_secs(config.database.finalize_slot_queries_timeout),
+    );
+
     let slot_finalizer = SlotFinalizer::spawn(
         db.clone(),
         config.clone(),
         updated_accounts_during_startup.clone(),
         health.clone(),
         prune_slot_tx,
+        cleanup,
     );
 
     let indexer_state = IndexerState {

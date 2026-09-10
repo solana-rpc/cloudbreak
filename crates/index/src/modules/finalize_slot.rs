@@ -9,15 +9,14 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{Notify, watch};
-use tokio::{task::JoinSet, time::Instant};
+use tokio::time::Instant;
 use yellowstone_grpc_proto::geyser::CommitmentLevel;
 
 use crate::indexer::AccountsReceivedPerBlock;
+use crate::modules::cleanup::{self, CleanupHandle};
 use crate::modules::health::{HealthReason, ServiceHealth};
 use crate::modules::snapshot::SnapshotProcessingState;
 use crate::{db_queries, metrics};
-
-const SLOT_FINALIZE_BATCH_SIZE: usize = 500;
 
 /// Emits a warning when the in-memory blocks map grows beyond this size, as an alert for
 /// further debugging (e.g. finalization stalled or a fork is leaving orphaned entries behind).
@@ -92,6 +91,8 @@ pub struct SlotFinalizer {
     health: ServiceHealth,
     /// Latest finalized slot, watched by the largest-accounts pruner task.
     prune_slot_tx: watch::Sender<u64>,
+    /// Queue the slot's cleanup keys go to. The worker never waits on its drainer.
+    cleanup: CleanupHandle,
     /// Max number of pending live slots before `note_finalized` blocks (back-pressure bound).
     /// Bypassed by `enqueue_unbounded` and `enqueue_gap_boundary`(gap fill).
     pub bound: usize,
@@ -105,6 +106,7 @@ impl SlotFinalizer {
         updated_accounts_during_startup: UpdatedAccountsDuringStartup,
         health: ServiceHealth,
         prune_slot_tx: watch::Sender<u64>,
+        cleanup: CleanupHandle,
     ) -> Self {
         let bound = config.finalize_slot_buffer_size;
         let finalizer = Self {
@@ -116,6 +118,7 @@ impl SlotFinalizer {
             updated_accounts_during_startup,
             health,
             prune_slot_tx,
+            cleanup,
             bound,
         };
 
@@ -319,6 +322,7 @@ impl SlotFinalizer {
                 entry.accounts,
                 self.updated_accounts_during_startup.clone(),
                 &self.prune_slot_tx,
+                &self.cleanup,
             )
             .await;
         }
@@ -413,170 +417,43 @@ async fn finalize_slot(
     updated_accounts: AccountsReceivedPerBlock,
     updated_accounts_during_startup: UpdatedAccountsDuringStartup,
     prune_slot_tx: &watch::Sender<u64>,
+    cleanup: &CleanupHandle,
 ) {
     let start_time = Instant::now();
 
-    let db_clone = db.clone();
-    let config_clone = config.clone();
-
-    // Mark the slot as finalized before starting the cleanup tasks for API queries consistency
+    // Mark the slot finalized before the cleanup keys are queued, for API query consistency.
     db_queries::insert_slot(
         slot,
         updated_accounts.block_time,
         CommitmentLevel::Finalized,
         updated_accounts_during_startup.health.is_healthy(),
-        &db_clone,
-        &config_clone,
+        &db,
+        config,
     )
     .await;
 
-    // These are accounts that were in the slot but did not have an older version (which means
-    //  they are completely new to our db)
-    let new_accounts_in_slot = Arc::new(Mutex::new(0));
-
-    // Each batch carries the matching owners chunk so the cleanup DELETE prunes to one hash
-    // partition per key. Owners are empty when the owner map is disabled (no-owner fallback).
-    let owner_routed = updated_accounts.accounts_owners.len() == updated_accounts.accounts.len();
-    let batches = if owner_routed {
-        updated_accounts
-            .accounts
-            .chunks(SLOT_FINALIZE_BATCH_SIZE)
-            .zip(
-                updated_accounts
-                    .accounts_owners
-                    .chunks(SLOT_FINALIZE_BATCH_SIZE),
-            )
-            .map(|(batch, owners)| (batch.to_vec(), owners.to_vec()))
-            .collect::<Vec<_>>()
-    } else {
-        updated_accounts
-            .accounts
-            .chunks(SLOT_FINALIZE_BATCH_SIZE)
-            .map(|batch| (batch.to_vec(), Vec::new()))
-            .collect::<Vec<_>>()
-    };
-
-    let mut join_set = JoinSet::new();
-
     updated_accounts_during_startup.cleanup_stored_accounts_once(&db, slot, config);
 
-    for (batch, owner_batch) in batches {
-        let db_clone = db.clone();
-        let batch_clone = batch.clone();
-        let owner_batch_clone = owner_batch.clone();
-        let new_accounts_in_slot_clone = new_accounts_in_slot.clone();
-        let updated_accounts_during_startup = updated_accounts_during_startup.clone();
-        let config_clone = config.clone();
-        join_set.spawn(async move {
-            let _guard = metrics::TokioTaskCounterGuard::new("finalize_slot_internal");
+    let derived =
+        cleanup::keys_for_slot(&updated_accounts, slot, config.accounts_owner_map_enabled);
 
-            db_queries::cleanup_accounts(
-                &db_clone,
-                batch_clone,
-                owner_batch_clone,
-                slot,
-                "accounts",
-                new_accounts_in_slot_clone,
-                "cleanup_accounts_batch",
-                &config_clone,
-            )
-            .await;
-        });
-
-        // If we are in startup, we just save the updated accounts to delete them after the snapshot is processed
-        if updated_accounts_during_startup.is_startup() {
-            updated_accounts_during_startup.add_batch_to_cache_during_startup(batch);
-            continue;
-        }
-
-        let db_clone = db.clone();
-        let config_clone = config.clone();
-        join_set.spawn(async move {
-            let _guard = metrics::TokioTaskCounterGuard::new("finalize_slot_internal");
-
-            // with the latest changes it doesn't make sense any more to try to measure this on the snapshot accounts table
-            // but this will asintotically become more accurate as the snapshot accounts table is deleted/cleaned up
-            let dummy_new_accounts_in_slot = Arc::new(Mutex::new(0));
-
-            db_queries::cleanup_accounts(
-                &db_clone,
-                batch,
-                owner_batch,
-                slot,
-                "snapshot_accounts",
-                dummy_new_accounts_in_slot,
-                "cleanup_snapshot_accounts_batch",
-                &config_clone,
-            )
-            .await;
-        });
+    // During startup `snapshot_accounts` is still loading and the owner map is still seeding, so
+    // a close the map has not learned yet can still have rows there. Cache every closed pubkey,
+    // not just the routed ones, and let the one-shot clear them once the load finishes.
+    if updated_accounts_during_startup.is_startup() {
+        updated_accounts_during_startup.add_batch_to_cache_during_startup(
+            derived
+                .items
+                .iter()
+                .map(|(key, _)| key.pubkey.to_vec())
+                .chain(updated_accounts.closed_accounts.iter().cloned()),
+        );
     }
 
     let _ = prune_slot_tx.send(slot);
-
-    // The captured pairs also carry the old-owner keys for in-slot owner changes, so an
-    // account that moved from owner A to B has its A-partition rows and mask deleted under A.
-    let closed_owner_routed = !updated_accounts.closed_cleanup_owners.is_empty()
-        && updated_accounts.closed_cleanup_owners.len()
-            == updated_accounts.closed_cleanup_pubkeys.len();
-
-    let (closed_pubkeys, closed_owners) = if closed_owner_routed {
-        (
-            updated_accounts.closed_cleanup_pubkeys.clone(),
-            updated_accounts.closed_cleanup_owners.clone(),
-        )
-    } else {
-        (updated_accounts.closed_accounts.clone(), Vec::new())
-    };
-
-    let db_clone = db.clone();
-    let config_clone = config.clone();
-    let closed_pubkeys_clone = closed_pubkeys.clone();
-    let closed_owners_clone = closed_owners.clone();
-    join_set.spawn(async move {
-        // Deletes the closed-account masks and their old versions, including old-owner rows for owner
-        // changes. Runs concurrently with cleanup_accounts because the owner match keeps the row sets disjoint.
-        db_queries::cleanup_closed_accounts(
-            &db_clone,
-            closed_pubkeys_clone,
-            closed_owners_clone,
-            slot,
-            &config_clone,
-        )
-        .await;
-    });
-
-    // If we are in startup, we just save the closed accounts to delete them after the snapshot is processed
-    if updated_accounts_during_startup.is_startup() {
-        updated_accounts_during_startup
-            .add_batch_to_cache_during_startup(updated_accounts.closed_accounts);
-    } else {
-        let config_clone = config.clone();
-        join_set.spawn(async move {
-            // Closed accounts are not included in the updated accounts, so we need to cleanup them separately
-            db_queries::cleanup_accounts(
-                &db,
-                closed_pubkeys,
-                closed_owners,
-                slot,
-                "snapshot_accounts",
-                Arc::new(Mutex::new(0)),
-                "cleanup_snapshot_closed_accounts",
-                &config_clone,
-            )
-            .await;
-        });
-    }
-
-    join_set.join_all().await;
+    cleanup.enqueue(slot, &derived.items);
 
     metrics::record_finalize_slot(start_time.elapsed().as_secs_f64(), "total");
-    metrics::record_new_accounts_in_slot(
-        *new_accounts_in_slot
-            .lock()
-            .expect("Failed to lock new_accounts_in_slot"),
-        "new_accounts_in_slot",
-    );
 }
 
 ///Used to store all accounts that are updated/closed while loading the snapshot, and delete them after the snapshot is processed
@@ -628,7 +505,10 @@ impl UpdatedAccountsDuringStartup {
         self.health.remove_reason(HealthReason::Startup).await;
     }
 
-    pub fn add_batch_to_cache_during_startup(&self, batch: Vec<Vec<u8>>) {
+    pub fn add_batch_to_cache_during_startup<I>(&self, batch: I)
+    where
+        I: IntoIterator<Item = Vec<u8>>,
+    {
         let mut accounts = self.accounts.lock().expect("Failed to lock accounts");
         accounts.extend(batch);
     }
@@ -658,7 +538,7 @@ impl UpdatedAccountsDuringStartup {
             .collect::<Vec<_>>();
 
         let db = db.clone();
-        let config = config.clone();
+        let query_timeout = Duration::from_secs(config.database.finalize_slot_queries_timeout);
         let snapshot_processing_state = self.snapshot_processing_state.clone();
         let health = self.health.clone();
 
@@ -666,53 +546,38 @@ impl UpdatedAccountsDuringStartup {
             let _guard = metrics::TokioTaskCounterGuard::new("startup_snapshot_accounts_cleanup");
 
             let start_time = Instant::now();
+            let total = accounts.len();
+            tracing::info!(target: "cleanup_stored_accounts", "Cleaning up stored accounts from snapshot_accounts - accounts: {}", total);
 
-            tracing::info!(target: "cleanup_stored_accounts", "Cleaning up stored accounts from snapshot_accounts - accounts: {}", accounts.len());
-
-            let batches = accounts
-                .chunks(SLOT_FINALIZE_BATCH_SIZE)
-                .map(|batch| batch.to_vec())
-                .collect::<Vec<_>>();
-
-            let mut join_set = JoinSet::new();
-            const MAX_CONCURRENT_CLEANUP_TASKS: usize = 10;
-
-            for batch in batches {
-                while join_set.len() >= MAX_CONCURRENT_CLEANUP_TASKS {
-                    join_set.join_next().await;
-                }
-
-                let db = db.clone();
-                let config_clone = config.clone();
-                join_set.spawn(async move {
-                    let _guard =
-                        metrics::TokioTaskCounterGuard::new("startup_snapshot_accounts_cleanup");
-
-                    db_queries::cleanup_accounts(
-                        &db,
-                        batch,
-                        Vec::new(),
-                        slot,
-                        "snapshot_accounts",
-                        Arc::new(Mutex::new(0)),
-                        "cleanup_startup_snapshot_accounts_batch",
-                        &config_clone,
-                    )
+            // A uniform cutoff is safe on this table only. See delete_below_uniform_cutoff.
+            let result =
+                cleanup::persist::delete_below_uniform_cutoff(&db, accounts, slot, query_timeout)
                     .await;
-                });
-            }
-
-            join_set.join_all().await;
 
             let elapsed = start_time.elapsed().as_secs_f64();
-            tracing::info!(target: "cleanup_stored_accounts", "Cleaned up stored accounts from snapshot_accounts in {} seconds", elapsed);
+            match result {
+                Ok(deleted) => {
+                    tracing::info!(target: "cleanup_stored_accounts", "Cleaned up {} rows from snapshot_accounts in {} seconds", deleted, elapsed);
 
-            // Startup snapshot processing is complete: clear the startup unhealthy reason.
-            *snapshot_processing_state
-                .lock()
-                .expect("Failed to lock snapshot_processing_state") =
-                SnapshotProcessingState::FinishedAndCleanedUp;
-            health.remove_reason(HealthReason::Startup).await;
+                    // Startup is complete only when every batch landed. A batch that never ran
+                    // leaves rows a closed account still needs removed, so the node stays
+                    // unhealthy instead of declaring itself ready over them.
+                    *snapshot_processing_state
+                        .lock()
+                        .expect("Failed to lock snapshot_processing_state") =
+                        SnapshotProcessingState::FinishedAndCleanedUp;
+                    health.remove_reason(HealthReason::Startup).await;
+                }
+                Err(error) => {
+                    tracing::error!(
+                        target: "cleanup_stored_accounts",
+                        "startup snapshot_accounts cleanup failed after {} seconds, leaving the node unhealthy: {}",
+                        elapsed,
+                        error
+                    );
+                    metrics::increment_db_errors();
+                }
+            }
         });
     }
 }
