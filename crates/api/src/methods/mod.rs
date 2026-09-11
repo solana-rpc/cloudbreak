@@ -15,6 +15,7 @@ pub mod get_account_info;
 pub mod get_balance;
 pub mod get_largest_accounts;
 pub mod get_multiple_accounts;
+pub mod get_supply;
 pub mod get_token_account_balance;
 pub mod get_token_largest_accounts;
 pub mod get_token_supply;

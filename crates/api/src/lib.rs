@@ -12,7 +12,7 @@ use cloudbreak_core::{ApiConfig, EnvironmentInfo, TryLoadConfig};
 use crate::{
     http::{CloudbreakRpcState, HeaderKeys},
     metrics::setup_metrics,
-    modules::{cache::GpaProcessor, vote_accounts_cache},
+    modules::{cache::GpaProcessor, supply_cache, vote_accounts_cache},
     query_tracker_client::QueryTrackerClient,
 };
 use std::sync::RwLock;
@@ -94,16 +94,15 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
     let simulation_supported = indexer_filter.supports_simulation();
     info!("simulateTransaction: supported: {}", simulation_supported);
 
-    let largest_accounts_mints = EnvironmentInfo::load_largest_accounts_mints(&database)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!("Failed to load largest accounts mints: {:?}", e);
-            None
-        })
-        .map(|mints| Arc::new(mints.into_iter().collect::<std::collections::HashSet<_>>()));
+    let largest_accounts = config.largest_accounts.clone().unwrap_or_default();
+    let token_largest_accounts = config.token_largest_accounts.clone().unwrap_or_default();
     info!(
         "getLargestAccounts: supported: {}",
-        largest_accounts_mints.is_some()
+        largest_accounts.enabled
+    );
+    info!(
+        "getTokenLargestAccounts: supported: {}",
+        token_largest_accounts.enabled
     );
 
     let vote_accounts_supported = indexer_filter.supports_vote_accounts();
@@ -139,6 +138,33 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
         );
     }
 
+    let supply_enabled = config.supply_enabled();
+    let supply_cache: supply_cache::SharedSupplySnapshot = Arc::default();
+    if supply_enabled {
+        match supply_cache::load_latest_supply(&database).await {
+            Ok(Some(snapshot)) => {
+                info!(
+                    "Loaded initial supply snapshot ({} rows)",
+                    snapshot.rows.len()
+                );
+                *supply_cache.write().unwrap() = Arc::new(snapshot);
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    "supply table is empty at startup; getSupply will fail until the \
+                     indexer processes a snapshot"
+                );
+            }
+            Err(e) => {
+                tracing::error!("Failed to load initial supply snapshot: {:?}", e);
+            }
+        }
+        supply_cache::spawn_poll_task(database.clone(), supply_cache.clone());
+        info!("getSupply: enabled");
+    } else {
+        info!("getSupply: disabled (supply-enabled is false)");
+    }
+
     let state = CloudbreakRpcState::new(
         database,
         queries_timeout,
@@ -156,7 +182,10 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
         stakes_cache,
         max_multiple_accounts,
         simulation_supported,
-        largest_accounts_mints,
+        supply_enabled,
+        supply_cache,
+        largest_accounts,
+        token_largest_accounts,
     );
 
     info!("Server is starting...");

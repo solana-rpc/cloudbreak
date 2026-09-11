@@ -7,6 +7,7 @@ use crate::http::server::HttpHandlerResponse;
 use crate::http::server::ResponseBody;
 use crate::modules::bandwidth;
 use crate::modules::cache::GpaProcessor;
+use crate::modules::supply_cache::SharedSupplySnapshot;
 use crate::modules::vote_accounts_cache::SharedStakesSnapshot;
 use crate::error::RpcError;
 use crate::query_tracker_client::QueryTrackerClient;
@@ -16,13 +17,13 @@ use hyper::StatusCode;
 use sea_orm::{DatabaseConnection, EntityTrait};
 use serde::{Deserialize, Serialize};
 use solana_commitment_config::CommitmentLevel;
-use solana_pubkey::Pubkey;
 use solana_rpc_client_api::response::Response as RpcResponse;
-use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tracing::Instrument;
-use cloudbreak_core::{AccountSelectorConfig, ProcessedCommitmentBehavior, UnhealthyResponseBehavior};
+use cloudbreak_core::{
+    AccountSelectorConfig, MethodSection, ProcessedCommitmentBehavior, UnhealthyResponseBehavior,
+};
 use cloudbreak_entity::slots;
 
 #[derive(Clone)]
@@ -110,9 +111,15 @@ pub struct CloudbreakRpcState {
     pub stakes_cache: SharedStakesSnapshot,
     pub max_multiple_accounts: usize,
     pub simulation_supported: bool,
+    pub supply_enabled: bool,
+    pub supply_cache: SharedSupplySnapshot,
     pub feature_set_cache: Arc<RwLock<Option<CachedFeatureSet>>>,
-    /// Will be `Some` if the node supports the `getLargestAccounts` RPC method.
-    pub largest_accounts_mints: Option<Arc<HashSet<Pubkey>>>,
+    /// The `[largest-accounts]` API section; getLargestAccounts is served when
+    /// its `enabled` flag is set.
+    pub largest_accounts: MethodSection,
+    /// The `[token-largest-accounts]` API section; getTokenLargestAccounts is
+    /// served when its `enabled` flag is set.
+    pub token_largest_accounts: MethodSection,
 }
 
 impl CloudbreakRpcState {
@@ -134,7 +141,10 @@ impl CloudbreakRpcState {
         stakes_cache: SharedStakesSnapshot,
         max_multiple_accounts: usize,
         simulation_supported: bool,
-        largest_accounts_mints: Option<Arc<HashSet<Pubkey>>>,
+        supply_enabled: bool,
+        supply_cache: SharedSupplySnapshot,
+        largest_accounts: MethodSection,
+        token_largest_accounts: MethodSection,
     ) -> Self {
         Self {
             database,
@@ -153,8 +163,11 @@ impl CloudbreakRpcState {
             stakes_cache,
             max_multiple_accounts,
             simulation_supported,
+            supply_enabled,
+            supply_cache,
             feature_set_cache: Arc::new(RwLock::new(None)),
-            largest_accounts_mints,
+            largest_accounts,
+            token_largest_accounts,
         }
     }
 

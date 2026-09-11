@@ -8,7 +8,8 @@ use cloudbreak_core::{
     modules::{
         account_owner_map::AccountOwnerMap,
         largest_accounts::{self, LargestAccountsTracker},
-        non_circulating::{self, NonCirculatingTracker},
+        non_circulating::NonCirculatingTracker,
+        supply::{self, SupplyTracker},
     },
 };
 use sea_orm::{ConnectOptions, Database, DatabaseConnection};
@@ -55,6 +56,7 @@ pub struct IndexerState {
     pub accounts_owner_map: AccountOwnerMap,
     pub largest_accounts: LargestAccountsTracker,
     pub non_circulating: NonCirculatingTracker,
+    pub supply_tracker: SupplyTracker,
 }
 
 pub async fn run(config: &str) -> CloudbreakResult<()> {
@@ -96,18 +98,19 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
         AccountOwnerMap::default()
     };
 
-    // Validates prerequisites, records tracked mints in environment_info, and clears
-    // stale largest_accounts rows. Disabled tracker when the feature is off.
+    // Validates prerequisites and clears stale largest_accounts rows. Disabled
+    // tracker when neither largest-accounts section is enabled.
     let largest_accounts = LargestAccountsTracker::from_config(&db, &config).await;
 
-    // The non-circulating tracker powers the getLargestAccounts circulating/non-circulating
-    // filter. It is enabled with largest-accounts (which already requires a full index, the
-    // snapshot section, and the owner map).
-    let non_circulating = if largest_accounts.is_enabled() {
-        NonCirculatingTracker::new()
-    } else {
-        NonCirculatingTracker::default()
-    };
+    // The non-circulating tracker keeps the stake map and the membership set
+    // behind the getLargestAccounts class filter and the getSupply figures.
+    let non_circulating = NonCirculatingTracker::from_config(&db, &config).await;
+
+    // The supply tracker keeps the running total-supply figure for getSupply. It
+    // reads the previous balance from the stake map and a bounded hot-accounts
+    // cache, so it needs a full index, the owner map off, owner partitioning off,
+    // and the snapshot anchor. `from_config` validates all of it.
+    let supply_tracker = supply::persist::from_config(&db, &config, non_circulating.clone()).await;
 
     // Service health is tracked as a set of reasons (Startup is set until the startup snapshot is
     // processed; GapFill is set while a gap fill is in progress).
@@ -117,9 +120,16 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
         UpdatedAccountsDuringStartup::new(snapshot_processing_state.clone(), health.clone());
 
     let (prune_slot_tx, prune_slot_rx) = tokio::sync::watch::channel(0u64);
-    if config.largest_accounts_enabled() {
-        largest_accounts::spawn_largest_accounts_pruner(db.clone(), config.clone(), prune_slot_rx);
-    }
+    // No-op when neither largest-accounts section is enabled.
+    largest_accounts::spawn_largest_accounts_pruner(db.clone(), config.clone(), prune_slot_rx);
+
+    // The cache sweeper wakes on each finalize-slot change and evicts stale
+    // unpinned entries off the block path. No-op when supply is disabled.
+    supply::maintain::spawn_supply_cache_sweeper(
+        db.clone(),
+        supply_tracker.clone(),
+        prune_slot_tx.subscribe(),
+    );
 
     // The finalize worker hands each slot's cleanup keys here and returns.
     let cleanup = modules::cleanup::CleanupHandle::new(config.cleanup_interval_slots);
@@ -142,13 +152,18 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
     let indexer_state = IndexerState {
         buffer_channel_rx_len: Arc::new(Mutex::new(buffer_channel_rx.len())),
         snapshot_processing_state: snapshot_processing_state.clone(),
-        self_healing_state: SelfHealingState::new(&config, slot_finalizer.clone()),
+        self_healing_state: SelfHealingState::new(
+            &config,
+            slot_finalizer.clone(),
+            supply_tracker.clone(),
+        ),
         slot_finalizer,
         updated_accounts_during_startup,
         finalize_slot_buffer_size: finalize_slot_buffer_size.clone(),
         accounts_owner_map,
         largest_accounts,
         non_circulating,
+        supply_tracker,
     };
 
     // Used for the hash-checker to signal the main loop to stop
@@ -188,14 +203,6 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
     let _epoch_stakes_handle =
         modules::epoch_stakes::spawn_epoch_stakes_recomputer(db.clone(), config.clone());
 
-    let _non_circulating_handle = non_circulating::spawn_non_circulating_recomputer(
-        db.clone(),
-        config.clone(),
-        indexer_state.non_circulating.clone(),
-        indexer_state.accounts_owner_map.clone(),
-        indexer_state.largest_accounts.clone(),
-    );
-
     operational_endpoints::self_healing::SELF_HEALING
         .set(indexer_state.self_healing_state.clone())
         .ok()
@@ -204,6 +211,14 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
         .set(indexer_state.slot_finalizer.clone())
         .ok()
         .expect("Failed to set finalizer for debug endpoint");
+    operational_endpoints::supply::SUPPLY
+        .set(indexer_state.supply_tracker.clone())
+        .ok()
+        .expect("Failed to set supply tracker for debug endpoint");
+    operational_endpoints::non_circulating::NON_CIRCULATING
+        .set(indexer_state.non_circulating.clone())
+        .ok()
+        .expect("Failed to set non-circulating tracker for debug endpoint");
 
     tokio::select! {
         _ = main_loop(

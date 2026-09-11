@@ -17,8 +17,6 @@ impl MigrationTrait for Migration {
                     updated_on TIMESTAMPTZ NOT NULL DEFAULT now(),
                     PRIMARY KEY (mint, slot)
                 );
-                ALTER TABLE environment_info
-                    ADD COLUMN IF NOT EXISTS largest_accounts_mints TEXT;
                 "#,
             )
             .await?;
@@ -32,7 +30,6 @@ impl MigrationTrait for Migration {
             .execute_unprepared(
                 r#"
                 DROP TABLE IF EXISTS largest_accounts;
-                ALTER TABLE environment_info DROP COLUMN IF EXISTS largest_accounts_mints;
                 "#,
             )
             .await?;

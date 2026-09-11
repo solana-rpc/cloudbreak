@@ -10,10 +10,7 @@ use sea_orm::{
     DatabaseConnection,
 };
 use solana_pubkey::Pubkey;
-use tokio::{
-    task::{JoinHandle, JoinSet},
-    time::Instant,
-};
+use tokio::{task::JoinSet, time::Instant};
 use yellowstone_grpc_proto::geyser::CommitmentLevel;
 use yellowstone_grpc_proto::geyser::SubscribeUpdateBlock;
 
@@ -39,6 +36,7 @@ pub async fn save_block(
         accounts_owner_map,
         largest_accounts,
         non_circulating,
+        supply_tracker,
     } = indexer_state;
 
     let start_time = Instant::now();
@@ -46,6 +44,7 @@ pub async fn save_block(
     let max_chunk_bytes_data = config.grpc.max_chunk_bytes_data;
 
     let slot = block.slot;
+    let is_repaired = block.blockhash.is_empty();
 
     modules::snapshot::process_snapshot_if_needed(
         config.clone(),
@@ -54,6 +53,8 @@ pub async fn save_block(
         finalize_slot_buffer_size.clone(),
         accounts_owner_map.clone(),
         largest_accounts.clone(),
+        non_circulating.clone(),
+        supply_tracker.clone(),
     )
     .await;
 
@@ -84,9 +85,15 @@ pub async fn save_block(
         .map(|pubkey| pubkey.0.to_bytes().to_vec())
         .collect::<Vec<_>>();
 
-    // Fold the block's accounts into the largest-accounts tracker before the main loop
-    // consumes `block.accounts`. Returns empty when the feature is disabled.
-    let largest_pending = largest_accounts.build_block_pending(&block.accounts, &non_circulating);
+    // The stake map goes first so the trackers below see this block's membership.
+    // Each returns empty when its feature is disabled.
+    let stake_block = non_circulating.apply_block(slot, is_repaired, &block.accounts);
+    let largest_pending = largest_accounts.build_block_pending(
+        &block.accounts,
+        &non_circulating,
+        &stake_block.expired,
+    );
+    let supply_pending = supply_tracker.build_block_pending(&block.accounts);
 
     // Create the chunks for updating the "accounts" table
     let system_program_id = [0u8; 32].to_vec();
@@ -193,21 +200,10 @@ pub async fn save_block(
             .lock()
             .expect("Failed to lock snapshot_processing_state")
     };
-
-    let closed_accounts_insert_handle: Option<JoinHandle<()>> = if snapshot_processing_state
+    let closed_accounts_to_insert = (snapshot_processing_state
         == SnapshotProcessingState::Finished
-        || snapshot_processing_state == SnapshotProcessingState::FinishedAndCleanedUp
-    {
-        db_queries::insert_closed_accounts(
-            db.clone(),
-            closed_accounts_for_slot.clone(),
-            slot,
-            &config,
-            accounts_owner_map,
-        )
-    } else {
-        None
-    };
+        || snapshot_processing_state == SnapshotProcessingState::FinishedAndCleanedUp)
+        .then(|| closed_accounts_for_slot.clone());
 
     // Record the block data in the finalizer map (keyed by slot). It is held there until the slot
     // is finalized (via a finalized notification or the ancestor walk). For snapshot-repaired
@@ -233,29 +229,59 @@ pub async fn save_block(
     metrics::record_closed_accounts_per_slot(closed_account_for_slot_len);
     metrics::record_block_size(block_bytes_data);
 
-    // Update the "accounts" table
-    let mut tasks = JoinSet::new();
-    for (chunk, byte_size) in chunks {
-        let db = db.clone();
-        let config_clone = config.clone();
-        // TODO: Set concurrency limit
-        tasks.spawn(async move {
-            let _guard = metrics::TokioTaskCounterGuard::new("insert_accounts_chunk");
-
-            db_queries::insert_accounts_chunk(&db, chunk, byte_size, &config_clone).await;
+    // Update the "accounts" table. The supply tracker starts these writes after
+    // its cache probe, so its miss read overlaps them.
+    let block_writes = async {
+        let closed_accounts_insert_handle = closed_accounts_to_insert.and_then(|closed| {
+            db_queries::insert_closed_accounts(
+                db.clone(),
+                closed,
+                slot,
+                &config,
+                accounts_owner_map,
+            )
         });
-    }
 
-    tasks.join_all().await;
+        let mut tasks = JoinSet::new();
+        for (chunk, byte_size) in chunks {
+            let db = db.clone();
+            let config_clone = config.clone();
+            // TODO: Set concurrency limit
+            tasks.spawn(async move {
+                let _guard = metrics::TokioTaskCounterGuard::new("insert_accounts_chunk");
 
-    if let Some(handle) = closed_accounts_insert_handle
-        && let Err(e) = handle.await
-    {
-        tracing::error!(target: "save_block_closed_accounts_insert", "failed to insert closed accounts: {:?}", e);
-    }
+                db_queries::insert_accounts_chunk(&db, chunk, byte_size, &config_clone).await
+            });
+        }
+
+        let mut block_writes_ok = tasks.join_all().await.into_iter().all(|inserted| inserted);
+
+        if let Some(handle) = closed_accounts_insert_handle {
+            match handle.await {
+                Ok(inserted) => block_writes_ok &= inserted,
+                Err(e) => {
+                    tracing::error!(target: "save_block_closed_accounts_insert", "failed to insert closed accounts: {:?}", e);
+                    block_writes_ok = false;
+                }
+            }
+        }
+        block_writes_ok
+    };
+    let (supply_outcome, block_writes_ok) = supply_tracker
+        .apply_block(
+            slot,
+            is_repaired,
+            supply_pending,
+            &stake_block,
+            block_writes,
+        )
+        .await;
 
     largest_accounts
         .commit_block(slot, largest_pending, db, &config)
+        .await;
+    non_circulating
+        .persist_block(&stake_block, db, &config)
         .await;
 
     // Wait until the chunk processing is finished to insert the slot (this ensures that gPA calls can only read from completed slots)
@@ -277,6 +303,8 @@ pub async fn save_block(
         &config,
     )
     .await;
+
+    supply_tracker.finish_block(slot, supply_outcome, block_writes_ok);
 
     let elapsed = start_time.elapsed().as_secs_f64();
     metrics::record_block_processing(elapsed, "block");

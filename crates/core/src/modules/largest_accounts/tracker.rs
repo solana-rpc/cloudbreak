@@ -1,50 +1,16 @@
-//! In-memory top-N largest-accounts tracker backing `getLargestAccounts` and
-//! `getTokenLargestAccounts`.
-//!
-//! The indexer maintains a top-N holder set per tracked mint plus three sentinel
-//! "mints" (native-SOL, circulating, non-circulating). Whenever a top-N changes,
-//! the persisted slice is written as one packed-`bytea` record per
-//! (mint, slot) row in the `largest_accounts` table (Model B: the API reads the
-//! record at `max(slot <= commitment slot)`).
+//! In-memory reservoir state: per-mint tops, the seed/bootstrap path, and
+//! apply_block.
 
-use crate::metrics;
-use crate::modules::non_circulating::{NonCirculatingBalance, NonCirculatingTracker};
-use crate::{EnvironmentInfo, IndexConfig};
-use sea_orm::{
-    ConnectionTrait, DatabaseBackend, DatabaseConnection, DbErr, Statement, TransactionTrait, Value,
+use super::{
+    CIRCULATING_SENTINEL_MINT, MintRecord, NON_CIRCULATING_SENTINEL_MINT, SOL_SENTINEL_MINT,
+    TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID, is_sentinel,
 };
+use crate::modules::non_circulating::{NonCirculatingBalance, NonCirculatingTracker};
 use solana_pubkey::Pubkey;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
-use tokio::sync::watch;
-use tokio::time::timeout;
 use yellowstone_grpc_proto::geyser::SubscribeUpdateAccountInfo;
-
-/// Number of rows persisted (and served) per record. The in-memory top can be
-/// larger (`accounts-per-mint`); the surplus acts as an eviction reservoir.
-pub const PERSISTED_TOP_N: usize = 20;
-
-/// Sentinel mint keying the native-SOL top-N that serves plain `getLargestAccounts`.
-pub const SOL_SENTINEL_MINT: Pubkey = Pubkey::new_from_array([0u8; 32]);
-/// Sentinel mint keying the circulating-accounts top-N behind the
-/// `getLargestAccounts` `filter: circulating` option.
-pub const CIRCULATING_SENTINEL_MINT: Pubkey = Pubkey::new_from_array([1u8; 32]);
-/// Sentinel mint keying the non-circulating-accounts top-N behind the
-/// `getLargestAccounts` `filter: nonCirculating` option.
-pub const NON_CIRCULATING_SENTINEL_MINT: Pubkey = Pubkey::new_from_array([2u8; 32]);
-
-fn is_sentinel(mint: &Pubkey) -> bool {
-    *mint == SOL_SENTINEL_MINT
-        || *mint == CIRCULATING_SENTINEL_MINT
-        || *mint == NON_CIRCULATING_SENTINEL_MINT
-}
-
-pub const TOKEN_PROGRAM_ID: Pubkey =
-    Pubkey::from_str_const("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
-pub const TOKEN_2022_PROGRAM_ID: Pubkey =
-    Pubkey::from_str_const("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
 
 /// One account's post-block state as collected by the ingest path, before it is
 /// routed into the token, SOL, and circulating-class tops by `apply_block`.
@@ -55,15 +21,6 @@ pub struct PendingLargestAccount {
     pub token: Option<(Pubkey, u64)>,
 }
 
-/// A snapshot of one mint's persisted top-N at a slot: the payload for a single
-/// `largest_accounts` row.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MintRecord {
-    pub mint: Pubkey,
-    pub slot: u64,
-    pub rows: Vec<(Pubkey, u64)>,
-}
-
 /// What the caller must persist after applying a block: changed records to
 /// upsert, mints that just became unservable, and mints whose rows should be
 /// deleted because their top emptied.
@@ -72,32 +29,6 @@ pub struct BlockOutcome {
     pub records: Vec<MintRecord>,
     pub newly_stale: Vec<Pubkey>,
     pub cleared: Vec<Pubkey>,
-}
-
-/// Bytes per entry in a packed record: a 32-byte pubkey followed by a
-/// little-endian `u64` amount.
-pub const RECORD_ENTRY_SIZE: usize = 40;
-
-pub fn encode_record(rows: &[(Pubkey, u64)]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(rows.len() * RECORD_ENTRY_SIZE);
-    for (pubkey, amount) in rows {
-        bytes.extend_from_slice(pubkey.as_ref());
-        bytes.extend_from_slice(&amount.to_le_bytes());
-    }
-    bytes
-}
-
-pub fn decode_record(bytes: &[u8]) -> Option<Vec<(Pubkey, u64)>> {
-    if !bytes.len().is_multiple_of(RECORD_ENTRY_SIZE) {
-        return None;
-    }
-    let mut rows = Vec::with_capacity(bytes.len() / RECORD_ENTRY_SIZE);
-    for chunk in bytes.chunks_exact(RECORD_ENTRY_SIZE) {
-        let pubkey = Pubkey::try_from(&chunk[..32]).ok()?;
-        let amount = u64::from_le_bytes(chunk[32..].try_into().ok()?);
-        rows.push((pubkey, amount));
-    }
-    Some(rows)
 }
 
 /// A tracked holder's amount stamped with the (slot, write_version) that set it,
@@ -146,8 +77,8 @@ impl MintTop {
             .map(|(pubkey, entry)| (*pubkey, entry.amount))
             .collect();
         rows.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(b.0.cmp(&a.0)));
-        rows.truncate(PERSISTED_TOP_N);
-        if rows.len() < PERSISTED_TOP_N && self.dropped_floor > 0 {
+        rows.truncate(super::PERSISTED_TOP_N);
+        if rows.len() < super::PERSISTED_TOP_N && self.dropped_floor > 0 {
             return ComputedTop::Unsound;
         }
         if let Some(last) = rows.last()
@@ -345,6 +276,69 @@ impl TrackerState {
         top.refresh_cached_min();
     }
 
+    /// Seeds the class sentinels at the bootstrap flip: every member with a
+    /// balance enters the non-circulating top, and the SOL top minus the
+    /// members becomes the circulating top. A balance is stamped
+    /// `(slot, u64::MAX)`: it is the final state of that slot, so it outranks
+    /// the same write routed to the circulating top before Live.
+    fn seed_class_sentinels(
+        &mut self,
+        balances: &[NonCirculatingBalance],
+        k: usize,
+        touched: &mut HashSet<Pubkey>,
+    ) {
+        let members: HashSet<Pubkey> = balances.iter().map(|balance| balance.pubkey).collect();
+        for balance in balances {
+            self.remove_member(
+                CIRCULATING_SENTINEL_MINT,
+                balance.pubkey,
+                balance.slot,
+                u64::MAX,
+                touched,
+            );
+            if balance.lamports == 0 {
+                continue;
+            }
+            self.apply_update(
+                NON_CIRCULATING_SENTINEL_MINT,
+                balance.pubkey,
+                balance.lamports,
+                balance.slot,
+                u64::MAX,
+                false,
+                false,
+                k,
+                touched,
+            );
+        }
+        let Some(sol) = self.mints.get(&SOL_SENTINEL_MINT) else {
+            return;
+        };
+        let sol_floor = sol.dropped_floor;
+        let candidates: Vec<(Pubkey, Entry)> = sol
+            .entries
+            .iter()
+            .filter(|(pubkey, _)| !members.contains(*pubkey))
+            .map(|(pubkey, entry)| (*pubkey, *entry))
+            .collect();
+        if let Some(top) = self.mints.get_mut(&CIRCULATING_SENTINEL_MINT) {
+            top.dropped_floor = sol_floor;
+        }
+        for (pubkey, entry) in candidates {
+            self.apply_update(
+                CIRCULATING_SENTINEL_MINT,
+                pubkey,
+                entry.amount,
+                entry.slot,
+                entry.write_version,
+                false,
+                false,
+                k,
+                touched,
+            );
+        }
+    }
+
     fn emit(&mut self, mint: Pubkey, slot: u64, outcome: &mut BlockOutcome) {
         let Some(top) = self.mints.get_mut(&mint) else {
             return;
@@ -379,14 +373,25 @@ pub struct SeedAccount {
 
 /// Per-snapshot-file accumulator of candidate holders and observed closes, built
 /// without locking and merged into the tracker while it is still bootstrapping.
+/// A pubkey seen at several stamps keeps only its newest state.
 pub struct LargestAccountsSeed {
-    k: usize,
+    sol_k: Option<usize>,
+    token_k: usize,
     tracked_mints: Arc<HashSet<Pubkey>>,
     mints: HashMap<Pubkey, Vec<SeedAccount>>,
     closes: Vec<(Pubkey, u64, u64)>,
 }
 
 impl LargestAccountsSeed {
+    /// Reservoir size for `mint`, or `None` when its domain is not tracked.
+    fn k_of(&self, mint: &Pubkey) -> Option<usize> {
+        if is_sentinel(mint) {
+            self.sol_k
+        } else {
+            Some(self.token_k)
+        }
+    }
+
     /// Fold one snapshot account into the seed: record a close for zero-lamport
     /// accounts, otherwise observe the native-SOL balance and, for tracked SPL
     /// token accounts, the token balance.
@@ -415,6 +420,9 @@ impl LargestAccountsSeed {
     }
 
     pub fn observe(&mut self, mint: Pubkey, pubkey: Pubkey, amount: u64, slot: u64, write_version: u64) {
+        let Some(k) = self.k_of(&mint) else {
+            return;
+        };
         let entries = self.mints.entry(mint).or_default();
         entries.push(SeedAccount {
             pubkey,
@@ -422,8 +430,8 @@ impl LargestAccountsSeed {
             slot,
             write_version,
         });
-        if entries.len() >= self.k * 8 {
-            Self::shrink(entries, self.k);
+        if entries.len() >= k * 8 {
+            Self::shrink(entries, k);
         }
     }
 
@@ -431,17 +439,32 @@ impl LargestAccountsSeed {
         self.closes.push((pubkey, slot, write_version));
     }
 
+    /// Keeps the newest state per pubkey by `(slot, write_version)`, then the
+    /// top `k` of those by amount.
     fn shrink(entries: &mut Vec<SeedAccount>, k: usize) {
-        entries.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.amount));
+        entries.sort_unstable_by_key(|entry| {
+            (
+                entry.pubkey,
+                std::cmp::Reverse((entry.slot, entry.write_version, entry.amount)),
+            )
+        });
+        entries.dedup_by_key(|entry| entry.pubkey);
+        entries.sort_unstable_by_key(|entry| {
+            (std::cmp::Reverse(entry.amount), std::cmp::Reverse(entry.pubkey))
+        });
         entries.truncate(k);
     }
 }
 
-/// The tracker's shared innards: the immutable configuration (tracked mints,
-/// top size) plus the mutex-guarded state.
+/// The tracker's shared innards: the immutable per-domain configuration plus
+/// the mutex-guarded state.
 struct Shared {
+    /// Reservoir size for the SOL/circulating/non-circulating sentinel tops;
+    /// `None` when the `[largest-accounts]` section is absent.
+    sol_k: Option<usize>,
     tracked_mints: Arc<HashSet<Pubkey>>,
-    k_per_mint: usize,
+    /// Reservoir size for the per-mint token tops.
+    token_k: usize,
     state: Mutex<TrackerState>,
 }
 
@@ -451,26 +474,46 @@ impl Shared {
             .lock()
             .expect("Failed to lock largest accounts state")
     }
+
+    /// Reservoir size for `mint`'s domain (unused when the domain is absent).
+    fn k_for(&self, mint: &Pubkey) -> usize {
+        if is_sentinel(mint) {
+            self.sol_k.unwrap_or(0)
+        } else {
+            self.token_k
+        }
+    }
 }
 
 /// Cheap-clone handle to the largest-accounts tracker shared by the ingest and
-/// snapshot paths. The default (`None`) means the feature is disabled and every
-/// operation is a no-op.
+/// snapshot paths. The default (`None`) means both features are disabled and
+/// every operation is a no-op.
 #[derive(Clone, Default)]
 pub struct LargestAccountsTracker(Option<Arc<Shared>>);
 
 impl LargestAccountsTracker {
-    pub fn new(tracked_mints: HashSet<Pubkey>, k_per_mint: usize) -> Self {
+    /// Builds the tracker from the two independent domains: `sol_k` sizes the
+    /// SOL/class sentinel tops (`[largest-accounts]`), `token` carries the
+    /// tracked mints and per-mint reservoir size (`[token-largest-accounts]`).
+    pub fn new(sol_k: Option<usize>, token: Option<(HashSet<Pubkey>, usize)>) -> Self {
+        if sol_k.is_none() && token.is_none() {
+            return Self::default();
+        }
+        let (tracked_mints, token_k) =
+            token.unwrap_or((HashSet::new(), super::PERSISTED_TOP_N));
         let mut mints: HashMap<Pubkey, MintTop> = tracked_mints
             .iter()
             .map(|mint| (*mint, MintTop::default()))
             .collect();
-        mints.insert(SOL_SENTINEL_MINT, MintTop::default());
-        mints.insert(CIRCULATING_SENTINEL_MINT, MintTop::default());
-        mints.insert(NON_CIRCULATING_SENTINEL_MINT, MintTop::default());
+        if sol_k.is_some() {
+            mints.insert(SOL_SENTINEL_MINT, MintTop::default());
+            mints.insert(CIRCULATING_SENTINEL_MINT, MintTop::default());
+            mints.insert(NON_CIRCULATING_SENTINEL_MINT, MintTop::default());
+        }
         Self(Some(Arc::new(Shared {
+            sol_k,
             tracked_mints: Arc::new(tracked_mints),
-            k_per_mint,
+            token_k,
             state: Mutex::new(TrackerState {
                 mints,
                 ..TrackerState::default()
@@ -480,6 +523,18 @@ impl LargestAccountsTracker {
 
     pub fn is_enabled(&self) -> bool {
         self.0.is_some()
+    }
+
+    /// True when the SOL/class sentinel tops are maintained (`[largest-accounts]`).
+    pub fn sol_tracking_enabled(&self) -> bool {
+        self.0.as_deref().is_some_and(|shared| shared.sol_k.is_some())
+    }
+
+    /// True when per-mint token tops are maintained (`[token-largest-accounts]`).
+    pub fn token_tracking_enabled(&self) -> bool {
+        self.0
+            .as_deref()
+            .is_some_and(|shared| !shared.tracked_mints.is_empty())
     }
 
     pub fn is_tracked(&self, mint_bytes: &[u8]) -> bool {
@@ -493,7 +548,8 @@ impl LargestAccountsTracker {
     pub fn new_seed(&self) -> Option<LargestAccountsSeed> {
         let shared = self.0.as_deref()?;
         Some(LargestAccountsSeed {
-            k: shared.k_per_mint,
+            sol_k: shared.sol_k,
+            token_k: shared.token_k,
             tracked_mints: shared.tracked_mints.clone(),
             mints: HashMap::new(),
             closes: Vec::new(),
@@ -523,14 +579,14 @@ impl LargestAccountsTracker {
                 state.remove_member(sentinel, pubkey, slot, write_version, &mut touched);
             }
         }
-        for (mint, mut entries) in seed.mints {
-            LargestAccountsSeed::shrink(&mut entries, shared.k_per_mint);
+        for (mint, entries) in seed.mints {
+            let k = shared.k_for(&mint);
             for account in &entries {
                 state.max_applied_slot = state.max_applied_slot.max(account.slot);
             }
             let reservoir = state.seed_reservoir.entry(mint).or_default();
             reservoir.extend(entries);
-            LargestAccountsSeed::shrink(reservoir, shared.k_per_mint);
+            LargestAccountsSeed::shrink(reservoir, k);
         }
     }
 
@@ -576,7 +632,7 @@ impl LargestAccountsTracker {
                     update.write_version,
                     bootstrapping,
                     old_block,
-                    shared.k_per_mint,
+                    shared.k_for(&mint),
                     &mut touched,
                 );
             }
@@ -588,7 +644,7 @@ impl LargestAccountsTracker {
                 update.write_version,
                 bootstrapping,
                 old_block,
-                shared.k_per_mint,
+                shared.k_for(&SOL_SENTINEL_MINT),
                 &mut touched,
             );
             let (class_mint, other_class_mint) = if update.non_circulating {
@@ -611,7 +667,7 @@ impl LargestAccountsTracker {
                 update.write_version,
                 bootstrapping,
                 old_block,
-                shared.k_per_mint,
+                shared.k_for(&class_mint),
                 &mut touched,
             );
         }
@@ -626,7 +682,9 @@ impl LargestAccountsTracker {
         outcome
     }
 
-    pub fn finish_bootstrap(&self) -> BlockOutcome {
+    /// Applies the seed reservoir, seeds the class sentinels from the
+    /// non-circulating member balances, and flips Live.
+    pub fn finish_bootstrap(&self, non_circulating: &[NonCirculatingBalance]) -> BlockOutcome {
         let Some(shared) = &self.0 else {
             return BlockOutcome::default();
         };
@@ -637,6 +695,7 @@ impl LargestAccountsTracker {
         let mut touched = HashSet::new();
         let reservoir = std::mem::take(&mut state.seed_reservoir);
         for (mint, accounts) in reservoir {
+            let k = shared.k_for(&mint);
             for account in accounts {
                 state.apply_update(
                     mint,
@@ -646,10 +705,13 @@ impl LargestAccountsTracker {
                     account.write_version,
                     true,
                     false,
-                    shared.k_per_mint,
+                    k,
                     &mut touched,
                 );
             }
+        }
+        if let Some(k) = shared.sol_k {
+            state.seed_class_sentinels(non_circulating, k, &mut touched);
         }
         state.tombstones = HashMap::new();
         state.status = Status::Live;
@@ -657,52 +719,10 @@ impl LargestAccountsTracker {
         let effective_slot = state.max_applied_slot;
         let mut outcome = BlockOutcome::default();
         for mint in mints {
-            state.trim(mint, shared.k_per_mint);
+            state.trim(mint, shared.k_for(&mint));
             state.emit(mint, effective_slot, &mut outcome);
         }
         outcome
-    }
-
-    /// Finish bootstrap and persist the resulting records. Mints that fail to
-    /// persist are marked stale. No-op when the tracker is disabled.
-    pub async fn finish_bootstrap_and_persist(&self, db: &DatabaseConnection) {
-        if !self.is_enabled() {
-            return;
-        }
-
-        let outcome = self.finish_bootstrap();
-        for mint in &outcome.newly_stale {
-            tracing::error!(
-                target: "largest_accounts",
-                "largest accounts bootstrap left mint {} unsound, marking stale",
-                mint
-            );
-        }
-
-        if outcome.records.is_empty() {
-            return;
-        }
-
-        match persist_records(db, &outcome.records).await {
-            Ok(()) => {
-                tracing::info!(
-                    target: "largest_accounts",
-                    "largest accounts bootstrap persisted {} mint record(s)",
-                    outcome.records.len()
-                );
-            }
-            Err(e) => {
-                tracing::error!(
-                    target: "largest_accounts",
-                    "failed to persist largest accounts bootstrap records, marking {} mint(s) stale: {:?}",
-                    outcome.records.len(),
-                    e
-                );
-                for record in &outcome.records {
-                    self.mark_mint_stale(&record.mint);
-                }
-            }
-        }
     }
 
     /// True once bootstrap has finished and the tracker is applying live blocks.
@@ -710,118 +730,6 @@ impl LargestAccountsTracker {
         self.0
             .as_deref()
             .is_some_and(|shared| shared.state().status == Status::Live)
-    }
-
-    /// Reseeds the circulating/non-circulating sentinels from a freshly recomputed
-    /// non-circulating member set and its balances, returning the records to persist.
-    pub fn seed_class_sentinels(
-        &self,
-        recompute_slot: u64,
-        members: &HashSet<Pubkey>,
-        balances: &[NonCirculatingBalance],
-    ) -> Option<BlockOutcome> {
-        let shared = self.0.as_deref()?;
-        let mut state = shared.state();
-        if state.status != Status::Live {
-            return None;
-        }
-        let mut touched = HashSet::new();
-        let stale_non_circulating: Vec<Pubkey> = state
-            .mints
-            .get(&NON_CIRCULATING_SENTINEL_MINT)
-            .map(|top| {
-                top.entries
-                    .keys()
-                    .filter(|pubkey| !members.contains(pubkey))
-                    .copied()
-                    .collect()
-            })
-            .unwrap_or_default();
-        for pubkey in stale_non_circulating {
-            state.remove_member(
-                NON_CIRCULATING_SENTINEL_MINT,
-                pubkey,
-                recompute_slot,
-                0,
-                &mut touched,
-            );
-        }
-        let stale_circulating: Vec<Pubkey> = state
-            .mints
-            .get(&CIRCULATING_SENTINEL_MINT)
-            .map(|top| {
-                top.entries
-                    .keys()
-                    .filter(|pubkey| members.contains(pubkey))
-                    .copied()
-                    .collect()
-            })
-            .unwrap_or_default();
-        for pubkey in stale_circulating {
-            state.remove_member(
-                CIRCULATING_SENTINEL_MINT,
-                pubkey,
-                recompute_slot,
-                0,
-                &mut touched,
-            );
-        }
-        if let Some(top) = state.mints.get_mut(&NON_CIRCULATING_SENTINEL_MINT) {
-            top.dropped_floor = 0;
-        }
-        for balance in balances {
-            if balance.lamports == 0 || !members.contains(&balance.pubkey) {
-                continue;
-            }
-            state.apply_update(
-                NON_CIRCULATING_SENTINEL_MINT,
-                balance.pubkey,
-                balance.lamports,
-                balance.slot,
-                0,
-                false,
-                false,
-                shared.k_per_mint,
-                &mut touched,
-            );
-        }
-        let sol_floor = state
-            .mints
-            .get(&SOL_SENTINEL_MINT)
-            .map(|top| top.dropped_floor)
-            .unwrap_or(0);
-        let candidates: Vec<(Pubkey, Entry)> = state
-            .mints
-            .get(&SOL_SENTINEL_MINT)
-            .map(|top| {
-                top.entries
-                    .iter()
-                    .filter(|(pubkey, _)| !members.contains(*pubkey))
-                    .map(|(pubkey, entry)| (*pubkey, *entry))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if let Some(top) = state.mints.get_mut(&CIRCULATING_SENTINEL_MINT) {
-            top.dropped_floor = sol_floor;
-        }
-        for (pubkey, entry) in candidates {
-            state.apply_update(
-                CIRCULATING_SENTINEL_MINT,
-                pubkey,
-                entry.amount,
-                entry.slot,
-                entry.write_version,
-                false,
-                false,
-                shared.k_per_mint,
-                &mut touched,
-            );
-        }
-        let effective_slot = state.max_applied_slot;
-        let mut outcome = BlockOutcome::default();
-        state.emit(NON_CIRCULATING_SENTINEL_MINT, effective_slot, &mut outcome);
-        state.emit(CIRCULATING_SENTINEL_MINT, effective_slot, &mut outcome);
-        Some(outcome)
     }
 
     pub fn mark_mint_stale(&self, mint: &Pubkey) -> bool {
@@ -846,113 +754,16 @@ impl LargestAccountsTracker {
             .filter(|top| top.stale)
             .count()
     }
-}
-
-pub async fn persist_records(
-    db: &DatabaseConnection,
-    records: &[MintRecord],
-) -> Result<(), DbErr> {
-    if records.is_empty() {
-        return Ok(());
-    }
-    let txn = db.begin().await?;
-    for record in records {
-        txn.execute(Statement::from_string(
-            DatabaseBackend::Postgres,
-            format!(
-                "INSERT INTO largest_accounts (mint, slot, record) \
-                 VALUES ('\\x{}'::bytea, {}, '\\x{}'::bytea) \
-                 ON CONFLICT (mint, slot) DO UPDATE \
-                 SET record = EXCLUDED.record, updated_on = now()",
-                hex::encode(record.mint.as_ref()),
-                record.slot,
-                hex::encode(encode_record(&record.rows)),
-            ),
-        ))
-        .await?;
-    }
-    txn.commit().await
-}
-
-pub async fn delete_mint_rows(db: &DatabaseConnection, mint: &Pubkey) -> Result<(), DbErr> {
-    db.execute(Statement::from_string(
-        DatabaseBackend::Postgres,
-        format!(
-            "DELETE FROM largest_accounts WHERE mint = '\\x{}'::bytea",
-            hex::encode(mint.as_ref())
-        ),
-    ))
-    .await?;
-    Ok(())
-}
-
-pub async fn clear_largest_accounts(db: &DatabaseConnection) -> Result<(), DbErr> {
-    db.execute(Statement::from_string(
-        DatabaseBackend::Postgres,
-        "DELETE FROM largest_accounts".to_string(),
-    ))
-    .await?;
-    Ok(())
-}
-
-impl LargestAccountsTracker {
-    /// Builds the tracker from config, validating the largest-accounts prerequisites,
-    /// recording the tracked mints in `environment_info`, and clearing any stale
-    /// `largest_accounts` rows. Returns a disabled tracker when the feature is off.
-    pub async fn from_config(db: &DatabaseConnection, config: &IndexConfig) -> Self {
-        let tracker = match &config.largest_accounts {
-            Some(largest_config) if largest_config.enabled => {
-                if !config.programs.supports_simulation() {
-                    panic!("largest-accounts requires an empty [programs] filter");
-                }
-                if config.snapshot.is_none() {
-                    panic!("largest-accounts requires the [snapshot] section");
-                }
-                if !config.accounts_owner_map_enabled {
-                    panic!(
-                        "largest-accounts requires accounts-owner-map-enabled (needed for the circulating/non-circulating filter)"
-                    );
-                }
-                if largest_config.accounts_per_mint < PERSISTED_TOP_N {
-                    panic!("largest-accounts accounts-per-mint must be at least {PERSISTED_TOP_N}");
-                }
-                Self::new(
-                    largest_config.tracked_mints.iter().map(|mint| mint.0).collect(),
-                    largest_config.accounts_per_mint,
-                )
-            }
-            _ => Self::default(),
-        };
-
-        EnvironmentInfo::upsert_largest_accounts_mints(
-            db,
-            config
-                .largest_accounts
-                .as_ref()
-                .filter(|largest_config| largest_config.enabled)
-                .map(|largest_config| {
-                    largest_config.tracked_mints.iter().map(|mint| mint.0).collect()
-                }),
-        )
-        .await
-        .expect("Failed to upsert largest accounts mints");
-
-        if tracker.is_enabled() {
-            clear_largest_accounts(db)
-                .await
-                .expect("Failed to clear largest_accounts table");
-        }
-
-        tracker
-    }
 
     /// Folds one block's accounts into a per-account pending map (native-SOL
     /// lamports plus tracked SPL token balances), keeping the highest write
-    /// version per pubkey. Empty when the tracker is disabled.
+    /// version per pubkey, plus one circulating update per member whose lockup
+    /// the block expired. Empty when the tracker is disabled.
     pub fn build_block_pending(
         &self,
         accounts: &[SubscribeUpdateAccountInfo],
         non_circulating: &NonCirculatingTracker,
+        expired: &[(Pubkey, u64)],
     ) -> HashMap<Pubkey, PendingLargestAccount> {
         let mut pending: HashMap<Pubkey, PendingLargestAccount> = HashMap::new();
         if !self.is_enabled() {
@@ -994,149 +805,33 @@ impl LargestAccountsTracker {
             }
         }
 
+        // An expired member was not written in the block, so its class move
+        // rides a synthetic update below any write at this slot.
+        for (pubkey, lamports) in expired {
+            pending.entry(*pubkey).or_insert(PendingLargestAccount {
+                write_version: 0,
+                lamports: *lamports,
+                non_circulating: false,
+                token: None,
+            });
+        }
+
         pending
     }
-
-    /// Applies a block's pending accounts to the tracker and persists the outcome.
-    /// No-op when the tracker is disabled.
-    pub async fn commit_block(
-        &self,
-        slot: u64,
-        pending: HashMap<Pubkey, PendingLargestAccount>,
-        db: &DatabaseConnection,
-        config: &IndexConfig,
-    ) {
-        if !self.is_enabled() {
-            return;
-        }
-        let outcome = self.apply_block(slot, pending);
-        persist_largest_outcome(self, outcome, slot, db, config).await;
-    }
-}
-
-/// Persists a block/recompute outcome: deletes stale/cleared mints, writes new
-/// records, and marks mints stale on persistence failure.
-pub(crate) async fn persist_largest_outcome(
-    largest_accounts: &LargestAccountsTracker,
-    outcome: BlockOutcome,
-    slot: u64,
-    db: &DatabaseConnection,
-    config: &IndexConfig,
-) {
-    let query_timeout = Duration::from_secs(config.database.save_block_queries_timeout);
-
-    for mint in &outcome.newly_stale {
-        tracing::error!(
-            target: "largest_accounts",
-            "largest accounts reservoir unsound for mint {} at slot {}, marking stale",
-            mint,
-            slot
-        );
-    }
-
-    for mint in outcome.newly_stale.iter().chain(outcome.cleared.iter()) {
-        let delete = timeout(query_timeout, delete_mint_rows(db, mint)).await;
-        if !matches!(delete, Ok(Ok(()))) {
-            metrics::LARGEST_ACCOUNTS_DB_ERRORS.inc();
-            tracing::error!(
-                target: "largest_accounts",
-                "failed to delete largest_accounts rows for mint {}: {:?}",
-                mint,
-                delete
-            );
-        }
-    }
-
-    if !outcome.records.is_empty() {
-        let persist = timeout(query_timeout, persist_records(db, &outcome.records)).await;
-        if !matches!(persist, Ok(Ok(()))) {
-            metrics::LARGEST_ACCOUNTS_DB_ERRORS.inc();
-            tracing::error!(
-                target: "largest_accounts",
-                "failed to persist largest_accounts records for slot {}, marking {} mint(s) stale: {:?}",
-                slot,
-                outcome.records.len(),
-                persist
-            );
-            for record in &outcome.records {
-                largest_accounts.mark_mint_stale(&record.mint);
-                let delete = timeout(query_timeout, delete_mint_rows(db, &record.mint)).await;
-                if !matches!(delete, Ok(Ok(()))) {
-                    metrics::LARGEST_ACCOUNTS_DB_ERRORS.inc();
-                }
-            }
-        }
-    }
-
-    metrics::LARGEST_ACCOUNTS_STALE_MINTS.set(largest_accounts.stale_count() as i64);
-}
-
-/// Deletes redundant `largest_accounts` generations older than the newest one at
-/// or below the finalized `slot`, per mint. The newest generation is always kept.
-pub async fn prune_largest_accounts(db: &DatabaseConnection, slot: u64, config: &IndexConfig) {
-    let query_timeout = Duration::from_secs(config.database.finalize_slot_queries_timeout);
-
-    let query = db.execute(Statement::from_sql_and_values(
-        DatabaseBackend::Postgres,
-        "DELETE FROM largest_accounts la USING ( \
-            SELECT mint, MAX(slot) AS keep_slot FROM largest_accounts \
-            WHERE slot <= $1 GROUP BY mint \
-         ) keep WHERE la.mint = keep.mint AND la.slot < keep.keep_slot",
-        [Value::BigInt(Some(slot as i64))],
-    ));
-
-    let result = timeout(query_timeout, query).await.unwrap_or_else(|elapsed| {
-        tracing::error!("prune_largest_accounts timeout ERROR: {}", elapsed);
-        Err(sea_orm::DbErr::RecordNotInserted)
-    });
-
-    if let Err(e) = result {
-        metrics::LARGEST_ACCOUNTS_DB_ERRORS.inc();
-        tracing::error!(
-            "prune_largest_accounts: failed to prune for slot {}: {}",
-            slot,
-            e
-        );
-    }
-}
-
-/// Long-lived task that prunes stale `largest_accounts` generations at most once every
-/// `prune-interval-slots` finalized slots, off the finalization critical path.
-pub fn spawn_largest_accounts_pruner(
-    db: DatabaseConnection,
-    config: IndexConfig,
-    mut finalized_slot_rx: watch::Receiver<u64>,
-) {
-    let prune_interval_slots = config
-        .largest_accounts
-        .as_ref()
-        .map(|largest_config| largest_config.prune_interval_slots)
-        .unwrap_or_default();
-
-    tokio::spawn(async move {
-        let _guard = metrics::TokioTaskCounterGuard::new("largest_accounts_pruner");
-
-        let mut last_pruned_slot = 0u64;
-        while finalized_slot_rx.changed().await.is_ok() {
-            let finalized_slot = *finalized_slot_rx.borrow_and_update();
-            if finalized_slot.saturating_sub(last_pruned_slot) >= prune_interval_slots {
-                prune_largest_accounts(&db, finalized_slot, &config).await;
-                last_pruned_slot = finalized_slot;
-            }
-        }
-    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::modules::largest_accounts::*;
+    use std::collections::HashMap;
 
     fn pk(byte: u8) -> Pubkey {
         Pubkey::new_from_array([byte; 32])
     }
 
     fn tracker(k: usize) -> LargestAccountsTracker {
-        LargestAccountsTracker::new([pk(200)].into_iter().collect(), k)
+        LargestAccountsTracker::new(Some(k), Some(([pk(200)].into_iter().collect(), k)))
     }
 
     fn pending_sol(lamports: u64, write_version: u64) -> PendingLargestAccount {
@@ -1157,8 +852,25 @@ mod tests {
         }
     }
 
+    fn pending_non_circ(lamports: u64, write_version: u64) -> PendingLargestAccount {
+        PendingLargestAccount {
+            write_version,
+            lamports,
+            non_circulating: true,
+            token: None,
+        }
+    }
+
+    fn balance(pubkey: Pubkey, slot: u64, lamports: u64) -> NonCirculatingBalance {
+        NonCirculatingBalance {
+            pubkey,
+            slot,
+            lamports,
+        }
+    }
+
     fn go_live(tracker: &LargestAccountsTracker) {
-        tracker.finish_bootstrap();
+        tracker.finish_bootstrap(&[]);
     }
 
     fn token_rows(outcome: &BlockOutcome) -> Option<&Vec<(Pubkey, u64)>> {
@@ -1273,7 +985,7 @@ mod tests {
         seed.observe(pk(200), pk(1), 1_000_000, 150, 3);
         seed.observe(pk(200), pk(2), 700, 150, 3);
         tracker.merge_seed(seed);
-        let outcome = tracker.finish_bootstrap();
+        let outcome = tracker.finish_bootstrap(&[]);
         let rows = token_rows(&outcome).unwrap();
         assert_eq!(rows[0], (pk(2), 700));
         assert!(rows.contains(&(pk(1), 5)));
@@ -1286,7 +998,7 @@ mod tests {
         let mut seed = tracker.new_seed().unwrap();
         seed.observe(pk(200), pk(1), 1_000_000, 150, 3);
         tracker.merge_seed(seed);
-        let outcome = tracker.finish_bootstrap();
+        let outcome = tracker.finish_bootstrap(&[]);
         assert!(token_rows(&outcome).is_none());
     }
 
@@ -1300,7 +1012,7 @@ mod tests {
         full.observe(pk(200), pk(1), 1_000_000, 150, 1);
         full.observe(pk(200), pk(2), 10, 150, 1);
         tracker.merge_seed(full);
-        let outcome = tracker.finish_bootstrap();
+        let outcome = tracker.finish_bootstrap(&[]);
         let rows = token_rows(&outcome).unwrap();
         assert_eq!(rows, &vec![(pk(2), 10)]);
     }
@@ -1346,6 +1058,44 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_seeds_class_sentinels_from_member_balances() {
+        let tracker = tracker(25);
+        // Before Live every account routes to circulating.
+        tracker.apply_block(
+            100,
+            [(pk(1), pending_sol(1000, 1)), (pk(2), pending_sol(500, 1))].into(),
+        );
+        let outcome = tracker.finish_bootstrap(&[balance(pk(1), 100, 1000)]);
+        let rows = sentinel_rows(&outcome, &NON_CIRCULATING_SENTINEL_MINT).unwrap();
+        assert_eq!(rows, &vec![(pk(1), 1000)]);
+        let rows = sentinel_rows(&outcome, &CIRCULATING_SENTINEL_MINT).unwrap();
+        assert_eq!(rows, &vec![(pk(2), 500)]);
+    }
+
+    #[test]
+    fn zero_balance_member_is_not_seeded() {
+        let tracker = tracker(25);
+        tracker.apply_block(100, [(pk(1), pending_sol(1000, 1))].into());
+        tracker.apply_block(101, [(pk(1), pending_sol(0, 2))].into());
+        let outcome = tracker.finish_bootstrap(&[balance(pk(1), 101, 0)]);
+        assert!(sentinel_rows(&outcome, &NON_CIRCULATING_SENTINEL_MINT).is_none());
+        assert!(sentinel_rows(&outcome, &CIRCULATING_SENTINEL_MINT).is_none());
+    }
+
+    #[test]
+    fn expired_member_moves_to_circulating() {
+        let tracker = tracker(25);
+        go_live(&tracker);
+        tracker.apply_block(100, [(pk(1), pending_non_circ(1000, 1))].into());
+        let pending =
+            tracker.build_block_pending(&[], &NonCirculatingTracker::default(), &[(pk(1), 1000)]);
+        let outcome = tracker.apply_block(101, pending);
+        assert!(outcome.cleared.contains(&NON_CIRCULATING_SENTINEL_MINT));
+        let rows = sentinel_rows(&outcome, &CIRCULATING_SENTINEL_MINT).unwrap();
+        assert_eq!(rows, &vec![(pk(1), 1000)]);
+    }
+
+    #[test]
     fn record_encoding_roundtrips() {
         let rows = vec![(pk(3), u64::MAX), (pk(2), 700), (pk(1), 0)];
         let bytes = encode_record(&rows);
@@ -1375,5 +1125,30 @@ mod tests {
         assert!(token_rows(&outcome).is_none());
         assert!(!tracker.is_tracked(pk(201).as_ref()));
         assert!(tracker.is_tracked(pk(200).as_ref()));
+    }
+
+    #[test]
+    fn token_only_tracker_skips_sentinels() {
+        let tracker =
+            LargestAccountsTracker::new(None, Some(([pk(200)].into_iter().collect(), 25)));
+        assert!(!tracker.sol_tracking_enabled());
+        assert!(tracker.token_tracking_enabled());
+        go_live(&tracker);
+        let outcome = tracker.apply_block(100, [(pk(1), pending_token(500, 1))].into());
+        assert!(token_rows(&outcome).is_some());
+        assert!(sentinel_rows(&outcome, &SOL_SENTINEL_MINT).is_none());
+        assert!(sentinel_rows(&outcome, &CIRCULATING_SENTINEL_MINT).is_none());
+    }
+
+    #[test]
+    fn sol_only_tracker_skips_token_updates() {
+        let tracker = LargestAccountsTracker::new(Some(25), None);
+        assert!(tracker.sol_tracking_enabled());
+        assert!(!tracker.token_tracking_enabled());
+        go_live(&tracker);
+        let outcome = tracker.apply_block(100, [(pk(1), pending_token(500, 1))].into());
+        assert!(token_rows(&outcome).is_none());
+        assert!(sentinel_rows(&outcome, &SOL_SENTINEL_MINT).is_some());
+        assert!(!tracker.is_tracked(pk(200).as_ref()));
     }
 }

@@ -8,7 +8,10 @@ use std::sync::{Once, OnceLock};
 use cloudbreak_core::IndexConfig;
 pub use cloudbreak_core::metrics::{
     CURRENT_TOKIO_TASKS, LARGEST_ACCOUNTS_DB_ERRORS, LARGEST_ACCOUNTS_STALE_MINTS,
-    TokioTaskCounterGuard,
+    NON_CIRCULATING_BLOCK_MICROSECONDS, NON_CIRCULATING_CHANGES_TOTAL, NON_CIRCULATING_MEMBERS,
+    SUPPLY_BLOCK_MICROSECONDS, SUPPLY_CACHE_ENTRIES, SUPPLY_CACHE_HITS_TOTAL,
+    SUPPLY_CACHE_MISSES_TOTAL, SUPPLY_DB_MICROSECONDS, SUPPLY_PROBE_MICROSECONDS,
+    SUPPLY_SWEEP_MICROSECONDS, TokioTaskCounterGuard,
 };
 use prometheus::{Counter, Histogram, HistogramOpts, HistogramVec, IntGauge, Registry};
 use tracing::error;
@@ -390,5 +393,15 @@ pub fn register_collectors() {
         register!(LARGEST_ACCOUNTS_DB_ERRORS);
         register!(LARGEST_ACCOUNTS_STALE_MINTS);
         register!(CLEANUP_LAG_SLOTS);
+        register!(SUPPLY_CACHE_ENTRIES);
+        register!(SUPPLY_CACHE_HITS_TOTAL);
+        register!(SUPPLY_CACHE_MISSES_TOTAL);
+        register!(SUPPLY_BLOCK_MICROSECONDS);
+        register!(SUPPLY_PROBE_MICROSECONDS);
+        register!(SUPPLY_DB_MICROSECONDS);
+        register!(SUPPLY_SWEEP_MICROSECONDS);
+        register!(NON_CIRCULATING_BLOCK_MICROSECONDS);
+        register!(NON_CIRCULATING_MEMBERS);
+        register!(NON_CIRCULATING_CHANGES_TOTAL);
     });
 }
