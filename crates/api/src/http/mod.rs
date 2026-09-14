@@ -24,6 +24,7 @@ use tracing::Instrument;
 use cloudbreak_core::{
     AccountSelectorConfig, MethodSection, ProcessedCommitmentBehavior, UnhealthyResponseBehavior,
 };
+use cloudbreak_core::modules::processed::ProcessedAccounts;
 use cloudbreak_entity::slots;
 
 #[derive(Clone)]
@@ -120,6 +121,9 @@ pub struct CloudbreakRpcState {
     /// The `[token-largest-accounts]` API section; getTokenLargestAccounts is
     /// served when its `enabled` flag is set.
     pub token_largest_accounts: MethodSection,
+    /// The `[processed-accounts]` overlay. The disabled handle routes every
+    /// request through `resolve_commitment`.
+    pub processed: ProcessedAccounts,
 }
 
 impl CloudbreakRpcState {
@@ -145,6 +149,7 @@ impl CloudbreakRpcState {
         supply_cache: SharedSupplySnapshot,
         largest_accounts: MethodSection,
         token_largest_accounts: MethodSection,
+        processed: ProcessedAccounts,
     ) -> Self {
         Self {
             database,
@@ -168,6 +173,7 @@ impl CloudbreakRpcState {
             feature_set_cache: Arc::new(RwLock::new(None)),
             largest_accounts,
             token_largest_accounts,
+            processed,
         }
     }
 

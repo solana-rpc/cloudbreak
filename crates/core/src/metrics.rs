@@ -109,6 +109,103 @@ lazy_static::lazy_static! {
         &["kind"],
     )
     .expect("Failed to create non-circulating changes counter");
+
+    /// Time from receiving a processed block to the Postgres anchor reaching it,
+    /// for blocks on the confirmed chain. Includes the slot syncronizer poll.
+    pub static ref PROCESSED_CONFIRM_LATENCY_MS: Histogram = Histogram::with_opts(
+        HistogramOpts::new("cloudbreak_api_processed_confirm_latency_ms", "Processed block receipt to Postgres confirmed, in milliseconds")
+            .buckets(vec![
+                100.0, 200.0, 300.0, 400.0, 500.0, 750.0, 1_000.0, 1_500.0, 2_000.0, 3_000.0,
+                5_000.0, 10_000.0, 20_000.0,
+            ]),
+    )
+    .expect("Failed to create processed confirm latency histogram");
+
+    /// Head slot minus anchor slot, observed when a published view changes.
+    pub static ref PROCESSED_DEPTH_SLOTS: Histogram = Histogram::with_opts(
+        HistogramOpts::new("cloudbreak_api_processed_depth_slots", "Processed view depth above the anchor in slots")
+            .buckets(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 16.0, 24.0, 32.0, 48.0, 64.0]),
+    )
+    .expect("Failed to create processed depth histogram");
+
+    /// Published `context.slot` moving backwards, labelled `degrade` and `fork_switch`.
+    pub static ref PROCESSED_HEAD_REGRESSIONS_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("cloudbreak_api_processed_head_regressions_total", "Processed head regressions by cause"),
+        &["cause"],
+    )
+    .expect("Failed to create processed head regressions counter");
+
+    /// Bytes held by every live processed block, including evicted blocks a request still pins.
+    pub static ref PROCESSED_LIVE_BYTES: IntGauge = IntGauge::new(
+        "cloudbreak_api_processed_live_bytes", "Bytes held by live processed blocks"
+    )
+    .expect("Failed to create processed live bytes gauge");
+
+    pub static ref PROCESSED_STORE_BLOCKS: IntGauge = IntGauge::new(
+        "cloudbreak_api_processed_store_blocks", "Blocks held by the processed store"
+    )
+    .expect("Failed to create processed store blocks gauge");
+
+    pub static ref PROCESSED_HEAD_SLOT: IntGauge = IntGauge::new(
+        "cloudbreak_api_processed_head_slot", "Slot of the last published processed view"
+    )
+    .expect("Failed to create processed head slot gauge");
+
+    pub static ref PROCESSED_ANCHOR_SLOT: IntGauge = IntGauge::new(
+        "cloudbreak_api_processed_anchor_slot", "Postgres confirmed slot the processed store is anchored to"
+    )
+    .expect("Failed to create processed anchor slot gauge");
+
+    /// Time since the head block was received, set when a view is published.
+    pub static ref PROCESSED_HEAD_AGE_MS: IntGauge = IntGauge::new(
+        "cloudbreak_api_processed_head_age_ms", "Age of the published processed head block in milliseconds"
+    )
+    .expect("Failed to create processed head age gauge");
+
+    /// Writer cost of one block: build, store, prune, select and publish.
+    pub static ref PROCESSED_BLOCK_INGEST_MS: Histogram = Histogram::with_opts(
+        HistogramOpts::new("cloudbreak_api_processed_block_ingest_ms", "Processed block ingest time in milliseconds")
+            .buckets(vec![1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 50.0, 75.0, 100.0, 250.0, 500.0, 1_000.0]),
+    )
+    .expect("Failed to create processed block ingest histogram");
+
+    /// Accounted bytes of one ingested block.
+    pub static ref PROCESSED_BLOCK_BYTES: Histogram = Histogram::with_opts(
+        HistogramOpts::new("cloudbreak_api_processed_block_bytes", "Processed block accounted size in bytes")
+            .buckets(vec![
+                65_536.0, 262_144.0, 1_048_576.0, 4_194_304.0, 8_388_608.0, 16_777_216.0,
+                33_554_432.0, 67_108_864.0, 134_217_728.0, 268_435_456.0,
+            ]),
+    )
+    .expect("Failed to create processed block bytes histogram");
+
+    pub static ref PROCESSED_GRPC_RECONNECTS_TOTAL: IntCounter = IntCounter::new(
+        "cloudbreak_api_processed_grpc_reconnects_total", "Processed feed reconnects"
+    )
+    .expect("Failed to create processed grpc reconnects counter");
+
+    pub static ref PROCESSED_CONFLICTS_TOTAL: IntCounter = IntCounter::new(
+        "cloudbreak_api_processed_conflicts_total", "Processed blockhash conflicts that set the latch"
+    )
+    .expect("Failed to create processed conflicts counter");
+
+    pub static ref PROCESSED_DEAD_SLOTS_TOTAL: IntCounter = IntCounter::new(
+        "cloudbreak_api_processed_dead_slots_total", "Slots reported dead on the processed feed"
+    )
+    .expect("Failed to create processed dead slots counter");
+
+    pub static ref PROCESSED_RESTARTED_SLOTS_TOTAL: IntCounter = IntCounter::new(
+        "cloudbreak_api_processed_restarted_slots_total", "Slots marked dead after a repeated bank creation"
+    )
+    .expect("Failed to create processed restarted slots counter");
+
+    /// Blocks removed from the processed store, labelled `anchor`, `off_root`,
+    /// `fork`, `overlay_slots` and `memory_cap`.
+    pub static ref PROCESSED_EVICTIONS_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("cloudbreak_api_processed_evictions_total", "Processed store evictions by reason"),
+        &["reason"],
+    )
+    .expect("Failed to create processed evictions counter");
 }
 
 /// We use a guard to increment the current tokio tasks metric when a task is created and

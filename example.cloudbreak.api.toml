@@ -88,6 +88,33 @@ span-filter = [
 enabled = false
 interval_ms = 200
 
+# Serves processed commitment for getAccountInfo, getMultipleAccounts, getBalance
+# and getTokenAccountBalance from a Yellowstone block feed held in memory above the
+# Postgres confirmed slot. Other methods keep following processed-commitment.
+# Requires [slot-syncronizer] enabled = true. Startup fails without it.
+# For these four methods it overrides processed-commitment = "reject". When no view
+# can be proven, a processed request gets confirmed data at the confirmed slot.
+# Each API instance carries its own full block feed.
+# [processed-accounts]
+# enabled = false
+# endpoint = "https://grpc.example:443"
+# x-token = "..."
+# connect-timeout = "10s"
+# Reconnect when the stream is silent this long. Must be above the 10 s server ping.
+# stall-timeout = "30s"
+# Reconnect backoff starts at 100 ms and doubles up to this.
+# reconnect-backoff-max = "30s"
+# Largest decoded gRPC message in MiB. At most max-memory-mb.
+# max-decoding-mb = 256
+# Deepest head above the confirmed slot that is served. At most max-overlay-slots.
+# max-servable-depth = 16
+# Caps the stored span, lowest to highest slot. At most 512.
+# max-overlay-slots = 64
+# Cap on block bytes in MiB, including blocks in-flight requests hold. At least 64.
+# max-memory-mb = 1024
+# Serve confirmed data when the last successful slot syncronizer poll is older than this.
+# anchor-max-age = "5s"
+
 # Optional module: cache configuration for the GPA queries.
 [gpa-cache]
 max-total-bytes = 1_073_741_824 # 1GB

@@ -158,6 +158,26 @@ lazy_static::lazy_static! {
         ),
         &["used"],
     ).unwrap();
+
+    /// Processed commitment requests for the four point-read methods, labelled by
+    /// `route` (`view` or `degraded`) and `reason` (`none` or the degrade reason).
+    pub static ref CLOUDBREAK_API_PROCESSED_REQUESTS_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new(
+            "cloudbreak_api_processed_requests_total",
+            "Processed commitment requests, labelled by method, route and degrade reason"
+        ),
+        &["method", "route", "reason"],
+    ).unwrap();
+
+    /// Requested keys answered on the processed view, labelled by `source`:
+    /// `live`, `closed`, `excluded` from memory, or `postgres` for a miss.
+    pub static ref CLOUDBREAK_API_PROCESSED_LOOKUPS_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new(
+            "cloudbreak_api_processed_lookups_total",
+            "Keys looked up on the processed view, labelled by method and source"
+        ),
+        &["method", "source"],
+    ).unwrap();
 }
 
 /// We use a guard to increment the in-flight requests metric when a request starts and
@@ -249,6 +269,12 @@ pub fn setup_metrics(config: &ApiConfig) -> anyhow::Result<()> {
             &METRICS_REGISTRY,
             config.metrics.client_ip_bandwidth_enabled,
         );
+
+        if config.processed_accounts_enabled() {
+            register!(CLOUDBREAK_API_PROCESSED_REQUESTS_TOTAL);
+            register!(CLOUDBREAK_API_PROCESSED_LOOKUPS_TOTAL);
+            cloudbreak_core::modules::processed::register_processed_metrics(&METRICS_REGISTRY);
+        }
     });
 
     // Set the max connections as a reference metric at startup

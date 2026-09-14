@@ -13,7 +13,6 @@ use solana_account::AccountSharedData;
 use solana_account_decoder::parse_account_data::AccountAdditionalDataV3;
 use solana_account_decoder::{UiAccountEncoding, encode_ui_account};
 use solana_account_decoder_client_types::UiAccount;
-use solana_commitment_config::CommitmentLevel;
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::config::RpcAccountInfoConfig;
 use solana_rpc_client_api::response::{Response as RpcResponse, RpcResponseContext};
@@ -23,7 +22,7 @@ use tracing::Instrument;
 use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
 use crate::methods::token::{check_account_data_len_for_encoding, parse_additional_mint_data};
-use crate::methods::{is_token_program, resolve_commitment};
+use crate::methods::{is_token_program, processed::{self, Route}};
 use crate::{db_query, metrics};
 
 #[tracing::instrument(name = "gma_rpc", skip_all, fields(num_pubkeys = pubkeys.len()))]
@@ -52,13 +51,12 @@ pub async fn get_multiple_accounts(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    let commitment = config
-        .commitment
-        .map(|commitment_config| {
-            resolve_commitment(commitment_config.commitment, state.processed_commitment)
-        })
-        .transpose()?
-        .unwrap_or(CommitmentLevel::Finalized);
+    let commitment = match processed::route(state, config.commitment, "getMultipleAccounts")? {
+        Route::View(view) => {
+            return processed::get_multiple_accounts(state, &view, &parsed_pubkeys, &config).await;
+        }
+        Route::Db(commitment) => commitment,
+    };
 
     let (latest_slot, block_time) = state.latest_slot_and_block_time(commitment).await?;
 

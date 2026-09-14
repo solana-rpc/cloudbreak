@@ -7,7 +7,7 @@ use sea_orm::sqlx::Row;
 use sea_orm::sqlx::{self};
 use solana_account_decoder::parse_token::token_amount_to_ui_amount_v3;
 use solana_account_decoder_client_types::token::UiTokenAmount;
-use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
+use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::response::{Response as RpcResponse, RpcResponseContext};
 use tokio::time::timeout;
@@ -16,7 +16,7 @@ use tracing::Instrument;
 use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
 use crate::methods::token::parse_additional_mint_data;
-use crate::methods::{is_token_program, resolve_commitment};
+use crate::methods::{is_token_program, processed::{self, Route}};
 use crate::{db_query, metrics};
 
 #[tracing::instrument(name = "get_token_account_balance_rpc", skip_all, fields(pubkey = %pubkey))]
@@ -31,12 +31,12 @@ pub async fn get_token_account_balance(
         .parse()
         .map_err(|_| RpcError::PubkeyValidationError(pubkey.clone()))?;
 
-    let commitment = commitment
-        .map(|commitment_config| {
-            resolve_commitment(commitment_config.commitment, state.processed_commitment)
-        })
-        .transpose()?
-        .unwrap_or(CommitmentLevel::Finalized);
+    let commitment = match processed::route(state, commitment, "getTokenAccountBalance")? {
+        Route::View(view) => {
+            return processed::get_token_account_balance(state, &view, &pubkey).await;
+        }
+        Route::Db(commitment) => commitment,
+    };
 
     let (latest_slot, block_time) = state.latest_slot_and_block_time(commitment).await?;
 

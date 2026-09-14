@@ -7,6 +7,7 @@ use futures::future;
 use sea_orm::{ConnectOptions, Database};
 use std::sync::Arc;
 use std::time::Duration;
+use cloudbreak_core::modules::processed::ProcessedAccounts;
 use cloudbreak_core::{ApiConfig, EnvironmentInfo, TryLoadConfig};
 
 use crate::{
@@ -29,6 +30,7 @@ mod slot_syncronizer;
 
 pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
     let config = ApiConfig::try_load(config)?;
+    config.validate_processed_accounts()?;
 
     setup_metrics(&config)?;
 
@@ -70,8 +72,9 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
         client_ip: config.metrics.client_ip_key.clone(),
     };
 
+    let (anchor_tx, anchor_rx) = tokio::sync::watch::channel(None);
     let (mut slot_syncronizer_handle, slot_syncronizer_data) =
-        match slot_syncronizer::start_slot_syncronizer(database.clone(), &config) {
+        match slot_syncronizer::start_slot_syncronizer(database.clone(), &config, anchor_tx) {
             Some((handle, data)) => (future::Either::Left(handle), Some(data)),
             None => (future::Either::Right(future::pending()), None),
         };
@@ -165,6 +168,11 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
         info!("getSupply: disabled (supply-enabled is false)");
     }
 
+    let processed =
+        ProcessedAccounts::from_config(config.processed_accounts.as_ref(), indexer_filter.clone())?;
+    processed.spawn(anchor_rx);
+    info!("processed accounts: enabled: {}", processed.is_enabled());
+
     let state = CloudbreakRpcState::new(
         database,
         queries_timeout,
@@ -186,6 +194,7 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
         supply_cache,
         largest_accounts,
         token_largest_accounts,
+        processed,
     );
 
     info!("Server is starting...");
