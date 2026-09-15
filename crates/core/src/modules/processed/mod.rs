@@ -19,7 +19,7 @@
 //!
 //! # Layout
 //!
-//! - `mod.rs`: the public surface, the constants and the metric registration.
+//! - `mod.rs`: the public surface and the constants.
 //! - `ingest.rs`: builds a `SlotBlock` and classifies each account as live or
 //!   closed. A write by an owner outside the API program filter is a close.
 //! - `store.rs`: the block store. One block per slot, slot statuses, the
@@ -106,12 +106,10 @@ pub use read::{Lookup, ProcessedView};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use prometheus::Registry;
 use solana_pubkey::Pubkey;
 use yellowstone_grpc_client::GeyserGrpcClient;
 
 use crate::config::{AccountSelectorConfig, ProcessedAccountsConfig};
-use crate::metrics;
 
 /// Bound on connecting and on each request.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -172,19 +170,16 @@ pub struct ProcessedAccounts(Option<Arc<Shared>>);
 
 impl ProcessedAccounts {
     /// Returns the disabled handle when the section is absent or disabled.
-    /// Otherwise checks the endpoint and x-token, and registers the metric.
-    /// Does not connect.
+    /// Otherwise checks the endpoint and x-token. Does not connect.
     pub fn from_config(
         config: Option<&ProcessedAccountsConfig>,
         program_filter: Arc<AccountSelectorConfig>,
-        registry: &Registry,
     ) -> anyhow::Result<Self> {
         let Some(config) = config.filter(|c| c.enabled) else {
             return Ok(Self::default());
         };
         GeyserGrpcClient::build_from_shared(config.endpoint.clone())?
             .x_token(config.x_token.clone())?;
-        register_metrics(registry);
         Ok(Self(Some(Arc::new(Shared {
             config: config.clone(),
             program_filter,
@@ -214,15 +209,6 @@ impl ProcessedAccounts {
     }
 }
 
-/// Registers the confirm-latency histogram. An already registered collector is skipped.
-fn register_metrics(registry: &Registry) {
-    let collector = Box::new(metrics::PROCESSED_CONFIRM_LATENCY_MS.clone());
-    match registry.register(collector) {
-        Ok(()) | Err(prometheus::Error::AlreadyReg) => {}
-        Err(e) => tracing::error!("Failed to register processed metric: {e}"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::store::tests::{TestChain, anchor_at};
@@ -237,11 +223,7 @@ mod tests {
     }
 
     fn handle(config: &ProcessedAccountsConfig) -> anyhow::Result<ProcessedAccounts> {
-        ProcessedAccounts::from_config(
-            Some(config),
-            Arc::new(AccountSelectorConfig::default()),
-            &Registry::new(),
-        )
+        ProcessedAccounts::from_config(Some(config), Arc::new(AccountSelectorConfig::default()))
     }
 
     #[test]
@@ -255,11 +237,7 @@ mod tests {
         let mut off = config("");
         off.enabled = false;
         assert!(!handle(&off).unwrap().is_enabled());
-        let none = ProcessedAccounts::from_config(
-            None,
-            Arc::new(AccountSelectorConfig::default()),
-            &Registry::new(),
-        );
+        let none = ProcessedAccounts::from_config(None, Arc::new(AccountSelectorConfig::default()));
         assert!(!none.unwrap().is_enabled());
 
         assert!(handle(&config("not a uri")).is_err());
@@ -280,18 +258,5 @@ mod tests {
         assert_eq!(handle.view().unwrap().slot, 101);
         shared.publish(None);
         assert!(handle.view().is_none());
-    }
-
-    #[test]
-    fn register_metrics_is_idempotent() {
-        let registry = Registry::new();
-        register_metrics(&registry);
-        register_metrics(&registry);
-        assert!(
-            registry
-                .gather()
-                .iter()
-                .any(|family| family.name() == "cloudbreak_api_processed_confirm_latency_ms")
-        );
     }
 }

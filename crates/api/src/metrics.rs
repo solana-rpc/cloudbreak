@@ -4,6 +4,7 @@
  */
 
 use cloudbreak_core::ApiConfig;
+use cloudbreak_core::metrics::PROCESSED_CONFIRM_LATENCY_MS;
 use hyper::StatusCode;
 use prometheus::{
     HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
@@ -19,7 +20,7 @@ use tracing::error;
 use crate::http::server::HttpHandlerResponse;
 
 lazy_static::lazy_static! {
-    pub(crate) static ref METRICS_REGISTRY: Registry = Registry::new();
+    static ref METRICS_REGISTRY: Registry = Registry::new();
 
     pub static ref CLOUDBREAK_API_REQUESTS_TOTAL:IntCounterVec = IntCounterVec::new(
         Opts::new("cloudbreak_api_requests_total", "Total number of Cloudbreak API calls, labelled by method and status"),
@@ -262,6 +263,7 @@ pub fn setup_metrics(config: &ApiConfig) -> anyhow::Result<()> {
 
         if config.processed_accounts_enabled() {
             register!(CLOUDBREAK_API_PROCESSED_REQUESTS_TOTAL);
+            register!(PROCESSED_CONFIRM_LATENCY_MS);
         }
     });
 

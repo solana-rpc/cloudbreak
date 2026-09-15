@@ -32,9 +32,11 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
     let config = ApiConfig::try_load(config)?;
     config.validate_processed_accounts()?;
 
-    rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .expect("Failed to install rustls crypto provider");
+    if config.processed_accounts_enabled() {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .expect("Failed to install rustls crypto provider");
+    }
 
     setup_metrics(&config)?;
 
@@ -172,11 +174,8 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
         info!("getSupply: disabled (supply-enabled is false)");
     }
 
-    let processed = ProcessedAccounts::from_config(
-        config.processed_accounts.as_ref(),
-        indexer_filter.clone(),
-        &metrics::METRICS_REGISTRY,
-    )?;
+    let processed =
+        ProcessedAccounts::from_config(config.processed_accounts.as_ref(), indexer_filter.clone())?;
     processed.spawn(anchor_rx);
     info!("processed accounts: enabled: {}", processed.is_enabled());
 
