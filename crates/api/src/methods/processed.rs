@@ -3,7 +3,8 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-//! Processed commitment for getAccountInfo and getMultipleAccounts.
+//! Processed commitment for getAccountInfo, getMultipleAccounts, getBalance,
+//! getTokenAccountBalance and getTokenSupply.
 //!
 //! Each method calls [`route`] first. With `[processed-accounts]` enabled, a
 //! processed request takes one [`ProcessedView`] ([`Route::View`]) and the method
@@ -16,7 +17,8 @@
 //!
 //! On a view, a key written in the chain is answered from memory. A miss reads
 //! Postgres at `slot <= view.anchor_slot`. `Lookup::Closed` never falls back to
-//! Postgres and answers null. A Postgres row keeps the confirmed owner check.
+//! Postgres and answers as an absent account. A Postgres row keeps the confirmed
+//! owner check.
 //! `context.slot` and the block time come from the head block. A jsonParsed
 //! token account resolves its mint through the view first:
 //!
@@ -25,6 +27,19 @@
 //! | `Live` | view mint data | view mint data, overriding the joined mint |
 //! | `Closed` | no mint data | no mint data |
 //! | `Miss` | one `getMultipleAccounts.sql` read at the anchor | the joined mint |
+//!
+//! getBalance, getTokenAccountBalance and getTokenSupply read their key through
+//! the getAccountInfo read, then decode it with the confirmed helpers.
+//! getTokenAccountBalance slices the data as `getTokenAccountBalance.sql` does.
+//!
+//! | Method | Account | Absent | Excluded Postgres row |
+//! |---|---|---|---|
+//! | getBalance | lamports | 0 | -32010 |
+//! | getTokenAccountBalance | `token_account_balance` with the resolved mint | `AccountNotFound` | -32010 |
+//! | getTokenSupply | `token_supply` | `AccountNotFound` | -32010 |
+//!
+//! A getBalance miss reads the account data too. Its newest Postgres row, when
+//! closed with an excluded owner, answers 0 as Agave does. Confirmed answers -32010.
 
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -37,6 +52,7 @@ use sea_orm::sqlx::{self, Row, postgres::PgRow};
 use solana_account::AccountSharedData;
 use solana_account_decoder::{UiAccountEncoding, UiDataSliceConfig, encode_ui_account};
 use solana_account_decoder_client_types::UiAccount;
+use solana_account_decoder_client_types::token::UiTokenAmount;
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::config::RpcAccountInfoConfig;
@@ -46,6 +62,8 @@ use tracing::Instrument;
 
 use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
+use crate::methods::get_token_account_balance::token_account_balance;
+use crate::methods::get_token_supply::token_supply;
 use crate::methods::token::{check_account_data_len_for_encoding, parse_additional_mint_data};
 use crate::methods::{is_token_program, resolve_commitment};
 use crate::slot_syncronizer::SlotSyncronizerData;
@@ -147,12 +165,7 @@ pub(crate) async fn get_account_info(
             config.data_slice,
             view.block_time,
         )?),
-        Some(KeyRead::Excluded(owner)) => {
-            return Err(RpcError::AccountOwnerExcluded {
-                pubkey: pubkey.to_string(),
-                owner: owner.to_string(),
-            });
-        }
+        Some(KeyRead::Excluded(owner)) => return Err(owner_excluded(pubkey, &owner)),
         Some(KeyRead::Absent) | None => None,
     };
     Ok(response(view, value))
@@ -191,6 +204,87 @@ pub(crate) async fn get_multiple_accounts(
         });
     }
     Ok(response(view, value))
+}
+
+pub(crate) async fn get_balance(
+    state: &CloudbreakRpcState,
+    view: &ProcessedView,
+    pubkey: &Pubkey,
+    min_context_slot: Option<u64>,
+) -> Result<RpcResponse<u64>, RpcError> {
+    check_min_context_slot(view, min_context_slot)?;
+    let value = match read_one(state, view, pubkey, UiAccountEncoding::Base64).await? {
+        KeyRead::Account { account, .. } => account.lamports,
+        KeyRead::Excluded(owner) => return Err(owner_excluded(pubkey, &owner)),
+        KeyRead::Absent => 0,
+    };
+    Ok(response(view, value))
+}
+
+pub(crate) async fn get_token_account_balance(
+    state: &CloudbreakRpcState,
+    view: &ProcessedView,
+    pubkey: &Pubkey,
+) -> Result<RpcResponse<UiTokenAmount>, RpcError> {
+    let value = match read_one(state, view, pubkey, UiAccountEncoding::JsonParsed).await? {
+        KeyRead::Account { account, mint_data } => token_account_balance(
+            pubkey,
+            &account.owner,
+            sql_substring(&account.data, 64, 8),
+            sql_substring(&account.data, 0, 32),
+            mint_data.as_deref().map_or(&[], Vec::as_slice),
+            view.block_time,
+        )?,
+        KeyRead::Excluded(owner) => return Err(owner_excluded(pubkey, &owner)),
+        KeyRead::Absent => return Err(account_not_found(pubkey)),
+    };
+    Ok(response(view, value))
+}
+
+pub(crate) async fn get_token_supply(
+    state: &CloudbreakRpcState,
+    view: &ProcessedView,
+    pubkey: &Pubkey,
+) -> Result<RpcResponse<UiTokenAmount>, RpcError> {
+    let value = match read_one(state, view, pubkey, UiAccountEncoding::Base64).await? {
+        KeyRead::Account { account, .. } => {
+            token_supply(pubkey, &account.owner, &account.data, view.block_time)?
+        }
+        KeyRead::Excluded(owner) => return Err(owner_excluded(pubkey, &owner)),
+        KeyRead::Absent => return Err(account_not_found(pubkey)),
+    };
+    Ok(response(view, value))
+}
+
+/// One key through the getAccountInfo read. jsonParsed also resolves a token mint.
+async fn read_one(
+    state: &CloudbreakRpcState,
+    view: &ProcessedView,
+    pubkey: &Pubkey,
+    encoding: UiAccountEncoding,
+) -> Result<KeyRead, RpcError> {
+    let keys = std::slice::from_ref(pubkey);
+    let reads = read_accounts(state, view, Method::AccountInfo, keys, encoding).await?;
+    Ok(reads.into_iter().next().unwrap_or(KeyRead::Absent))
+}
+
+fn owner_excluded(pubkey: &Pubkey, owner: &Pubkey) -> RpcError {
+    RpcError::AccountOwnerExcluded {
+        pubkey: pubkey.to_string(),
+        owner: owner.to_string(),
+    }
+}
+
+fn account_not_found(pubkey: &Pubkey) -> RpcError {
+    RpcError::AccountNotFound {
+        pubkey: pubkey.to_string(),
+    }
+}
+
+/// The bytes `SUBSTRING(data FROM start + 1 FOR len)` returns: shorter when data ends early.
+fn sql_substring(data: &[u8], start: usize, len: usize) -> &[u8] {
+    let end = (start + len).min(data.len());
+    &data[start.min(end)..end]
 }
 
 /// The calling method. It picks the SQL that reads misses.
@@ -656,5 +750,48 @@ mod tests {
         assert_eq!(parsed_decimals(encode(Some(&mint_data(9)))), Some(9));
         // No mint data cannot be parsed as a token account, as on the Postgres path.
         assert_eq!(parsed_decimals(encode(None)), None);
+    }
+
+    #[test]
+    fn sql_substring_matches_postgres_on_short_data() {
+        let data = [1u8, 2, 3, 4, 5];
+        assert_eq!(sql_substring(&data, 1, 2), &[2, 3]);
+        assert_eq!(sql_substring(&data, 3, 8), &[4, 5]);
+        assert!(sql_substring(&data, 64, 8).is_empty());
+    }
+
+    #[test]
+    fn token_reads_decode_view_data_like_the_confirmed_path() {
+        let mint = Pubkey::new_unique();
+        let pubkey = Pubkey::new_unique();
+        let data = token_account_data(&mint, 5_000);
+        let balance = |data: &[u8], owner: &Pubkey| {
+            token_account_balance(
+                &pubkey,
+                owner,
+                sql_substring(data, 64, 8),
+                sql_substring(data, 0, 32),
+                &mint_data(6),
+                0,
+            )
+        };
+
+        let amount = balance(&data, &LEGACY_TOKEN_PROGRAM_ID).unwrap();
+        assert_eq!((amount.amount.as_str(), amount.decimals), ("5000", 6));
+        assert!(matches!(
+            balance(&data, &Pubkey::new_unique()),
+            Err(RpcError::NotATokenAccount { .. })
+        ));
+        assert!(matches!(
+            balance(&data[..70], &LEGACY_TOKEN_PROGRAM_ID),
+            Err(RpcError::InternalError)
+        ));
+
+        let supply = token_supply(&mint, &TOKEN_2022_PROGRAM_ID, &mint_data(9), 0).unwrap();
+        assert_eq!((supply.amount.as_str(), supply.decimals), ("0", 9));
+        assert!(matches!(
+            token_supply(&mint, &LEGACY_TOKEN_PROGRAM_ID, &data[..10], 0),
+            Err(RpcError::MintDataNotFound { .. })
+        ));
     }
 }

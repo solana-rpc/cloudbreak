@@ -3,7 +3,8 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-//! Processed commitment for getAccountInfo and getMultipleAccounts.
+//! Processed commitment for getAccountInfo, getMultipleAccounts, getBalance,
+//! getTokenAccountBalance and getTokenSupply.
 //!
 //! Postgres holds confirmed data only. This module subscribes to Yellowstone
 //! blocks with accounts at processed commitment and keeps the blocks around the

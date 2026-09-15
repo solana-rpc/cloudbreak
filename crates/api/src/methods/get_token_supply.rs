@@ -7,7 +7,7 @@ use sea_orm::sqlx::Row;
 use sea_orm::sqlx::{self};
 use solana_account_decoder::parse_token::token_amount_to_ui_amount_v3;
 use solana_account_decoder_client_types::token::UiTokenAmount;
-use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
+use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::response::{Response as RpcResponse, RpcResponseContext};
 use spl_token_2022::extension::StateWithExtensions;
@@ -17,8 +17,9 @@ use tracing::Instrument;
 
 use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
+use crate::methods::is_token_program;
+use crate::methods::processed::{self, Route};
 use crate::methods::token::parse_additional_mint_data;
-use crate::methods::{is_token_program, resolve_commitment};
 use crate::{db_query, metrics};
 
 #[tracing::instrument(name = "get_token_supply_rpc", skip_all, fields(pubkey = %mint))]
@@ -33,12 +34,12 @@ pub async fn get_token_supply(
         .parse()
         .map_err(|_| RpcError::PubkeyValidationError(mint.clone()))?;
 
-    let commitment = commitment
-        .map(|commitment_config| {
-            resolve_commitment(commitment_config.commitment, state.processed_commitment)
-        })
-        .transpose()?
-        .unwrap_or(CommitmentLevel::Finalized);
+    let commitment = match processed::route(state, commitment, "getTokenSupply")? {
+        Route::View(view) => {
+            return processed::get_token_supply(state, &view, &pubkey).await;
+        }
+        Route::Db(commitment) => commitment,
+    };
 
     let (latest_slot, block_time) = state.latest_slot_and_block_time(commitment).await?;
 
@@ -82,29 +83,9 @@ pub async fn get_token_supply(
         });
     }
 
-    if !is_token_program(&owner) {
-        return Err(RpcError::NotATokenAccount {
-            pubkey: pubkey.to_string(),
-        });
-    }
-
     let data: Vec<u8> = row.get("data");
 
-    let mint_state =
-        StateWithExtensions::<Mint>::unpack(&data).map_err(|_| RpcError::MintDataNotFound {
-            mint: pubkey.to_string(),
-        })?;
-
-    let supply = mint_state.base.supply;
-    let additional_mint_data = parse_additional_mint_data(&pubkey, &data, block_time);
-    let additional_data = additional_mint_data
-        .as_ref()
-        .and_then(|d| d.spl_token_additional_data.as_ref())
-        .ok_or_else(|| RpcError::MintDataNotFound {
-            mint: pubkey.to_string(),
-        })?;
-
-    let ui_token_amount = token_amount_to_ui_amount_v3(supply, additional_data);
+    let ui_token_amount = token_supply(&pubkey, &owner, &data, block_time)?;
 
     Ok(RpcResponse {
         context: RpcResponseContext {
@@ -113,4 +94,35 @@ pub async fn get_token_supply(
         },
         value: ui_token_amount,
     })
+}
+
+/// The supply of a mint account from its owner and data. The caller checks the
+/// owner filter first.
+pub(crate) fn token_supply(
+    pubkey: &Pubkey,
+    owner: &Pubkey,
+    data: &[u8],
+    block_time: i64,
+) -> Result<UiTokenAmount, RpcError> {
+    if !is_token_program(owner) {
+        return Err(RpcError::NotATokenAccount {
+            pubkey: pubkey.to_string(),
+        });
+    }
+
+    let mint_state =
+        StateWithExtensions::<Mint>::unpack(data).map_err(|_| RpcError::MintDataNotFound {
+            mint: pubkey.to_string(),
+        })?;
+
+    let supply = mint_state.base.supply;
+    let additional_mint_data = parse_additional_mint_data(pubkey, data, block_time);
+    let additional_data = additional_mint_data
+        .as_ref()
+        .and_then(|d| d.spl_token_additional_data.as_ref())
+        .ok_or_else(|| RpcError::MintDataNotFound {
+            mint: pubkey.to_string(),
+        })?;
+
+    Ok(token_amount_to_ui_amount_v3(supply, additional_data))
 }

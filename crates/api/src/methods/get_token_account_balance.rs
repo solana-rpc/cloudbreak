@@ -7,7 +7,7 @@ use sea_orm::sqlx::Row;
 use sea_orm::sqlx::{self};
 use solana_account_decoder::parse_token::token_amount_to_ui_amount_v3;
 use solana_account_decoder_client_types::token::UiTokenAmount;
-use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
+use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::response::{Response as RpcResponse, RpcResponseContext};
 use tokio::time::timeout;
@@ -15,8 +15,9 @@ use tracing::Instrument;
 
 use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
+use crate::methods::is_token_program;
+use crate::methods::processed::{self, Route};
 use crate::methods::token::parse_additional_mint_data;
-use crate::methods::{is_token_program, resolve_commitment};
 use crate::{db_query, metrics};
 
 #[tracing::instrument(name = "get_token_account_balance_rpc", skip_all, fields(pubkey = %pubkey))]
@@ -31,12 +32,12 @@ pub async fn get_token_account_balance(
         .parse()
         .map_err(|_| RpcError::PubkeyValidationError(pubkey.clone()))?;
 
-    let commitment = commitment
-        .map(|commitment_config| {
-            resolve_commitment(commitment_config.commitment, state.processed_commitment)
-        })
-        .transpose()?
-        .unwrap_or(CommitmentLevel::Finalized);
+    let commitment = match processed::route(state, commitment, "getTokenAccountBalance")? {
+        Route::View(view) => {
+            return processed::get_token_account_balance(state, &view, &pubkey).await;
+        }
+        Route::Db(commitment) => commitment,
+    };
 
     let (latest_slot, block_time) = state.latest_slot_and_block_time(commitment).await?;
 
@@ -80,25 +81,8 @@ pub async fn get_token_account_balance(
         });
     }
 
-    if !is_token_program(&owner) {
-        return Err(RpcError::NotATokenAccount {
-            pubkey: pubkey.to_string(),
-        });
-    }
-
-    // Amount: u64 LE at bytes 64..72 of the token account data. The SQL guarantees
-    // exactly 8 bytes for token-owned accounts (and 8 zero bytes for anything else,
-    // which we've already rejected above).
+    // The SQL returns up to 8 amount bytes for token-owned accounts and 8 zero bytes otherwise.
     let amount_bytes: Vec<u8> = row.get("amount");
-    let amount_array: [u8; 8] = amount_bytes.as_slice().try_into().map_err(|_| {
-        tracing::error!(
-            "getTokenAccountBalance: unexpected amount length {} for pubkey {}",
-            amount_bytes.len(),
-            pubkey
-        );
-        RpcError::InternalError
-    })?;
-    let amount = u64::from_le_bytes(amount_array);
 
     // Mint pubkey from the generated token_mint column (bytes 0..32 of data).
     let mint_pubkey_bytes: Vec<u8> = row.try_get("token_mint").map_err(|e| {
@@ -109,23 +93,17 @@ pub async fn get_token_account_balance(
         );
         RpcError::InternalError
     })?;
-    let mint_pubkey =
-        Pubkey::try_from(mint_pubkey_bytes.as_slice()).map_err(|_| RpcError::InternalError)?;
 
-    // Pass mint_data (or empty) unconditionally so the WSOL native_mint short-circuit
-    // can hardcode decimals=9 even when the mint account itself isn't in our DB —
-    // same trick we use in gAI / gTABO.
     let mint_data: Vec<u8> = row.try_get("mint_data").ok().unwrap_or_default();
-    let additional_mint_data = parse_additional_mint_data(&mint_pubkey, &mint_data, block_time);
 
-    let additional_data = additional_mint_data
-        .as_ref()
-        .and_then(|d| d.spl_token_additional_data.as_ref())
-        .ok_or_else(|| RpcError::MintDataNotFound {
-            mint: mint_pubkey.to_string(),
-        })?;
-
-    let ui_token_amount = token_amount_to_ui_amount_v3(amount, additional_data);
+    let ui_token_amount = token_account_balance(
+        &pubkey,
+        &owner,
+        &amount_bytes,
+        &mint_pubkey_bytes,
+        &mint_data,
+        block_time,
+    )?;
 
     Ok(RpcResponse {
         context: RpcResponseContext {
@@ -134,4 +112,46 @@ pub async fn get_token_account_balance(
         },
         value: ui_token_amount,
     })
+}
+
+/// The balance of a token account from its owner, `data[64..72]`, `data[0..32]`
+/// and its mint data. The caller checks the owner filter first.
+pub(crate) fn token_account_balance(
+    pubkey: &Pubkey,
+    owner: &Pubkey,
+    amount_bytes: &[u8],
+    mint_pubkey_bytes: &[u8],
+    mint_data: &[u8],
+    block_time: i64,
+) -> Result<UiTokenAmount, RpcError> {
+    if !is_token_program(owner) {
+        return Err(RpcError::NotATokenAccount {
+            pubkey: pubkey.to_string(),
+        });
+    }
+
+    // Amount: u64 LE at bytes 64..72 of the token account data.
+    let amount_array: [u8; 8] = amount_bytes.try_into().map_err(|_| {
+        tracing::error!(
+            "getTokenAccountBalance: unexpected amount length {} for pubkey {}",
+            amount_bytes.len(),
+            pubkey
+        );
+        RpcError::InternalError
+    })?;
+    let amount = u64::from_le_bytes(amount_array);
+
+    let mint_pubkey = Pubkey::try_from(mint_pubkey_bytes).map_err(|_| RpcError::InternalError)?;
+
+    // Empty mint data still parses for the native mint.
+    let additional_mint_data = parse_additional_mint_data(&mint_pubkey, mint_data, block_time);
+
+    let additional_data = additional_mint_data
+        .as_ref()
+        .and_then(|d| d.spl_token_additional_data.as_ref())
+        .ok_or_else(|| RpcError::MintDataNotFound {
+            mint: mint_pubkey.to_string(),
+        })?;
+
+    Ok(token_amount_to_ui_amount_v3(amount, additional_data))
 }

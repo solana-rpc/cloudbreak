@@ -159,7 +159,7 @@ lazy_static::lazy_static! {
         &["used"],
     ).unwrap();
 
-    /// Processed commitment requests for getAccountInfo and getMultipleAccounts,
+    /// Processed commitment requests for the methods served from the processed view,
     /// labelled by `route` (`view` or `degraded`) and `reason` (`none` or the fallback reason).
     pub static ref CLOUDBREAK_API_PROCESSED_REQUESTS_TOTAL: IntCounterVec = IntCounterVec::new(
         Opts::new(

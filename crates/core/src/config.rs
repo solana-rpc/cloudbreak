@@ -743,8 +743,8 @@ pub struct ApiConfig {
     /// `[token-largest-accounts]` state.
     #[serde(rename = "token-largest-accounts", default)]
     pub token_largest_accounts: Option<MethodSection>,
-    /// Serves processed commitment for getAccountInfo and getMultipleAccounts.
-    /// Requires `[slot-syncronizer]`.
+    /// Serves processed commitment for getAccountInfo, getMultipleAccounts,
+    /// getBalance, getTokenAccountBalance and getTokenSupply. Requires `[slot-syncronizer]`.
     #[serde(rename = "processed-accounts", default)]
     pub processed_accounts: Option<ProcessedAccountsConfig>,
 }
