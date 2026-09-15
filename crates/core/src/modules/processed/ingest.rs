@@ -9,10 +9,7 @@
 //! most one entry per pubkey per block (see the upstream invariants in `mod.rs`).
 
 use std::collections::HashMap;
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::Arc;
 use std::time::Instant;
 
 use solana_pubkey::Pubkey;
@@ -21,12 +18,7 @@ use yellowstone_grpc_proto::prelude::SubscribeUpdateBlock;
 use super::{AccountEntry, LiveAccount};
 use crate::config::AccountSelectorConfig;
 
-/// Estimated heap cost of one account beyond its data: the map slot at
-/// hashbrown's 7/8 load factor with its control byte, and the `Arc<Vec<u8>>` header.
-pub(crate) const ENTRY_OVERHEAD_BYTES: usize =
-    size_of::<(Pubkey, AccountEntry)>() * 8 / 7 + 1 + 2 * size_of::<usize>() + size_of::<Vec<u8>>();
-
-/// One sealed processed block, keyed in the store by `(slot, blockhash)`.
+/// One sealed processed block, keyed in the store by slot.
 pub(crate) struct SlotBlock {
     pub slot: u64,
     pub blockhash: String,
@@ -34,22 +26,18 @@ pub(crate) struct SlotBlock {
     pub parent_blockhash: String,
     pub block_time: Option<i64>,
     pub received_at: Instant,
-    /// Live data lengths plus [`ENTRY_OVERHEAD_BYTES`] per account.
-    pub bytes: usize,
     pub accounts: HashMap<Pubkey, AccountEntry>,
-    live_bytes: Arc<AtomicUsize>,
 }
 
 impl SlotBlock {
-    /// Classifies every account and adds the block's bytes to `live_bytes`.
+    /// Classifies every account. A zero-lamport write and a write whose owner
+    /// is outside the program filter are both closes.
     pub(crate) fn from_update(
         block: SubscribeUpdateBlock,
         program_filter: &AccountSelectorConfig,
-        live_bytes: &Arc<AtomicUsize>,
         received_at: Instant,
     ) -> Self {
         let mut accounts = HashMap::with_capacity(block.accounts.len());
-        let mut bytes = 0usize;
         let mut skipped = 0usize;
 
         for account in block.accounts {
@@ -60,13 +48,9 @@ impl SlotBlock {
                 skipped += 1;
                 continue;
             };
-            // Closed and excluded entries drop their data, so only live data is counted.
-            let entry = if account.lamports == 0 {
+            let entry = if account.lamports == 0 || !program_filter.is_program_selected(&owner) {
                 AccountEntry::Closed
-            } else if !program_filter.is_program_selected(&owner) {
-                AccountEntry::Excluded { owner }
             } else {
-                bytes += account.data.len();
                 AccountEntry::Live(LiveAccount {
                     lamports: account.lamports,
                     owner,
@@ -75,7 +59,6 @@ impl SlotBlock {
                     data: Arc::new(account.data),
                 })
             };
-            bytes += ENTRY_OVERHEAD_BYTES;
             accounts.insert(pubkey, entry);
         }
 
@@ -87,7 +70,6 @@ impl SlotBlock {
             );
         }
 
-        live_bytes.fetch_add(bytes, Ordering::Relaxed);
         Self {
             slot: block.slot,
             blockhash: block.blockhash,
@@ -95,16 +77,8 @@ impl SlotBlock {
             parent_blockhash: block.parent_blockhash,
             block_time: block.block_time.map(|t| t.timestamp),
             received_at,
-            bytes,
             accounts,
-            live_bytes: live_bytes.clone(),
         }
-    }
-}
-
-impl Drop for SlotBlock {
-    fn drop(&mut self) {
-        self.live_bytes.fetch_sub(self.bytes, Ordering::Relaxed);
     }
 }
 
@@ -155,19 +129,12 @@ pub(crate) mod tests {
     fn build(
         accounts: Vec<SubscribeUpdateAccountInfo>,
         filter: &AccountSelectorConfig,
-    ) -> (SlotBlock, Arc<AtomicUsize>) {
-        let live = Arc::new(AtomicUsize::new(0));
-        let block = SlotBlock::from_update(
-            update(10, "h10", 9, "h9", accounts),
-            filter,
-            &live,
-            Instant::now(),
-        );
-        (block, live)
+    ) -> SlotBlock {
+        SlotBlock::from_update(update(10, "h10", 9, "h9", accounts), filter, Instant::now())
     }
 
     #[test]
-    fn classifies_live_closed_and_excluded() {
+    fn classifies_live_and_treats_excluded_as_closed() {
         let included = Pubkey::new_unique();
         let excluded = Pubkey::new_unique();
         let filter = AccountSelectorConfig {
@@ -177,7 +144,7 @@ pub(crate) mod tests {
         let live_key = Pubkey::new_unique();
         let closed_key = Pubkey::new_unique();
         let excluded_key = Pubkey::new_unique();
-        let (block, live) = build(
+        let block = build(
             vec![
                 account_info(live_key, included, 5, vec![1, 2, 3]),
                 account_info(closed_key, included, 0, vec![9; 100]),
@@ -194,15 +161,8 @@ pub(crate) mod tests {
             other => panic!("expected live, got {other:?}"),
         }
         assert_eq!(block.accounts[&closed_key], AccountEntry::Closed);
-        assert_eq!(
-            block.accounts[&excluded_key],
-            AccountEntry::Excluded { owner: excluded }
-        );
-        assert_eq!(block.bytes, 3 * ENTRY_OVERHEAD_BYTES + 3);
+        assert_eq!(block.accounts[&excluded_key], AccountEntry::Closed);
         assert_eq!(block.block_time, Some(1_700_000_010));
-        assert_eq!(live.load(Ordering::Relaxed), block.bytes);
-        drop(block);
-        assert_eq!(live.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -213,7 +173,7 @@ pub(crate) mod tests {
         let mut bad_owner = account_info(Pubkey::new_unique(), owner, 1, vec![]);
         bad_owner.owner.push(0);
         let good = Pubkey::new_unique();
-        let (block, _) = build(
+        let block = build(
             vec![bad, bad_owner, account_info(good, owner, 1, vec![])],
             &AccountSelectorConfig::default(),
         );

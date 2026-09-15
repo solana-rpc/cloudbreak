@@ -5,6 +5,7 @@
 
 use sea_orm::sqlx::Row;
 use sea_orm::sqlx::{self};
+use solana_commitment_config::CommitmentLevel;
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::config::RpcContextConfig;
 use solana_rpc_client_api::response::{Response as RpcResponse, RpcResponseContext};
@@ -13,7 +14,7 @@ use tracing::Instrument;
 
 use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
-use crate::methods::processed::{self, Route};
+use crate::methods::resolve_commitment;
 use crate::{db_query, metrics};
 
 #[tracing::instrument(name = "get_balance_rpc", skip_all, fields(pubkey = %pubkey))]
@@ -30,12 +31,13 @@ pub async fn get_balance(
         .parse()
         .map_err(|_| RpcError::PubkeyValidationError(pubkey.clone()))?;
 
-    let commitment = match processed::route(state, config.commitment, "getBalance")? {
-        Route::View(view) => {
-            return processed::get_balance(state, &view, &pubkey, config.min_context_slot).await;
-        }
-        Route::Db(commitment) => commitment,
-    };
+    let commitment = config
+        .commitment
+        .map(|commitment_config| {
+            resolve_commitment(commitment_config.commitment, state.processed_commitment)
+        })
+        .transpose()?
+        .unwrap_or(CommitmentLevel::Finalized);
 
     let sql_template = include_str!("../db/getBalance.sql");
     let pubkey_hex = format!("'\\x{}'::bytea", hex::encode(pubkey.as_ref()));

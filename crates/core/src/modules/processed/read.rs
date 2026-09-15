@@ -5,17 +5,25 @@
 
 //! The request snapshot and its one read function.
 
-use std::fmt;
 use std::sync::Arc;
-use std::time::Instant;
 
 use solana_pubkey::Pubkey;
 
 use super::ingest::SlotBlock;
-use super::{AccountEntry, Lookup};
+use super::{AccountEntry, LiveAccount};
 
-/// An immutable chain from the head block down to the block above the anchor.
-/// Every lookup in one request uses the same view.
+/// The newest state of a key along a view's chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lookup<'a> {
+    Live(&'a LiveAccount),
+    /// Closed, or written by an owner outside the program filter.
+    Closed,
+    /// Not written in the chain. Read Postgres at `slot <= anchor_slot`.
+    Miss,
+}
+
+/// An immutable chain from the head block down through the confirmed slot and
+/// the retained slots below it. Every lookup in one request uses the same view.
 pub struct ProcessedView {
     /// Head slot, the response `context.slot`.
     pub slot: u64,
@@ -25,7 +33,6 @@ pub struct ProcessedView {
     pub anchor_slot: u64,
     /// Newest first.
     pub(super) chain: Vec<Arc<SlotBlock>>,
-    pub(super) anchor_polled_at: Instant,
 }
 
 impl ProcessedView {
@@ -36,7 +43,6 @@ impl ProcessedView {
                 return match entry {
                     AccountEntry::Live(account) => Lookup::Live(account),
                     AccountEntry::Closed => Lookup::Closed,
-                    AccountEntry::Excluded { owner } => Lookup::Excluded(*owner),
                 };
             }
         }
@@ -44,20 +50,8 @@ impl ProcessedView {
     }
 }
 
-impl fmt::Debug for ProcessedView {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ProcessedView")
-            .field("slot", &self.slot)
-            .field("block_time", &self.block_time)
-            .field("anchor_slot", &self.anchor_slot)
-            .field("chain_len", &self.chain.len())
-            .finish()
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::super::LiveAccount;
     use super::super::store::tests::{TestChain, anchor_at};
     use super::*;
     use crate::config::{AccountSelectorConfig, PubkeyDef};
@@ -100,13 +94,25 @@ mod tests {
         chain.block_owned(102, 101, vec![(closed, selected, 0), (moved, other, 6)]);
         chain.store.set_anchor(anchor_at(100));
         let view = chain.event().unwrap();
-        // Closed and Excluded, not Miss, so the caller never falls back to a Postgres row.
+        // Closed, not Miss, so the caller never falls back to a Postgres row.
         assert_eq!(view.lookup(&closed), Lookup::Closed);
-        assert_eq!(view.lookup(&moved), Lookup::Excluded(other));
+        assert_eq!(view.lookup(&moved), Lookup::Closed);
 
         chain.block_owned(103, 102, vec![(moved, selected, 7)]);
         let view = chain.event().unwrap();
         assert_eq!(view.slot, 103);
         assert_eq!(lamports(view.lookup(&moved)), Some(7));
+    }
+
+    #[test]
+    fn retained_blocks_below_the_confirmed_slot_answer_lookups() {
+        let key = Pubkey::new_unique();
+        let mut chain = TestChain::new();
+        chain.block_with(98, 97, vec![(key, 3)]);
+        chain.linear(99, 103);
+        chain.store.set_anchor(anchor_at(100));
+        let view = chain.event().unwrap();
+        assert_eq!(view.anchor_slot, 100);
+        assert_eq!(lamports(view.lookup(&key)), Some(3));
     }
 }

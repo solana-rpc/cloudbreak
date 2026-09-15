@@ -3,59 +3,69 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-//! Processed commitment for account point reads: getAccountInfo,
-//! getMultipleAccounts, getBalance and getTokenAccountBalance.
+//! Processed commitment for getAccountInfo and getMultipleAccounts.
 //!
 //! Postgres holds confirmed data only. This module subscribes to Yellowstone
-//! blocks with accounts at processed commitment and keeps the few blocks above
-//! the Postgres confirmed slot, the anchor, in memory. Each request takes one
-//! [`ProcessedView`]: a head block whose chain links by parent slot and parent
-//! blockhash down to the anchor. A key written in the chain is answered from
-//! memory, and a miss reads Postgres at `slot <= anchor_slot`. When no chain can
-//! be proven, [`ProcessedAccounts::view`] returns a [`DegradeReason`] and the
-//! caller serves the confirmed path. The module has no Postgres dependency. The
-//! anchor arrives on a watch channel from the API slot syncronizer.
+//! blocks with accounts at processed commitment and keeps the blocks around the
+//! Postgres confirmed slot in memory. Each request takes one [`ProcessedView`]:
+//! the highest stored block and its parents down through the confirmed slot,
+//! linked by parent slot and parent blockhash. A key written in the chain is
+//! answered from memory, and a miss reads Postgres at `slot <= anchor_slot`.
+//! When no chain can be proven, [`ProcessedAccounts::view`] returns `None` and
+//! the request takes the confirmed path. The module has no Postgres dependency.
+//! The confirmed slot and its blockhash arrive as an [`Anchor`] on a watch
+//! channel from the API slot syncronizer.
 //!
 //! # Layout
 //!
-//! - `mod.rs`: the public surface and metric registration.
-//! - `ingest.rs`: builds a `SlotBlock` and classifies each account as live,
-//!   closed or excluded by the API program filter.
-//! - `store.rs`: the block store. Slot statuses, the anchor, the conflict latch,
-//!   chain links and view selection. Pure and synchronous.
-//! - `prune.rs`: retention, the span and memory caps, and the dropper thread.
+//! - `mod.rs`: the public surface, the constants and the metric registration.
+//! - `ingest.rs`: builds a `SlotBlock` and classifies each account as live or
+//!   closed. A write by an owner outside the API program filter is a close.
+//! - `store.rs`: the block store. One block per slot, slot statuses, the
+//!   anchor, conflicts, retention, the slot cap and view selection.
 //! - `read.rs`: [`ProcessedView::lookup`], the one read function the API calls.
-//! - `subscribe.rs`: the gRPC session, the reconnect loop and the single writer.
-//!
-//! Nothing is persisted, so there is no persist file.
+//! - `subscribe.rs`: the feed thread. The shared gRPC client in `crate::grpc`
+//!   drives the single writer, which owns the store without a lock.
 //!
 //! # Runtime model
 //!
-//! [`ProcessedAccounts::spawn`] starts two OS threads. `processed-feed` runs the
-//! subscribe loop and the single writer, which owns the store without a lock.
-//! After every block, slot status or anchor change the writer prunes, selects a
-//! view and publishes it behind an `RwLock`. A request clones one `Arc` and holds
-//! no lock while it reads. `processed-dropper` frees evicted blocks off the
-//! writer, and a block a request still pins is freed when the request drops it.
+//! [`ProcessedAccounts::spawn`] starts the `processed-feed` thread. After every
+//! block, slot status or anchor change the writer prunes, selects a view and
+//! publishes it behind an `RwLock`. A request clones one `Arc` and holds no
+//! lock while it reads. A block leaves memory when the last view that pins it
+//! drops, on the feed thread after the publish lock or in a request.
 //!
-//! Each `SlotBlock` adds its bytes to a shared counter when built and subtracts
-//! them when dropped, so the memory cap covers blocks that requests pin. Bytes of
-//! evicted blocks queued for the dropper do not count toward the cap.
+//! The feed subscribes without `from_slot`, keeps retrying on every failure
+//! and never changes node health. While it is down, requests take the
+//! confirmed path.
 //!
-//! View selection fails closed. A head is served only when its chain links to
-//! the anchor blockhash, it descends from the stream's confirmed block when that
-//! block is unambiguous, and no slot on the chain is poisoned. A slot is poisoned
-//! when it is dead, restarted by a second `SLOT_CREATED_BANK`, has no
-//! `SLOT_CREATED_BANK` in this session, or is at or below the highest slot seen
-//! before the last reconnect. A parent blockhash that matches no stored parent,
-//! or two blockhashes for one slot, sets a conflict latch on the highest slot
-//! involved. Every view degrades until the anchor reaches that slot.
+//! # View selection
+//!
+//! The head is the highest stored slot. Its walk follows parent links, each
+//! checked by blockhash, down to the confirmed slot, whose blockhash comes from
+//! `recent_blockhashes`. The walk fails, and no view is served, when a link is
+//! missing, a blockhash differs, the head has no `block_time`, or a slot above
+//! the confirmed slot is poisoned: dead, restarted by a second
+//! `SLOT_CREATED_BANK`, without a `SLOT_CREATED_BANK` in this session, or at or
+//! below the highest slot seen before the last reconnect. A second blockhash
+//! for a stored slot, or a parent blockhash that does not match the stored
+//! parent, deletes the conflicting block and its descendants and serves nothing
+//! until the confirmed slot passes that slot.
+//!
+//! # Retention
+//!
+//! Only the Postgres confirmed slot prunes. Blocks below it stay for
+//! `RETAINED_SLOTS_BELOW_CONFIRMED` slots and serve hot keys from memory. The
+//! Postgres bound stays at the confirmed slot, so a retained write is the
+//! newest one whenever the chain is linked. Above the confirmed slot at most
+//! `MAX_SLOTS_ABOVE_CONFIRMED` slots are kept. Past that the lowest goes, which
+//! breaks the walk until Postgres catches up.
 //!
 //! # Enable rules
 //!
 //! The API `[processed-accounts]` section with `enabled = true` turns it on.
 //! Otherwise [`ProcessedAccounts::default()`] is a no-op handle: `spawn` does
-//! nothing and `view` returns [`DegradeReason::Disabled`].
+//! nothing and `view` returns `None`.
 //!
 //! # Node requirements
 //!
@@ -75,7 +85,7 @@
 //!   inserts each pubkey without dedup, so if it breaks, a repeated pubkey keeps
 //!   an arbitrary version from that block.
 //! - One block per slot per stream. The plugin's block assembly enforces it. A
-//!   second version, from a reconnect or another node, sets the conflict latch.
+//!   second version is a conflict.
 //! - Account writes are sent before the block seals. The plugin's message
 //!   ordering enforces it. If it breaks, a block misses writes and serves stale
 //!   data.
@@ -83,40 +93,42 @@
 //!   `update_slot_status` enforces it. If it breaks, a restarted slot goes
 //!   undetected and a block that mixes two attempts can be served.
 //! - `parent_blockhash` equals the parent block's `blockhash`. Agave bank
-//!   construction enforces it. If it breaks, nothing links and every view
-//!   degrades.
+//!   construction enforces it. If it breaks, nothing links and no view is served.
 
 mod ingest;
-mod prune;
 mod read;
 mod store;
 mod subscribe;
 
-pub use read::ProcessedView;
+pub use read::{Lookup, ProcessedView};
 
-use std::sync::{
-    Arc, RwLock,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
-};
-use std::time::Instant;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
-use prometheus::{Registry, core::Collector};
+use prometheus::Registry;
 use solana_pubkey::Pubkey;
+use yellowstone_grpc_client::GeyserGrpcClient;
 
 use crate::config::{AccountSelectorConfig, ProcessedAccountsConfig};
 use crate::metrics;
 
-/// The Postgres confirmed state the overlay is anchored to, published by the
-/// API slot syncronizer.
+/// Bound on connecting and on each request.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Reconnects when the stream is silent this long. Above the 10 s server ping.
+const STALL_TIMEOUT: Duration = Duration::from_secs(30);
+const RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
+const MAX_DECODING_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
+/// Stored slots above the confirmed slot.
+pub(crate) const MAX_SLOTS_ABOVE_CONFIRMED: usize = 32;
+/// Slots kept below the confirmed slot.
+pub(crate) const RETAINED_SLOTS_BELOW_CONFIRMED: u64 = 4;
+
+/// The Postgres confirmed slot and its blockhash, published by the API slot syncronizer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Anchor {
     pub confirmed_slot: u64,
     /// Base58, as in `recent_blockhashes.blockhash` and `SubscribeUpdateBlock.blockhash`.
     pub confirmed_blockhash: String,
-    pub finalized_slot: u64,
-    pub healthy: bool,
-    /// Time of the last successful poll.
-    pub polled_at: Instant,
 }
 
 /// One account version held in memory.
@@ -133,105 +145,49 @@ pub struct LiveAccount {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum AccountEntry {
     Live(LiveAccount),
-    /// Zero lamports. Shadows every older version.
+    /// Zero lamports, or an owner outside the program filter. Shadows every older version.
     Closed,
-    /// Owner not selected by the API program filter.
-    Excluded {
-        owner: Pubkey,
-    },
 }
-
-/// The newest state of a key along a view's chain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Lookup<'a> {
-    Live(&'a LiveAccount),
-    Closed,
-    Excluded(Pubkey),
-    /// Not written in the chain. Read Postgres at `slot <= anchor_slot`.
-    Miss,
-}
-
-/// Why no processed view can be served. Every reason routes to the confirmed path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DegradeReason {
-    Disabled,
-    NotWarm,
-    Unhealthy,
-    AnchorStale,
-    FinalizedAboveAnchor,
-    Conflict,
-    Unlinked,
-    TooDeep,
-    MemoryCap,
-    HeadNotAhead,
-}
-
-impl DegradeReason {
-    pub const fn as_str(&self) -> &'static str {
-        match self {
-            Self::Disabled => "disabled",
-            Self::NotWarm => "not_warm",
-            Self::Unhealthy => "unhealthy",
-            Self::AnchorStale => "anchor_stale",
-            Self::FinalizedAboveAnchor => "finalized_above_anchor",
-            Self::Conflict => "conflict",
-            Self::Unlinked => "unlinked",
-            Self::TooDeep => "too_deep",
-            Self::MemoryCap => "memory_cap",
-            Self::HeadNotAhead => "head_not_ahead",
-        }
-    }
-}
-
-type Published = Result<Arc<ProcessedView>, DegradeReason>;
 
 struct Shared {
     config: ProcessedAccountsConfig,
     program_filter: Arc<AccountSelectorConfig>,
-    live_bytes: Arc<AtomicUsize>,
-    /// Bytes of evicted blocks waiting for the dropper.
-    pending_drop_bytes: Arc<AtomicUsize>,
-    published: RwLock<Published>,
-    spawned: AtomicBool,
+    published: RwLock<Option<Arc<ProcessedView>>>,
 }
 
 impl Shared {
-    fn max_memory_bytes(&self) -> usize {
-        self.config.max_memory_mb.saturating_mul(1024 * 1024)
-    }
-
-    /// Swaps in the new result. The old one drops after the write lock is released.
-    fn publish(&self, next: Published) {
-        let previous = {
+    /// Swaps in the new view. The old one drops after the write lock is released.
+    fn publish(&self, next: Option<Arc<ProcessedView>>) {
+        let _previous = {
             let mut guard = self.published.write().unwrap_or_else(|e| e.into_inner());
             std::mem::replace(&mut *guard, next)
         };
-        drop(previous);
     }
 }
 
-/// Cheap-clone handle to the processed overlay. `None` is the disabled handle.
+/// Cheap-clone handle to the processed view. `None` is the disabled handle.
 #[derive(Clone, Default)]
 pub struct ProcessedAccounts(Option<Arc<Shared>>);
 
 impl ProcessedAccounts {
-    /// Returns the disabled handle when the section is absent or disabled, and
-    /// validates the section otherwise. Does not connect.
+    /// Returns the disabled handle when the section is absent or disabled.
+    /// Otherwise checks the endpoint and x-token, and registers the metric.
+    /// Does not connect.
     pub fn from_config(
         config: Option<&ProcessedAccountsConfig>,
         program_filter: Arc<AccountSelectorConfig>,
+        registry: &Registry,
     ) -> anyhow::Result<Self> {
         let Some(config) = config.filter(|c| c.enabled) else {
             return Ok(Self::default());
         };
-        config.validate()?;
+        GeyserGrpcClient::build_from_shared(config.endpoint.clone())?
+            .x_token(config.x_token.clone())?;
+        register_metrics(registry);
         Ok(Self(Some(Arc::new(Shared {
             config: config.clone(),
             program_filter,
-            live_bytes: Arc::new(AtomicUsize::new(0)),
-            pending_drop_bytes: Arc::new(AtomicUsize::new(0)),
-            published: RwLock::new(Err(DegradeReason::NotWarm)),
-            spawned: AtomicBool::new(false),
+            published: RwLock::new(None),
         }))))
     }
 
@@ -239,69 +195,30 @@ impl ProcessedAccounts {
         self.0.is_some()
     }
 
-    /// Starts the `processed-feed` and `processed-dropper` threads. No-op when
-    /// disabled or already spawned.
+    /// Starts the `processed-feed` thread. No-op when disabled.
     pub fn spawn(&self, anchor_rx: tokio::sync::watch::Receiver<Option<Anchor>>) {
-        let Some(shared) = &self.0 else {
-            return;
-        };
-        if shared.spawned.swap(true, Ordering::SeqCst) {
-            tracing::warn!("processed accounts feed already spawned");
-            return;
+        if let Some(shared) = &self.0 {
+            subscribe::spawn_feed(shared.clone(), anchor_rx);
         }
-        let drop_tx = prune::spawn_dropper();
-        subscribe::spawn_feed(shared.clone(), anchor_rx, drop_tx);
     }
 
-    /// The view for one request, or why none can be served.
-    pub fn view(&self) -> Result<Arc<ProcessedView>, DegradeReason> {
-        let shared = self.0.as_ref().ok_or(DegradeReason::Disabled)?;
-        let published = shared
+    /// The view for one request, or `None` when no chain can be proven.
+    pub fn view(&self) -> Option<Arc<ProcessedView>> {
+        self.0
+            .as_ref()?
             .published
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let view = published?;
-        if view.anchor_polled_at.elapsed() > shared.config.anchor_max_age {
-            return Err(DegradeReason::AnchorStale);
-        }
-        let held = shared
-            .live_bytes
-            .load(Ordering::Relaxed)
-            .saturating_sub(shared.pending_drop_bytes.load(Ordering::Relaxed));
-        if held > shared.max_memory_bytes() {
-            return Err(DegradeReason::MemoryCap);
-        }
-        Ok(view)
+            .clone()
     }
 }
 
-/// Registers the processed metrics and `CURRENT_TOKIO_TASKS`. Collectors
-/// already registered are skipped.
-pub fn register_processed_metrics(registry: &Registry) {
-    let collectors: Vec<Box<dyn Collector>> = vec![
-        Box::new(metrics::CURRENT_TOKIO_TASKS.clone()),
-        Box::new(metrics::PROCESSED_CONFIRM_LATENCY_MS.clone()),
-        Box::new(metrics::PROCESSED_DEPTH_SLOTS.clone()),
-        Box::new(metrics::PROCESSED_HEAD_REGRESSIONS_TOTAL.clone()),
-        Box::new(metrics::PROCESSED_LIVE_BYTES.clone()),
-        Box::new(metrics::PROCESSED_STORE_BLOCKS.clone()),
-        Box::new(metrics::PROCESSED_HEAD_SLOT.clone()),
-        Box::new(metrics::PROCESSED_ANCHOR_SLOT.clone()),
-        Box::new(metrics::PROCESSED_HEAD_AGE_MS.clone()),
-        Box::new(metrics::PROCESSED_BLOCK_INGEST_MS.clone()),
-        Box::new(metrics::PROCESSED_BLOCK_BYTES.clone()),
-        Box::new(metrics::PROCESSED_GRPC_RECONNECTS_TOTAL.clone()),
-        Box::new(metrics::PROCESSED_CONFLICTS_TOTAL.clone()),
-        Box::new(metrics::PROCESSED_DEAD_SLOTS_TOTAL.clone()),
-        Box::new(metrics::PROCESSED_RESTARTED_SLOTS_TOTAL.clone()),
-        Box::new(metrics::PROCESSED_EVICTIONS_TOTAL.clone()),
-    ];
-    for collector in collectors {
-        match registry.register(collector) {
-            Ok(()) | Err(prometheus::Error::AlreadyReg) => {}
-            Err(e) => tracing::error!("Failed to register processed metric: {e}"),
-        }
+/// Registers the confirm-latency histogram. An already registered collector is skipped.
+fn register_metrics(registry: &Registry) {
+    let collector = Box::new(metrics::PROCESSED_CONFIRM_LATENCY_MS.clone());
+    match registry.register(collector) {
+        Ok(()) | Err(prometheus::Error::AlreadyReg) => {}
+        Err(e) => tracing::error!("Failed to register processed metric: {e}"),
     }
 }
 
@@ -309,93 +226,71 @@ pub fn register_processed_metrics(registry: &Registry) {
 mod tests {
     use super::store::tests::{TestChain, anchor_at};
     use super::*;
-    use std::time::Duration;
 
-    fn config(extra: &str) -> ProcessedAccountsConfig {
-        toml::from_str(&format!(
-            "enabled = true\nendpoint = \"http://grpc:10000\"\nmax-memory-mb = 64\nmax-decoding-mb = 64\n{extra}"
-        ))
-        .unwrap()
+    fn config(endpoint: &str) -> ProcessedAccountsConfig {
+        ProcessedAccountsConfig {
+            enabled: true,
+            endpoint: endpoint.to_string(),
+            x_token: None,
+        }
     }
 
     fn handle(config: &ProcessedAccountsConfig) -> anyhow::Result<ProcessedAccounts> {
-        ProcessedAccounts::from_config(Some(config), Arc::new(AccountSelectorConfig::default()))
-    }
-
-    /// Publishes a view with head 101 over anchor 100, its bytes on the handle's counter.
-    fn publish_view(handle: &ProcessedAccounts) {
-        let shared = handle.0.as_ref().unwrap();
-        let mut chain = TestChain::with_live_bytes(shared.live_bytes.clone());
-        chain.linear(101, 101);
-        chain.store.set_anchor(anchor_at(100));
-        shared.publish(Ok(Arc::new(chain.store.select_view().unwrap())));
+        ProcessedAccounts::from_config(
+            Some(config),
+            Arc::new(AccountSelectorConfig::default()),
+            &Registry::new(),
+        )
     }
 
     #[test]
-    fn from_config_gates_on_enabled_and_validates() {
+    fn from_config_gates_on_enabled_and_checks_the_endpoint() {
         let disabled = ProcessedAccounts::default();
         assert!(!disabled.is_enabled());
         let (_tx, rx) = tokio::sync::watch::channel(None);
         disabled.spawn(rx);
-        assert_eq!(disabled.view().unwrap_err(), DegradeReason::Disabled);
+        assert!(disabled.view().is_none());
 
         let mut off = config("");
         off.enabled = false;
-        off.endpoint.clear();
         assert!(!handle(&off).unwrap().is_enabled());
-        let none = ProcessedAccounts::from_config(None, Arc::new(AccountSelectorConfig::default()));
+        let none = ProcessedAccounts::from_config(
+            None,
+            Arc::new(AccountSelectorConfig::default()),
+            &Registry::new(),
+        );
         assert!(!none.unwrap().is_enabled());
 
-        let mut bad = config("");
-        bad.endpoint.clear();
-        assert!(handle(&bad).is_err());
+        assert!(handle(&config("not a uri")).is_err());
 
-        let enabled = handle(&config("")).unwrap();
+        let enabled = handle(&config("http://grpc:10000")).unwrap();
         assert!(enabled.is_enabled());
-        assert_eq!(enabled.view().unwrap_err(), DegradeReason::NotWarm);
+        assert!(enabled.view().is_none());
     }
 
     #[test]
-    fn view_degrades_on_stale_anchor() {
-        let handle = handle(&config("anchor-max-age = \"0s\"\n")).unwrap();
-        publish_view(&handle);
-        std::thread::sleep(Duration::from_millis(2));
-        assert_eq!(handle.view().unwrap_err(), DegradeReason::AnchorStale);
-    }
-
-    #[test]
-    fn view_memory_cap_counts_pinned_but_not_pending_bytes() {
-        let handle = handle(&config("")).unwrap();
-        publish_view(&handle);
+    fn view_returns_the_published_view() {
+        let handle = handle(&config("http://grpc:10000")).unwrap();
         let shared = handle.0.as_ref().unwrap();
+        let mut chain = TestChain::new();
+        chain.linear(101, 101);
+        chain.store.set_anchor(anchor_at(100));
+        shared.publish(chain.event().map(Arc::new));
         assert_eq!(handle.view().unwrap().slot, 101);
-
-        // Bytes pinned elsewhere count toward the cap.
-        let excess = shared.max_memory_bytes() + 1;
-        shared.live_bytes.fetch_add(excess, Ordering::Relaxed);
-        assert_eq!(handle.view().unwrap_err(), DegradeReason::MemoryCap);
-
-        // The same bytes queued for the dropper do not.
-        shared
-            .pending_drop_bytes
-            .fetch_add(excess, Ordering::Relaxed);
-        assert_eq!(handle.view().unwrap().slot, 101);
-        shared.live_bytes.fetch_sub(excess, Ordering::Relaxed);
-        shared
-            .pending_drop_bytes
-            .fetch_sub(excess, Ordering::Relaxed);
+        shared.publish(None);
+        assert!(handle.view().is_none());
     }
 
     #[test]
     fn register_metrics_is_idempotent() {
         let registry = Registry::new();
-        register_processed_metrics(&registry);
-        register_processed_metrics(&registry);
+        register_metrics(&registry);
+        register_metrics(&registry);
         assert!(
             registry
                 .gather()
                 .iter()
-                .any(|family| family.name() == "cloudbreak_api_processed_live_bytes")
+                .any(|family| family.name() == "cloudbreak_api_processed_confirm_latency_ms")
         );
     }
 }

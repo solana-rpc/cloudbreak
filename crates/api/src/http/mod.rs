@@ -121,7 +121,7 @@ pub struct CloudbreakRpcState {
     /// The `[token-largest-accounts]` API section; getTokenLargestAccounts is
     /// served when its `enabled` flag is set.
     pub token_largest_accounts: MethodSection,
-    /// The `[processed-accounts]` overlay. The disabled handle routes every
+    /// The `[processed-accounts]` view. The disabled handle routes every
     /// request through `resolve_commitment`.
     pub processed: ProcessedAccounts,
 }

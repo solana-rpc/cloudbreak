@@ -743,13 +743,13 @@ pub struct ApiConfig {
     /// `[token-largest-accounts]` state.
     #[serde(rename = "token-largest-accounts", default)]
     pub token_largest_accounts: Option<MethodSection>,
-    /// Serves processed commitment for getAccountInfo, getMultipleAccounts,
-    /// getBalance and getTokenAccountBalance. Requires `[slot-syncronizer]`.
+    /// Serves processed commitment for getAccountInfo and getMultipleAccounts.
+    /// Requires `[slot-syncronizer]`.
     #[serde(rename = "processed-accounts", default)]
     pub processed_accounts: Option<ProcessedAccountsConfig>,
 }
 
-/// The in-memory processed overlay above the Postgres confirmed slot, fed by a
+/// The in-memory processed view around the Postgres confirmed slot, fed by a
 /// Yellowstone block subscription. See `modules::processed`.
 #[derive(Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
@@ -762,132 +762,6 @@ pub struct ProcessedAccountsConfig {
     /// Sent as the `x-token` header.
     #[serde(rename = "x-token", default)]
     pub x_token: Option<String>,
-    /// Bound on connecting and on the subscribe call.
-    #[serde(
-        rename = "connect-timeout",
-        default = "ProcessedAccountsConfig::default_connect_timeout",
-        deserialize_with = "deserialize_duration_required"
-    )]
-    pub connect_timeout: Duration,
-    /// Reconnects when the stream delivers no message for this long. Must exceed
-    /// the 10 s server ping interval.
-    #[serde(
-        rename = "stall-timeout",
-        default = "ProcessedAccountsConfig::default_stall_timeout",
-        deserialize_with = "deserialize_duration_required"
-    )]
-    pub stall_timeout: Duration,
-    /// Upper bound of the reconnect backoff, which starts at 100 ms and doubles.
-    #[serde(
-        rename = "reconnect-backoff-max",
-        default = "ProcessedAccountsConfig::default_reconnect_backoff_max",
-        deserialize_with = "deserialize_duration_required"
-    )]
-    pub reconnect_backoff_max: Duration,
-    /// Largest decoded gRPC message accepted, in MiB.
-    #[serde(
-        rename = "max-decoding-mb",
-        default = "ProcessedAccountsConfig::default_max_decoding_mb"
-    )]
-    pub max_decoding_mb: usize,
-    /// Deepest head above the anchor that is served, in slots.
-    #[serde(
-        rename = "max-servable-depth",
-        default = "ProcessedAccountsConfig::default_max_servable_depth"
-    )]
-    pub max_servable_depth: u64,
-    /// Largest span of stored slots, lowest to highest. Beyond it the lowest
-    /// slot is evicted. At most 512.
-    #[serde(
-        rename = "max-overlay-slots",
-        default = "ProcessedAccountsConfig::default_max_overlay_slots"
-    )]
-    pub max_overlay_slots: u64,
-    /// Cap on live block bytes, including blocks pinned by in-flight requests, in MiB.
-    #[serde(
-        rename = "max-memory-mb",
-        default = "ProcessedAccountsConfig::default_max_memory_mb"
-    )]
-    pub max_memory_mb: usize,
-    /// Views degrade when the last successful slot syncronizer poll is older than this.
-    #[serde(
-        rename = "anchor-max-age",
-        default = "ProcessedAccountsConfig::default_anchor_max_age",
-        deserialize_with = "deserialize_duration_required"
-    )]
-    pub anchor_max_age: Duration,
-}
-
-impl ProcessedAccountsConfig {
-    /// Upper bound for `max-overlay-slots`. Link and view selection walk the stored span per event.
-    const MAX_OVERLAY_SLOTS: u64 = 512;
-    /// The Yellowstone server pings every 10 s, so a shorter stall timeout reconnects a healthy idle stream.
-    const SERVER_PING_INTERVAL: Duration = Duration::from_secs(10);
-    const MIN_MEMORY_MB: usize = 64;
-
-    const fn default_connect_timeout() -> Duration {
-        Duration::from_secs(10)
-    }
-    const fn default_stall_timeout() -> Duration {
-        Duration::from_secs(30)
-    }
-    const fn default_reconnect_backoff_max() -> Duration {
-        Duration::from_secs(30)
-    }
-    const fn default_max_decoding_mb() -> usize {
-        256
-    }
-    const fn default_max_servable_depth() -> u64 {
-        16
-    }
-    const fn default_max_overlay_slots() -> u64 {
-        64
-    }
-    const fn default_max_memory_mb() -> usize {
-        1024
-    }
-    const fn default_anchor_max_age() -> Duration {
-        Duration::from_secs(5)
-    }
-
-    /// Checks the section's own bounds. Callers skip a disabled section.
-    pub fn validate(&self) -> Result<()> {
-        anyhow::ensure!(
-            !self.endpoint.trim().is_empty(),
-            "processed-accounts endpoint must not be empty"
-        );
-        anyhow::ensure!(
-            (1..=self.max_overlay_slots).contains(&self.max_servable_depth),
-            "processed-accounts max-servable-depth must be between 1 and max-overlay-slots ({}), got {}",
-            self.max_overlay_slots,
-            self.max_servable_depth
-        );
-        anyhow::ensure!(
-            self.max_overlay_slots <= Self::MAX_OVERLAY_SLOTS,
-            "processed-accounts max-overlay-slots must be at most {}, got {}",
-            Self::MAX_OVERLAY_SLOTS,
-            self.max_overlay_slots
-        );
-        anyhow::ensure!(
-            self.max_memory_mb >= Self::MIN_MEMORY_MB,
-            "processed-accounts max-memory-mb must be at least {}, got {}",
-            Self::MIN_MEMORY_MB,
-            self.max_memory_mb
-        );
-        anyhow::ensure!(
-            (1..=self.max_memory_mb).contains(&self.max_decoding_mb),
-            "processed-accounts max-decoding-mb must be between 1 and max-memory-mb ({}), got {}",
-            self.max_memory_mb,
-            self.max_decoding_mb
-        );
-        anyhow::ensure!(
-            self.stall_timeout > Self::SERVER_PING_INTERVAL,
-            "processed-accounts stall-timeout must exceed the {:?} server ping interval, got {:?}",
-            Self::SERVER_PING_INTERVAL,
-            self.stall_timeout
-        );
-        Ok(())
-    }
 }
 
 /// Config section for an optional API method; the method is served only when
@@ -1542,17 +1416,13 @@ impl ApiConfig {
             .is_some_and(|processed| processed.enabled)
     }
 
-    /// Validates `[processed-accounts]` when enabled, including its
-    /// `[slot-syncronizer]` requirement.
+    /// Checks the `[slot-syncronizer]` requirement of an enabled `[processed-accounts]`.
     pub fn validate_processed_accounts(&self) -> Result<()> {
-        let Some(processed) = self.processed_accounts.as_ref().filter(|p| p.enabled) else {
-            return Ok(());
-        };
         anyhow::ensure!(
-            self.slot_syncronizer.enabled,
+            !self.processed_accounts_enabled() || self.slot_syncronizer.enabled,
             "processed-accounts requires [slot-syncronizer] enabled = true"
         );
-        processed.validate()
+        Ok(())
     }
 }
 
@@ -1838,55 +1708,6 @@ url = "postgres://localhost/cloudbreak"
     }
 
     #[test]
-    fn processed_accounts_defaults() {
-        let config =
-            api_config("[processed-accounts]\nenabled = true\nendpoint = \"http://grpc\"\n")
-                .unwrap();
-        assert!(config.processed_accounts_enabled());
-        let p = config.processed_accounts.as_ref().unwrap();
-        assert_eq!(p.x_token, None);
-        assert_eq!(p.connect_timeout, Duration::from_secs(10));
-        assert_eq!(p.stall_timeout, Duration::from_secs(30));
-        assert_eq!(p.reconnect_backoff_max, Duration::from_secs(30));
-        assert_eq!(p.max_decoding_mb, 256);
-        assert_eq!(p.max_servable_depth, 16);
-        assert_eq!(p.max_overlay_slots, 64);
-        assert_eq!(p.max_memory_mb, 1024);
-        assert_eq!(p.anchor_max_age, Duration::from_secs(5));
-        config.validate_processed_accounts().unwrap();
-    }
-
-    #[test]
-    fn processed_accounts_parses_every_knob() {
-        let config = api_config(
-            r#"[processed-accounts]
-enabled = true
-endpoint = "https://grpc"
-x-token = "secret"
-connect-timeout = "3s"
-stall-timeout = "15s"
-reconnect-backoff-max = "5s"
-max-decoding-mb = 64
-max-servable-depth = 8
-max-overlay-slots = 32
-max-memory-mb = 512
-anchor-max-age = "2s"
-"#,
-        )
-        .unwrap();
-        let p = config.processed_accounts.as_ref().unwrap();
-        assert_eq!(p.x_token.as_deref(), Some("secret"));
-        assert_eq!(p.connect_timeout, Duration::from_secs(3));
-        assert_eq!(p.stall_timeout, Duration::from_secs(15));
-        assert_eq!(p.reconnect_backoff_max, Duration::from_secs(5));
-        assert_eq!(p.max_decoding_mb, 64);
-        assert_eq!(p.max_servable_depth, 8);
-        assert_eq!(p.max_overlay_slots, 32);
-        assert_eq!(p.max_memory_mb, 512);
-        assert_eq!(p.anchor_max_age, Duration::from_secs(2));
-    }
-
-    #[test]
     fn processed_accounts_rejects_unknown_field() {
         let err = api_config("[processed-accounts]\nenabled = true\nretain-slots = 1\n")
             .unwrap_err()
@@ -1905,32 +1726,5 @@ anchor-max-age = "2s"
             .unwrap_err()
             .to_string();
         assert!(err.contains("slot-syncronizer"), "{err}");
-    }
-
-    #[test]
-    fn processed_accounts_validation_bounds() {
-        type Case = (fn(&mut ProcessedAccountsConfig), bool);
-        let cases: [Case; 11] = [
-            (|p| p.endpoint = " ".to_string(), false),
-            (|p| p.max_servable_depth = 0, false),
-            (|p| p.max_servable_depth = 64, true),
-            (|p| p.max_servable_depth = 65, false),
-            (|p| p.max_overlay_slots = 512, true),
-            (|p| p.max_overlay_slots = 513, false),
-            (|p| p.max_memory_mb = 63, false),
-            (|p| p.max_decoding_mb = 0, false),
-            (|p| p.max_decoding_mb = 1025, false),
-            (|p| p.stall_timeout = Duration::from_secs(10), false),
-            (|p| p.stall_timeout = Duration::from_secs(11), true),
-        ];
-        for (index, (mutate, valid)) in cases.into_iter().enumerate() {
-            let mut p =
-                api_config("[processed-accounts]\nenabled = true\nendpoint = \"http://grpc\"\n")
-                    .unwrap()
-                    .processed_accounts
-                    .unwrap();
-            mutate(&mut p);
-            assert_eq!(p.validate().is_ok(), valid, "case {index}");
-        }
     }
 }
