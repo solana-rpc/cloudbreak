@@ -11,6 +11,7 @@ mod compare_accounts_by_mint;
 mod compare_accounts_by_mint_vs_cluster;
 mod compare_genesis_hash;
 mod compare_largest_accounts;
+mod compare_processed_accounts;
 mod compare_program_accounts;
 mod compare_supply;
 mod compare_token_largest_accounts;
@@ -20,7 +21,6 @@ mod config;
 mod db_check;
 mod get_slot;
 mod logging;
-mod processed_suite;
 mod response_comparison;
 mod sources;
 mod utils;
@@ -51,9 +51,8 @@ enum Commands {
     CompareTokenLargestAccounts(compare_token_largest_accounts::Args),
     /// Validate getSupply against getMultipleAccounts (independent read path) on the same node
     CompareSupply(compare_supply::Args),
-    /// Correctness and speed suite for processed commitment account reads
-    #[command(long_about = processed_suite::LONG_ABOUT)]
-    ProcessedSuite(Box<processed_suite::Args>),
+    /// Validate processed account reads against reference RPCs and confirmed data
+    CompareProcessedAccounts(compare_processed_accounts::Args),
     /// Compare getGenesisHash between two RPC endpoints (exact equality)
     CompareGenesisHash(compare_genesis_hash::Args),
     /// Compare getVersion: cloudbreak's composite string should embed the cluster's solana-core
@@ -81,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
             compare_token_largest_accounts::run(&args).await?
         }
         Commands::CompareSupply(args) => compare_supply::run(&args).await?,
-        Commands::ProcessedSuite(args) => processed_suite::run(*args).await?,
+        Commands::CompareProcessedAccounts(args) => compare_processed_accounts::run(&args).await?,
         Commands::CompareGenesisHash(args) => compare_genesis_hash::run(&args).await?,
         Commands::CompareVersion(args) => compare_version::run(&args).await?,
         Commands::Benchmark(args) => benchmark::run(&args).await?,

@@ -6,21 +6,26 @@
 //! Processed commitment for getAccountInfo, getMultipleAccounts, getBalance,
 //! getTokenAccountBalance and getTokenSupply.
 //!
-//! Each method calls [`route`] first. With `[processed-accounts]` enabled, a
-//! processed request takes one [`ProcessedView`] ([`Route::View`]) and the method
-//! returns early into this module. When no view is published, the node is
-//! unhealthy, the view head is below the cached confirmed slot, or the cached
-//! finalized slot is above the view anchor, the request takes the confirmed
-//! path ([`Route::Db`]) and answers exactly as a confirmed request would, even
-//! with `processed-commitment = "reject"`. Every other request resolves through
-//! [`resolve_commitment`].
+//! Each method resolves its request with [`read_at`]. With `[processed-accounts]`
+//! enabled, a processed request that a published [`ProcessedView`] can serve
+//! carries that view in its [`Read`]. Every other request carries the commitment
+//! from [`resolve_commitment`]. A processed request with no servable view takes
+//! `Confirmed` and answers exactly as a confirmed request would, even with
+//! `processed-commitment = "reject"`. A view is servable when the node is
+//! healthy, the view head is not below the cached confirmed slot, and the cached
+//! finalized slot is not above the view anchor.
 //!
-//! On a view, a key written in the chain is answered from memory. A miss reads
-//! Postgres at `slot <= view.anchor_slot`. `Lookup::Closed` never falls back to
-//! Postgres and answers as an absent account. A Postgres row keeps the confirmed
-//! owner check.
-//! `context.slot` and the block time come from the head block. A jsonParsed
-//! token account resolves its mint through the view first:
+//! getAccountInfo, getMultipleAccounts, getTokenAccountBalance and getTokenSupply
+//! read their keys through [`read_accounts`] at both commitments and keep their
+//! own filter, decode and encode logic. Without a view every key reads Postgres
+//! with the method's SQL at the request slot. With a view, a key written in the
+//! chain is answered from memory, a `Lookup::Closed` key is absent and never
+//! reads Postgres, and a `Lookup::Miss` key reads Postgres at
+//! `slot <= view.anchor_slot`. A Postgres row keeps the confirmed owner check.
+//! `context.slot` and the block time come from the head block through
+//! [`Read::slot_and_block_time`].
+//!
+//! On a view, a jsonParsed token account resolves its mint through the view first:
 //!
 //! | Mint lookup | Account from the view | Account from Postgres |
 //! |---|---|---|
@@ -28,68 +33,72 @@
 //! | `Closed` | no mint data | no mint data |
 //! | `Miss` | one `getMultipleAccounts.sql` read at the anchor | the joined mint |
 //!
-//! getBalance, getTokenAccountBalance and getTokenSupply read their key through
-//! the getAccountInfo read, then decode it with the confirmed helpers.
-//! getTokenAccountBalance slices the data as `getTokenAccountBalance.sql` does.
-//!
-//! | Method | Account | Absent | Excluded Postgres row |
-//! |---|---|---|---|
-//! | getBalance | lamports | 0 | -32010 |
-//! | getTokenAccountBalance | `token_account_balance` with the resolved mint | `AccountNotFound` | -32010 |
-//! | getTokenSupply | `token_supply` | `AccountNotFound` | -32010 |
-//!
-//! A getBalance miss reads the account data too. Its newest Postgres row, when
-//! closed with an excluded owner, answers 0 as Agave does. Confirmed answers -32010.
+//! getBalance keeps `getBalance.sql` and looks its key up in the view itself. A
+//! live key answers its lamports and a closed key answers 0, both at the head
+//! slot. A miss runs the SQL bounded at the anchor with the head as the context
+//! slot. The newest Postgres row of a closed account with an excluded owner
+//! answers -32010 at both commitments.
 
 use std::collections::HashMap;
-use std::fmt::Display;
 use std::sync::Arc;
 
-use cloudbreak_core::AccountSelectorConfig;
 use cloudbreak_core::modules::processed::{LiveAccount, Lookup, ProcessedView};
 use rust_decimal::prelude::ToPrimitive;
 use sea_orm::sqlx::{self, Row, postgres::PgRow};
-use solana_account::AccountSharedData;
-use solana_account_decoder::{UiAccountEncoding, UiDataSliceConfig, encode_ui_account};
-use solana_account_decoder_client_types::UiAccount;
-use solana_account_decoder_client_types::token::UiTokenAmount;
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_pubkey::Pubkey;
-use solana_rpc_client_api::config::RpcAccountInfoConfig;
-use solana_rpc_client_api::response::{Response as RpcResponse, RpcResponseContext};
 use tokio::time::timeout;
 use tracing::Instrument;
 
 use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
-use crate::methods::get_token_account_balance::token_account_balance;
-use crate::methods::get_token_supply::token_supply;
-use crate::methods::token::{check_account_data_len_for_encoding, parse_additional_mint_data};
 use crate::methods::{is_token_program, resolve_commitment};
 use crate::slot_syncronizer::SlotSyncronizerData;
 use crate::{db_query, metrics};
 
-/// Where one request is served from.
-pub(crate) enum Route {
-    /// The processed view, with Postgres misses bounded at its anchor.
-    View(Arc<ProcessedView>),
-    /// Postgres at this commitment.
-    Db(CommitmentLevel),
+/// How one request reads: at a commitment, or through a processed view.
+pub(crate) struct Read {
+    pub(crate) commitment: CommitmentLevel,
+    /// Set for a processed request with a servable view. `commitment` is then `Confirmed`.
+    pub(crate) view: Option<Arc<ProcessedView>>,
+}
+
+impl Read {
+    /// The context slot and block time: the view head, or the cached slot at the commitment.
+    pub(crate) async fn slot_and_block_time(
+        &self,
+        state: &CloudbreakRpcState,
+    ) -> Result<(u64, i64), RpcError> {
+        match &self.view {
+            Some(view) => Ok((view.slot, view.block_time)),
+            None => state.latest_slot_and_block_time(self.commitment).await,
+        }
+    }
+
+    /// The Postgres slot bound: the view anchor, or the request slot.
+    fn bound(&self, latest_slot: u64) -> u64 {
+        self.view
+            .as_ref()
+            .map_or(latest_slot, |view| view.anchor_slot)
+    }
 }
 
 /// Resolves the request commitment. `method` is the metric label.
-pub(crate) fn route(
+pub(crate) fn read_at(
     state: &CloudbreakRpcState,
     commitment: Option<CommitmentConfig>,
     method: &str,
-) -> Result<Route, RpcError> {
+) -> Result<Read, RpcError> {
     let commitment = commitment.map(|config| config.commitment);
     if commitment != Some(CommitmentLevel::Processed) || !state.processed.is_enabled() {
-        let level = commitment
+        let commitment = commitment
             .map(|commitment| resolve_commitment(commitment, state.processed_commitment))
             .transpose()?
             .unwrap_or(CommitmentLevel::Finalized);
-        return Ok(Route::Db(level));
+        return Ok(Read {
+            commitment,
+            view: None,
+        });
     }
     let slots = state
         .slot_syncronizer_data
@@ -99,15 +108,19 @@ pub(crate) fn route(
                 .expect("Failed to read slot syncronizer data")
                 .clone()
         });
-    Ok(match servable(state.processed.view(), &slots) {
+    let view = match servable(state.processed.view(), &slots) {
         Ok(view) => {
             count_route(method, "view", "none");
-            Route::View(view)
+            Some(view)
         }
         Err(reason) => {
             count_route(method, "degraded", reason);
-            Route::Db(CommitmentLevel::Confirmed)
+            None
         }
+    };
+    Ok(Read {
+        commitment: CommitmentLevel::Confirmed,
+        view,
     })
 }
 
@@ -146,165 +159,19 @@ fn count_route(method: &str, route: &str, reason: &str) {
         .inc();
 }
 
-pub(crate) async fn get_account_info(
-    state: &CloudbreakRpcState,
-    view: &ProcessedView,
-    pubkey: &Pubkey,
-    config: &RpcAccountInfoConfig,
-) -> Result<RpcResponse<Option<UiAccount>>, RpcError> {
-    check_min_context_slot(view, config.min_context_slot)?;
-    let encoding = config.encoding.unwrap_or(UiAccountEncoding::Binary);
-    let keys = std::slice::from_ref(pubkey);
-    let reads = read_accounts(state, view, Method::AccountInfo, keys, encoding).await?;
-    let value = match reads.into_iter().next() {
-        Some(KeyRead::Account { account, mint_data }) => Some(encode_account(
-            pubkey,
-            account,
-            mint_data.as_deref().map(Vec::as_slice),
-            encoding,
-            config.data_slice,
-            view.block_time,
-        )?),
-        Some(KeyRead::Excluded(owner)) => return Err(owner_excluded(pubkey, &owner)),
-        Some(KeyRead::Absent) | None => None,
-    };
-    Ok(response(view, value))
-}
-
-pub(crate) async fn get_multiple_accounts(
-    state: &CloudbreakRpcState,
-    view: &ProcessedView,
-    pubkeys: &[Pubkey],
-    config: &RpcAccountInfoConfig,
-) -> Result<RpcResponse<Vec<Option<UiAccount>>>, RpcError> {
-    check_min_context_slot(view, config.min_context_slot)?;
-    let encoding = config.encoding.unwrap_or(UiAccountEncoding::Base64);
-    let reads = read_accounts(state, view, Method::MultipleAccounts, pubkeys, encoding).await?;
-    let mut value = Vec::with_capacity(pubkeys.len());
-    for (pubkey, read) in pubkeys.iter().zip(reads) {
-        value.push(match read {
-            KeyRead::Account { account, mint_data } => Some(encode_account(
-                pubkey,
-                account,
-                mint_data.as_deref().map(Vec::as_slice),
-                encoding,
-                config.data_slice,
-                view.block_time,
-            )?),
-            KeyRead::Excluded(owner) => {
-                tracing::error!(
-                    target: "gma_indexer_filter",
-                    pubkey = %pubkey,
-                    owner = %owner,
-                    "getMultipleAccounts: skipping account because owner is excluded by the current indexer filter"
-                );
-                None
-            }
-            KeyRead::Absent => None,
-        });
-    }
-    Ok(response(view, value))
-}
-
-pub(crate) async fn get_balance(
-    state: &CloudbreakRpcState,
-    view: &ProcessedView,
-    pubkey: &Pubkey,
-    min_context_slot: Option<u64>,
-) -> Result<RpcResponse<u64>, RpcError> {
-    check_min_context_slot(view, min_context_slot)?;
-    let value = match read_one(state, view, pubkey, UiAccountEncoding::Base64).await? {
-        KeyRead::Account { account, .. } => account.lamports,
-        KeyRead::Excluded(owner) => return Err(owner_excluded(pubkey, &owner)),
-        KeyRead::Absent => 0,
-    };
-    Ok(response(view, value))
-}
-
-pub(crate) async fn get_token_account_balance(
-    state: &CloudbreakRpcState,
-    view: &ProcessedView,
-    pubkey: &Pubkey,
-) -> Result<RpcResponse<UiTokenAmount>, RpcError> {
-    let value = match read_one(state, view, pubkey, UiAccountEncoding::JsonParsed).await? {
-        KeyRead::Account { account, mint_data } => token_account_balance(
-            pubkey,
-            &account.owner,
-            sql_substring(&account.data, 64, 8),
-            sql_substring(&account.data, 0, 32),
-            mint_data.as_deref().map_or(&[], Vec::as_slice),
-            view.block_time,
-        )?,
-        KeyRead::Excluded(owner) => return Err(owner_excluded(pubkey, &owner)),
-        KeyRead::Absent => return Err(account_not_found(pubkey)),
-    };
-    Ok(response(view, value))
-}
-
-pub(crate) async fn get_token_supply(
-    state: &CloudbreakRpcState,
-    view: &ProcessedView,
-    pubkey: &Pubkey,
-) -> Result<RpcResponse<UiTokenAmount>, RpcError> {
-    let value = match read_one(state, view, pubkey, UiAccountEncoding::Base64).await? {
-        KeyRead::Account { account, .. } => {
-            token_supply(pubkey, &account.owner, &account.data, view.block_time)?
-        }
-        KeyRead::Excluded(owner) => return Err(owner_excluded(pubkey, &owner)),
-        KeyRead::Absent => return Err(account_not_found(pubkey)),
-    };
-    Ok(response(view, value))
-}
-
-/// One key through the getAccountInfo read. jsonParsed also resolves a token mint.
-async fn read_one(
-    state: &CloudbreakRpcState,
-    view: &ProcessedView,
-    pubkey: &Pubkey,
-    encoding: UiAccountEncoding,
-) -> Result<KeyRead, RpcError> {
-    let keys = std::slice::from_ref(pubkey);
-    let reads = read_accounts(state, view, Method::AccountInfo, keys, encoding).await?;
-    Ok(reads.into_iter().next().unwrap_or(KeyRead::Absent))
-}
-
-fn owner_excluded(pubkey: &Pubkey, owner: &Pubkey) -> RpcError {
-    RpcError::AccountOwnerExcluded {
-        pubkey: pubkey.to_string(),
-        owner: owner.to_string(),
-    }
-}
-
-fn account_not_found(pubkey: &Pubkey) -> RpcError {
-    RpcError::AccountNotFound {
-        pubkey: pubkey.to_string(),
-    }
-}
-
-/// The bytes `SUBSTRING(data FROM start + 1 FOR len)` returns: shorter when data ends early.
-fn sql_substring(data: &[u8], start: usize, len: usize) -> &[u8] {
-    let end = (start + len).min(data.len());
-    &data[start.min(end)..end]
-}
-
-/// The calling method. It picks the SQL that reads misses.
-#[derive(Debug, Clone, Copy)]
-enum Method {
-    AccountInfo,
-    MultipleAccounts,
-}
-
-/// Account fields ready for encoding, from the view or a Postgres row.
+/// One live account, from the view or a Postgres row.
 #[derive(Debug, Clone)]
-struct AccountParts {
-    lamports: u64,
-    owner: Pubkey,
-    executable: bool,
-    rent_epoch: u64,
-    data: Arc<Vec<u8>>,
+pub(crate) struct Account {
+    pub(crate) lamports: u64,
+    pub(crate) owner: Pubkey,
+    pub(crate) executable: bool,
+    pub(crate) rent_epoch: u64,
+    pub(crate) data: Arc<Vec<u8>>,
+    /// The joined `mint_data` column, or the mint resolved through the view.
+    mint_data: Option<Arc<Vec<u8>>>,
 }
 
-impl AccountParts {
+impl Account {
     fn from_live(account: &LiveAccount) -> Self {
         Self {
             lamports: account.lamports,
@@ -312,20 +179,32 @@ impl AccountParts {
             executable: account.executable,
             rent_epoch: account.rent_epoch,
             data: account.data.clone(),
+            mint_data: None,
         }
     }
 
-    fn from_row(row: &PgRow, owner: Pubkey) -> Self {
-        Self {
+    fn from_row(row: &PgRow, with_mint: bool) -> Result<Self, RpcError> {
+        let mint_data = if with_mint {
+            row.try_get::<Vec<u8>, _>("mint_data").ok().map(Arc::new)
+        } else {
+            None
+        };
+        Ok(Self {
             lamports: row.get::<i64, _>("lamports") as u64,
-            owner,
+            owner: pubkey_column(row, "owner")?,
             executable: row.get("executable"),
             rent_epoch: row
                 .get::<rust_decimal::Decimal, _>("rent_epoch")
                 .to_u64()
                 .unwrap_or(0),
             data: Arc::new(row.get("data")),
-        }
+            mint_data,
+        })
+    }
+
+    /// The mint data of a jsonParsed token account. Empty when the mint was not found.
+    pub(crate) fn mint_data(&self) -> &[u8] {
+        self.mint_data.as_deref().map_or(&[], Vec::as_slice)
     }
 
     /// The mint of a token-program account with at least 32 bytes of data.
@@ -337,120 +216,65 @@ impl AccountParts {
     }
 }
 
-/// The state of one requested key.
-#[derive(Debug)]
-enum KeyRead {
-    /// `mint_data` is set only for jsonParsed token accounts whose mint was found.
-    Account {
-        account: AccountParts,
-        mint_data: Option<Arc<Vec<u8>>>,
-    },
-    /// Never written, or closed.
-    Absent,
-    /// A Postgres row whose owner is outside the program filter.
-    Excluded(Pubkey),
-}
-
-/// Reads the requested keys in order. Misses read Postgres at the anchor, and
-/// jsonParsed token accounts resolve their mint through the view.
-async fn read_accounts(
+/// Reads `keys` in order, `None` for an absent or closed key. Without a view
+/// every key reads Postgres with `sql_template` at `latest_slot`. With a view,
+/// a live key comes from memory and a miss reads Postgres at the view anchor.
+/// `$1` in the template takes one bytea literal, or an array when the template
+/// unnests it. `what` names the method in logs.
+pub(crate) async fn read_accounts(
     state: &CloudbreakRpcState,
-    view: &ProcessedView,
-    method: Method,
+    read: &Read,
     keys: &[Pubkey],
-    encoding: UiAccountEncoding,
-) -> Result<Vec<KeyRead>, RpcError> {
-    let with_mint = encoding == UiAccountEncoding::JsonParsed;
-    let lookups: Vec<Lookup<'_>> = keys.iter().map(|key| view.lookup(key)).collect();
-
+    sql_template: &str,
+    latest_slot: u64,
+    with_mint: bool,
+    what: &str,
+) -> Result<Vec<Option<Account>>, RpcError> {
+    let lookups: Vec<Lookup<'_>> = match &read.view {
+        Some(view) => keys.iter().map(|key| view.lookup(key)).collect(),
+        None => vec![Lookup::Miss; keys.len()],
+    };
     let misses: Vec<Pubkey> = keys
         .iter()
         .zip(&lookups)
         .filter(|(_, lookup)| matches!(lookup, Lookup::Miss))
         .map(|(key, _)| *key)
         .collect();
-    let rows = if misses.is_empty() {
-        Vec::new()
-    } else {
-        fetch_misses(state, method, &misses, view.anchor_slot, with_mint).await?
-    };
-    let mut row_by_pubkey: HashMap<Pubkey, &PgRow> = HashMap::with_capacity(rows.len());
-    for row in &rows {
-        row_by_pubkey.insert(pubkey_column(row, "pubkey")?, row);
-    }
 
-    let mut reads = Vec::with_capacity(keys.len());
-    for (key, lookup) in keys.iter().zip(&lookups) {
-        reads.push(match *lookup {
-            Lookup::Live(account) => KeyRead::Account {
-                account: AccountParts::from_live(account),
-                mint_data: None,
-            },
-            Lookup::Closed => KeyRead::Absent,
-            Lookup::Miss => match row_by_pubkey.get(key) {
-                Some(row) => key_read_from_row(&state.indexer_filter, row, with_mint)?,
-                None => KeyRead::Absent,
-            },
-        });
-    }
-    if with_mint {
-        resolve_mints(state, view, &mut reads, &lookups).await?;
-    }
-    Ok(reads)
-}
-
-fn key_read_from_row(
-    filter: &AccountSelectorConfig,
-    row: &PgRow,
-    with_mint: bool,
-) -> Result<KeyRead, RpcError> {
-    let owner = pubkey_column(row, "owner")?;
-    if !filter.is_program_selected(&owner) {
-        return Ok(KeyRead::Excluded(owner));
-    }
-    let mint_data = if with_mint {
-        row.try_get::<Vec<u8>, _>("mint_data").ok().map(Arc::new)
-    } else {
-        None
-    };
-    Ok(KeyRead::Account {
-        account: AccountParts::from_row(row, owner),
-        mint_data,
-    })
-}
-
-/// Reads the misses at `slot` with the method's own SQL.
-async fn fetch_misses(
-    state: &CloudbreakRpcState,
-    method: Method,
-    misses: &[Pubkey],
-    slot: u64,
-    with_mint: bool,
-) -> Result<Vec<PgRow>, RpcError> {
-    match method {
-        Method::AccountInfo => {
-            let template = if with_mint {
-                include_str!("../db/getAccountInfoWithMintData.sql")
-            } else {
-                include_str!("../db/getAccountInfo.sql")
-            };
-            let query = bind_query(template, &bytea_literal(&misses[0]), slot);
-            tracing::debug!(target: "gai_sql", "## sql: {}", query);
-            let span = tracing::info_span!("gai_db");
-            fetch_rows(state, &query, span, "getAccountInfo").await
-        }
-        Method::MultipleAccounts => {
-            let template = if with_mint {
-                include_str!("../db/getMultipleAccountsWithMintData.sql")
-            } else {
-                include_str!("../db/getMultipleAccounts.sql")
-            };
-            let query = bind_query(template, &bytea_array_literal(misses), slot);
-            tracing::debug!(target: "gma_sql", "## sql: {}", query);
-            let span = tracing::info_span!("gma_db");
-            fetch_rows(state, &query, span, "getMultipleAccounts").await
+    let mut found = HashMap::with_capacity(misses.len());
+    if !misses.is_empty() {
+        let bound = read.bound(latest_slot);
+        for row in fetch_accounts(state, sql_template, &misses, bound, what).await? {
+            found.insert(
+                pubkey_column(&row, "pubkey")?,
+                Account::from_row(&row, with_mint)?,
+            );
         }
     }
+
+    let mut accounts = assemble(keys, &lookups, found);
+    if let Some(view) = &read.view
+        && with_mint
+    {
+        resolve_mints(state, view, &mut accounts, &lookups).await?;
+    }
+    Ok(accounts)
+}
+
+/// Pairs each key with its view account, its Postgres account, or `None`.
+fn assemble(
+    keys: &[Pubkey],
+    lookups: &[Lookup<'_>],
+    found: HashMap<Pubkey, Account>,
+) -> Vec<Option<Account>> {
+    keys.iter()
+        .zip(lookups)
+        .map(|(key, lookup)| match lookup {
+            Lookup::Live(account) => Some(Account::from_live(account)),
+            Lookup::Closed => None,
+            Lookup::Miss => found.get(key).cloned(),
+        })
+        .collect()
 }
 
 /// Where a token account's mint data comes from on a view.
@@ -479,12 +303,12 @@ fn mint_source(mint_lookup: Lookup<'_>, account_from_postgres: bool) -> MintSour
 async fn resolve_mints(
     state: &CloudbreakRpcState,
     view: &ProcessedView,
-    reads: &mut [KeyRead],
+    accounts: &mut [Option<Account>],
     lookups: &[Lookup<'_>],
 ) -> Result<(), RpcError> {
     let mut queried: Vec<(usize, Pubkey)> = Vec::new();
-    for (index, (read, lookup)) in reads.iter_mut().zip(lookups).enumerate() {
-        let KeyRead::Account { account, mint_data } = read else {
+    for (index, (account, lookup)) in accounts.iter_mut().zip(lookups).enumerate() {
+        let Some(account) = account else {
             continue;
         };
         let Some(mint) = account.token_mint() else {
@@ -492,8 +316,8 @@ async fn resolve_mints(
         };
         let from_postgres = matches!(lookup, Lookup::Miss);
         match mint_source(view.lookup(&mint), from_postgres) {
-            MintSource::View(data) => *mint_data = Some(data),
-            MintSource::Empty => *mint_data = None,
+            MintSource::View(data) => account.mint_data = Some(data),
+            MintSource::Empty => account.mint_data = None,
             MintSource::Joined => {}
             MintSource::Query => queried.push((index, mint)),
         }
@@ -505,124 +329,52 @@ async fn resolve_mints(
     let mut mints: Vec<Pubkey> = queried.iter().map(|(_, mint)| *mint).collect();
     mints.sort_unstable();
     mints.dedup();
-    let query = bind_query(
-        include_str!("../db/getMultipleAccounts.sql"),
-        &bytea_array_literal(&mints),
+    let sql_template = include_str!("../db/getMultipleAccounts.sql");
+    let rows = fetch_accounts(
+        state,
+        sql_template,
+        &mints,
         view.anchor_slot,
-    );
-    let span = tracing::info_span!("processed_mint_db");
-    let rows = fetch_rows(state, &query, span, "processed mint").await?;
+        "processed mint",
+    )
+    .await?;
     let mut found = HashMap::with_capacity(rows.len());
     for row in &rows {
         let data = Arc::new(row.get::<Vec<u8>, _>("data"));
         found.insert(pubkey_column(row, "pubkey")?, data);
     }
     for (index, mint) in queried {
-        if let KeyRead::Account { mint_data, .. } = &mut reads[index] {
-            *mint_data = found.get(&mint).cloned();
+        if let Some(account) = &mut accounts[index] {
+            account.mint_data = found.get(&mint).cloned();
         }
     }
     Ok(())
 }
 
-/// Encodes one account. jsonParsed token accounts use `mint_data`, or empty mint data.
-fn encode_account(
-    pubkey: &Pubkey,
-    account: AccountParts,
-    mint_data: Option<&[u8]>,
-    encoding: UiAccountEncoding,
-    data_slice: Option<UiDataSliceConfig>,
-    block_time: i64,
-) -> Result<UiAccount, RpcError> {
-    let additional_mint_data = if encoding == UiAccountEncoding::JsonParsed {
-        account.token_mint().and_then(|mint| {
-            parse_additional_mint_data(&mint, mint_data.unwrap_or_default(), block_time)
-        })
-    } else {
-        None
-    };
-
-    check_account_data_len_for_encoding(encoding, data_slice, account.data.len(), pubkey)?;
-
-    let account_shared_data = AccountSharedData::create_from_existing_shared_data(
-        account.lamports,
-        account.data,
-        account.owner,
-        account.executable,
-        account.rent_epoch,
-    );
-
-    // encode_ui_account takes `space` from the full data before slicing, as Agave does.
-    Ok(encode_ui_account(
-        pubkey,
-        &account_shared_data,
-        encoding,
-        additional_mint_data,
-        data_slice,
-    ))
-}
-
-fn check_min_context_slot(
-    view: &ProcessedView,
-    min_context_slot: Option<u64>,
-) -> Result<(), RpcError> {
-    match min_context_slot {
-        Some(min_context_slot) if view.slot < min_context_slot => {
-            Err(RpcError::RpcSlotBehindMinContextSlot {
-                rpc_slot: view.slot,
-            })
-        }
-        _ => Ok(()),
-    }
-}
-
-fn response<T>(view: &ProcessedView, value: T) -> RpcResponse<T> {
-    RpcResponse {
-        context: RpcResponseContext {
-            slot: view.slot,
-            api_version: None,
-        },
-        value,
-    }
-}
-
-fn pubkey_column(row: &PgRow, column: &str) -> Result<Pubkey, RpcError> {
-    let bytes: Vec<u8> = row.try_get(column).map_err(|e| {
-        tracing::error!("processed read: missing {column} column: {e}");
-        RpcError::InternalError
-    })?;
-    Pubkey::try_from(bytes.as_slice()).map_err(|_| RpcError::InternalError)
-}
-
-fn bytea_literal(pubkey: &Pubkey) -> String {
-    format!("'\\x{}'::bytea", hex::encode(pubkey.as_ref()))
-}
-
-fn bytea_array_literal(pubkeys: &[Pubkey]) -> String {
-    let literals: Vec<String> = pubkeys.iter().map(bytea_literal).collect();
-    format!("ARRAY[{}]", literals.join(", "))
-}
-
-/// Substitutes `$1` with a key literal and `$2` with the bound, then adds the traceparent.
-fn bind_query(template: &str, keys_literal: &str, bound: impl Display) -> String {
-    let query = template
-        .replace("$1", keys_literal)
-        .replace("$2", &bound.to_string());
-    db_query::add_trace_traceparent_to_query(&query)
-}
-
-/// Runs `query` under the API query timeout. `what` names the query in the timeout log.
-async fn fetch_rows(
+/// Runs `sql_template` for `keys` bounded at `slot` under the API query timeout.
+async fn fetch_accounts(
     state: &CloudbreakRpcState,
-    query: &str,
-    span: tracing::Span,
+    sql_template: &str,
+    keys: &[Pubkey],
+    slot: u64,
     what: &str,
 ) -> Result<Vec<PgRow>, RpcError> {
+    let keys_literal = if sql_template.contains("unnest($1)") {
+        bytea_array_literal(keys)
+    } else {
+        bytea_literal(&keys[0])
+    };
+    let sql = sql_template.replace("$1", &keys_literal);
+    let sql = sql.replace("$2", &slot.to_string());
+    let sql = db_query::add_trace_traceparent_to_query(&sql);
+
+    tracing::debug!(target: "account_sql", "## {what} sql: {}", sql);
+
     let pool = state.database.get_postgres_connection_pool();
-    timeout(
-        state.queries_timeout,
-        sqlx::raw_sql(query).fetch_all(pool).instrument(span),
-    )
+    timeout(state.queries_timeout, async {
+        let span = tracing::info_span!("account_db", method = what);
+        sqlx::raw_sql(&sql).fetch_all(pool).instrument(span).await
+    })
     .await
     .map_err(|_elapsed| {
         tracing::error!("{what} query timed out");
@@ -634,12 +386,31 @@ async fn fetch_rows(
     })
 }
 
+fn pubkey_column(row: &PgRow, column: &str) -> Result<Pubkey, RpcError> {
+    let bytes: Vec<u8> = row.try_get(column).map_err(|e| {
+        tracing::error!("missing {column} column returned by DB: {e}");
+        RpcError::InternalError
+    })?;
+    Pubkey::try_from(bytes.as_slice()).map_err(|_| {
+        tracing::error!("invalid {column} bytes returned by DB");
+        RpcError::InternalError
+    })
+}
+
+fn bytea_literal(pubkey: &Pubkey) -> String {
+    format!("'\\x{}'::bytea", hex::encode(pubkey.as_ref()))
+}
+
+fn bytea_array_literal(pubkeys: &[Pubkey]) -> String {
+    let literals: Vec<String> = pubkeys.iter().map(bytea_literal).collect();
+    format!("ARRAY[{}]", literals.join(", "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::methods::{LEGACY_TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID};
     use crate::slot_syncronizer::SlotData;
-    use solana_account_decoder_client_types::UiAccountData;
 
     fn slots(confirmed: u64, finalized: u64, healthy: bool) -> SlotSyncronizerData {
         SlotSyncronizerData {
@@ -692,16 +463,6 @@ mod tests {
         data
     }
 
-    /// An initialized SPL token account with no optional fields.
-    fn token_account_data(mint: &Pubkey, amount: u64) -> Vec<u8> {
-        let mut data = vec![0u8; 165];
-        data[..32].copy_from_slice(mint.as_ref());
-        data[32..64].copy_from_slice(Pubkey::new_unique().as_ref());
-        data[64..72].copy_from_slice(&amount.to_le_bytes());
-        data[108] = 1;
-        data
-    }
-
     #[test]
     fn view_mint_overrides_joined_mint() {
         let mint = live(TOKEN_2022_PROGRAM_ID, 1, mint_data(6));
@@ -719,79 +480,54 @@ mod tests {
         assert_eq!(mint_source(Lookup::Miss, false), MintSource::Query);
     }
 
-    fn parsed_decimals(account: UiAccount) -> Option<u64> {
-        let UiAccountData::Json(parsed) = account.data else {
-            return None;
-        };
-        parsed.parsed["info"]["tokenAmount"]["decimals"].as_u64()
+    #[test]
+    fn assemble_keeps_key_order_across_live_closed_and_miss() {
+        let mut keys: Vec<Pubkey> = (0..5).map(|_| Pubkey::new_unique()).collect();
+        // A repeated key answers at every position, as in main.
+        keys[4] = keys[2];
+        let in_view = live(Pubkey::new_unique(), 7, vec![]);
+        let lookups = [
+            Lookup::Live(&in_view),
+            Lookup::Closed,
+            Lookup::Miss,
+            Lookup::Miss,
+            Lookup::Miss,
+        ];
+        let mut found = HashMap::new();
+        found.insert(
+            keys[2],
+            Account {
+                lamports: 9,
+                owner: Pubkey::new_unique(),
+                executable: false,
+                rent_epoch: 0,
+                data: Arc::new(vec![]),
+                mint_data: None,
+            },
+        );
+
+        let accounts = assemble(&keys, &lookups, found);
+        let lamports: Vec<Option<u64>> = accounts
+            .iter()
+            .map(|account| account.as_ref().map(|account| account.lamports))
+            .collect();
+        assert_eq!(lamports, vec![Some(7), None, Some(9), None, Some(9)]);
     }
 
     #[test]
-    fn encode_account_uses_the_resolved_mint_data() {
+    fn token_mint_needs_a_token_owner_and_32_bytes_of_data() {
         let mint = Pubkey::new_unique();
-        let pubkey = Pubkey::new_unique();
-        let account = AccountParts::from_live(&live(
-            LEGACY_TOKEN_PROGRAM_ID,
-            2_039_280,
-            token_account_data(&mint, 5_000),
-        ));
-        let encode = |mint_data: Option<&[u8]>| {
-            encode_account(
-                &pubkey,
-                account.clone(),
-                mint_data,
-                UiAccountEncoding::JsonParsed,
-                None,
-                0,
-            )
-            .unwrap()
-        };
-        assert_eq!(parsed_decimals(encode(Some(&mint_data(6)))), Some(6));
-        assert_eq!(parsed_decimals(encode(Some(&mint_data(9)))), Some(9));
-        // No mint data cannot be parsed as a token account, as on the Postgres path.
-        assert_eq!(parsed_decimals(encode(None)), None);
-    }
+        let mut data = vec![0u8; 165];
+        data[..32].copy_from_slice(mint.as_ref());
 
-    #[test]
-    fn sql_substring_matches_postgres_on_short_data() {
-        let data = [1u8, 2, 3, 4, 5];
-        assert_eq!(sql_substring(&data, 1, 2), &[2, 3]);
-        assert_eq!(sql_substring(&data, 3, 8), &[4, 5]);
-        assert!(sql_substring(&data, 64, 8).is_empty());
-    }
+        let account = Account::from_live(&live(LEGACY_TOKEN_PROGRAM_ID, 1, data.clone()));
+        assert_eq!(account.token_mint(), Some(mint));
+        assert!(account.mint_data().is_empty());
 
-    #[test]
-    fn token_reads_decode_view_data_like_the_confirmed_path() {
-        let mint = Pubkey::new_unique();
-        let pubkey = Pubkey::new_unique();
-        let data = token_account_data(&mint, 5_000);
-        let balance = |data: &[u8], owner: &Pubkey| {
-            token_account_balance(
-                &pubkey,
-                owner,
-                sql_substring(data, 64, 8),
-                sql_substring(data, 0, 32),
-                &mint_data(6),
-                0,
-            )
-        };
+        let short = Account::from_live(&live(LEGACY_TOKEN_PROGRAM_ID, 1, data[..10].to_vec()));
+        assert_eq!(short.token_mint(), None);
 
-        let amount = balance(&data, &LEGACY_TOKEN_PROGRAM_ID).unwrap();
-        assert_eq!((amount.amount.as_str(), amount.decimals), ("5000", 6));
-        assert!(matches!(
-            balance(&data, &Pubkey::new_unique()),
-            Err(RpcError::NotATokenAccount { .. })
-        ));
-        assert!(matches!(
-            balance(&data[..70], &LEGACY_TOKEN_PROGRAM_ID),
-            Err(RpcError::InternalError)
-        ));
-
-        let supply = token_supply(&mint, &TOKEN_2022_PROGRAM_ID, &mint_data(9), 0).unwrap();
-        assert_eq!((supply.amount.as_str(), supply.decimals), ("0", 9));
-        assert!(matches!(
-            token_supply(&mint, &LEGACY_TOKEN_PROGRAM_ID, &data[..10], 0),
-            Err(RpcError::MintDataNotFound { .. })
-        ));
+        let other = Account::from_live(&live(Pubkey::new_unique(), 1, data));
+        assert_eq!(other.token_mint(), None);
     }
 }

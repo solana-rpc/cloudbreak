@@ -3,6 +3,7 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+use cloudbreak_core::modules::processed::{Lookup, ProcessedView};
 use sea_orm::sqlx::Row;
 use sea_orm::sqlx::{self};
 use solana_pubkey::Pubkey;
@@ -13,7 +14,7 @@ use tracing::Instrument;
 
 use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
-use crate::methods::processed::{self, Route};
+use crate::methods::processed;
 use crate::{db_query, metrics};
 
 #[tracing::instrument(name = "get_balance_rpc", skip_all, fields(pubkey = %pubkey))]
@@ -30,17 +31,41 @@ pub async fn get_balance(
         .parse()
         .map_err(|_| RpcError::PubkeyValidationError(pubkey.clone()))?;
 
-    let commitment = match processed::route(state, config.commitment, "getBalance")? {
-        Route::View(view) => {
-            return processed::get_balance(state, &view, &pubkey, config.min_context_slot).await;
+    let read = processed::read_at(state, config.commitment, "getBalance")?;
+
+    // A key written in the view answers from memory at the view head.
+    if let Some(view) = &read.view
+        && let Some(lamports) = view_lamports(view, &pubkey)
+    {
+        if let Some(min_context_slot) = config.min_context_slot
+            && view.slot < min_context_slot
+        {
+            return Err(RpcError::RpcSlotBehindMinContextSlot {
+                rpc_slot: view.slot,
+            });
         }
-        Route::Db(commitment) => commitment,
+        return Ok(RpcResponse {
+            context: RpcResponseContext {
+                slot: view.slot,
+                api_version: None,
+            },
+            value: lamports,
+        });
+    }
+
+    // The slot bound is the view anchor, or the slot at the commitment.
+    let slot_bound = match &read.view {
+        Some(view) => view.anchor_slot.to_string(),
+        None => format!(
+            "(SELECT slot FROM slots WHERE commitment = {})",
+            read.commitment as i32
+        ),
     };
 
     let sql_template = include_str!("../db/getBalance.sql");
     let pubkey_hex = format!("'\\x{}'::bytea", hex::encode(pubkey.as_ref()));
     let sql = sql_template.replace("$1", &pubkey_hex);
-    let sql = sql.replace("$2", &(commitment as i32).to_string());
+    let sql = sql.replace("$2", &slot_bound);
     let sql = db_query::add_trace_traceparent_to_query(&sql);
 
     tracing::debug!(target: "get_balance_sql", "## sql: {}", sql);
@@ -63,12 +88,16 @@ pub async fn get_balance(
     let row = rows.first().ok_or_else(|| {
         tracing::error!(
             "getBalance: slots table missing entry for commitment {:?}",
-            commitment
+            read.commitment
         );
         RpcError::InternalError
     })?;
 
-    let context_slot = row.get::<i64, _>("context_slot") as u64;
+    // On a view the context slot is the view head.
+    let context_slot = match &read.view {
+        Some(view) => view.slot,
+        None => row.get::<i64, _>("context_slot") as u64,
+    };
 
     if let Some(min_context_slot) = config.min_context_slot
         && context_slot < min_context_slot
@@ -109,4 +138,13 @@ pub async fn get_balance(
         },
         value: lamports as u64,
     })
+}
+
+/// The lamports of a key written in the view: its balance when live, 0 when closed.
+fn view_lamports(view: &ProcessedView, pubkey: &Pubkey) -> Option<u64> {
+    match view.lookup(pubkey) {
+        Lookup::Live(account) => Some(account.lamports),
+        Lookup::Closed => Some(0),
+        Lookup::Miss => None,
+    }
 }

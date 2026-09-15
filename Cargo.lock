@@ -3566,7 +3566,6 @@ dependencies = [
  "clap",
  "futures",
  "hex",
- "humantime",
  "rand 0.8.5",
  "reqwest",
  "sea-orm",
@@ -3577,8 +3576,6 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
- "yellowstone-grpc-client",
- "yellowstone-grpc-proto",
  "zstd",
 ]
 
