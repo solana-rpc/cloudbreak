@@ -4,6 +4,7 @@
  */
 
 use cloudbreak_core::ApiConfig;
+use cloudbreak_core::metrics::PROCESSED_CONFIRM_LATENCY_MS;
 use hyper::StatusCode;
 use prometheus::{
     HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
@@ -158,6 +159,16 @@ lazy_static::lazy_static! {
         ),
         &["used"],
     ).unwrap();
+
+    /// Processed commitment requests for the methods served from processed blocks,
+    /// labelled by `route` (`view` or `degraded`) and `reason` (`none` or the fallback reason).
+    pub static ref CLOUDBREAK_API_PROCESSED_REQUESTS_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new(
+            "cloudbreak_api_processed_requests_total",
+            "Processed commitment requests, labelled by method, route and degrade reason"
+        ),
+        &["method", "route", "reason"],
+    ).unwrap();
 }
 
 /// We use a guard to increment the in-flight requests metric when a request starts and
@@ -249,6 +260,11 @@ pub fn setup_metrics(config: &ApiConfig) -> anyhow::Result<()> {
             &METRICS_REGISTRY,
             config.metrics.client_ip_bandwidth_enabled,
         );
+
+        if config.processed_accounts_enabled() {
+            register!(CLOUDBREAK_API_PROCESSED_REQUESTS_TOTAL);
+            register!(PROCESSED_CONFIRM_LATENCY_MS);
+        }
     });
 
     // Set the max connections as a reference metric at startup

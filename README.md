@@ -27,15 +27,11 @@ The API server exposes the following JSON-RPC methods:
 | `getLargestAccounts`         | Returns the 20 largest accounts by lamport balance, with `filter: circulating\|nonCirculating` support. Optional; requires `[largest-accounts]` on both indexer and API. See [Largest Accounts](#largest-accounts-getlargestaccounts-gettokenlargestaccounts). |
 | `getSupply`                  | Returns the total and circulating supply in lamports plus the non-circulating account list. Optional; requires the `[supply]` section on the indexer and the `[supply]` section on the API. See [Supply](#supply-getsupply). |
 
-Only **confirmed** and **finalized** commitment levels are fully supported. By default, requests with `processed` commitment return an error. This can be overridden via the `processed-commitment` configuration option (see [API Configuration](#api-server-cloudbreakapitoml)).
+**Confirmed** and **finalized** commitment levels are supported for every method. With the optional `[processed-accounts]` section, `getAccountInfo`, `getMultipleAccounts`, `getBalance`, `getTokenAccountBalance` and `getTokenSupply` also serve **processed** commitment from an in-memory block feed. Every other method handles `processed` through the `processed-commitment` option, which rejects it by default (see [API Configuration](#api-server-cloudbreakapitoml)).
 
 > **Note on `getVersion`.** The `solana-core` field returned by Cloudbreak is a *composite* string of the form `"<upstream-solana-core>-cloudbreak<cloudbreak-version>"` (e.g. `"2.0.21-cloudbreak0.1.0"`). The upstream half is the `solana-core` version reported by the gRPC source the indexer is subscribed to (persisted to the `environment_info` table on indexer startup); the suffix is Cloudbreak's own crate version. This lets clients see *both* what cluster they're effectively talking to and which Cloudbreak build is serving them. If the indexer has never written an upstream version, the prefix falls back to `"unknown"`. The response is cached in-process for 10 minutes.
 
 ## Roadmap
-
-### Processed Commitment Level
-
-Full native support for the `processed` commitment level is planned as an **optional plugin**, allowing operators to enable it when low-latency reads of unconfirmed state are needed. In the meantime, operators can set `processed-commitment = "use-confirmed"` in the API config to respond with `confirmed` data instead of rejecting `processed` requests.
 
 ### Paginated Responses
 
@@ -511,6 +507,27 @@ Example:
 
 ```toml
 processed-commitment = "use-confirmed"
+```
+
+#### `[processed-accounts]` (optional)
+
+Serves `processed` commitment for `getAccountInfo`, `getMultipleAccounts`, `getBalance`, `getTokenAccountBalance` and `getTokenSupply`. The API subscribes to Yellowstone blocks at processed commitment and keeps the blocks around the Postgres confirmed slot in memory. A key written in those blocks is answered from memory. Any other key reads Postgres at the confirmed slot. When the blocks cannot be linked to the confirmed slot, a processed request answers exactly as a confirmed request would, even with `processed-commitment = "reject"`. Other methods keep following `processed-commitment`.
+
+Requires `[slot-syncronizer]` with `enabled = true`. Startup fails without it. Each API instance carries its own block feed.
+
+| Field      | Type     | Default | Description                                                               |
+| ---------- | -------- | ------- | ------------------------------------------------------------------------- |
+| `enabled`  | `bool`   | `false` | Enable processed commitment for the methods above.                        |
+| `endpoint` | `string` | `""`    | Yellowstone gRPC endpoint that allows processed commitment and interslot updates. |
+| `x-token`  | `string` | none    | Yellowstone gRPC access token.                                            |
+
+Example:
+
+```toml
+[processed-accounts]
+enabled = true
+endpoint = "https://grpc.example:443"
+x-token = "..."
 ```
 
 #### `unhealthy-response` (top-level, optional)

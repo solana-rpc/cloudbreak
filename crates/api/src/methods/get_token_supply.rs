@@ -3,23 +3,19 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-use sea_orm::sqlx::Row;
-use sea_orm::sqlx::{self};
 use solana_account_decoder::parse_token::token_amount_to_ui_amount_v3;
 use solana_account_decoder_client_types::token::UiTokenAmount;
-use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
+use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::response::{Response as RpcResponse, RpcResponseContext};
 use spl_token_2022::extension::StateWithExtensions;
 use spl_token_2022::state::Mint;
-use tokio::time::timeout;
-use tracing::Instrument;
 
 use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
 use crate::methods::token::parse_additional_mint_data;
-use crate::methods::{is_token_program, resolve_commitment};
-use crate::{db_query, metrics};
+use crate::methods::{is_token_program, processed};
+use crate::metrics;
 
 #[tracing::instrument(name = "get_token_supply_rpc", skip_all, fields(pubkey = %mint))]
 pub async fn get_token_supply(
@@ -33,47 +29,30 @@ pub async fn get_token_supply(
         .parse()
         .map_err(|_| RpcError::PubkeyValidationError(mint.clone()))?;
 
-    let commitment = commitment
-        .map(|commitment_config| {
-            resolve_commitment(commitment_config.commitment, state.processed_commitment)
-        })
-        .transpose()?
-        .unwrap_or(CommitmentLevel::Finalized);
+    let read = processed::account_read(state, commitment, "getTokenSupply")?;
 
-    let (latest_slot, block_time) = state.latest_slot_and_block_time(commitment).await?;
+    let (latest_slot, block_time) = read.slot_and_block_time(state).await?;
 
     let sql_template = include_str!("../db/getAccountInfo.sql");
-    let pubkey_hex = format!("'\\x{}'::bytea", hex::encode(pubkey.as_ref()));
-    let sql = sql_template.replace("$1", &pubkey_hex);
-    let sql = sql.replace("$2", &latest_slot.to_string());
-    let sql = db_query::add_trace_traceparent_to_query(&sql);
+    let accounts = processed::read_accounts(
+        state,
+        &read,
+        std::slice::from_ref(&pubkey),
+        sql_template,
+        latest_slot,
+        false,
+        "getTokenSupply",
+    )
+    .await?;
 
-    tracing::debug!(target: "get_token_supply_sql", "## sql: {}", sql);
-
-    let pool = state.database.get_postgres_connection_pool();
-    let rows = timeout(state.queries_timeout, async {
-        let span = tracing::info_span!("get_token_supply_db");
-        sqlx::raw_sql(&sql).fetch_all(pool).instrument(span).await
-    })
-    .await
-    .map_err(|_elapsed| {
-        tracing::error!("getTokenSupply query timed out");
-        RpcError::InternalError
-    })?
-    .map_err(|e| {
-        tracing::error!("Database query error: {}", e);
-        RpcError::InternalError
-    })?;
-
-    let Some(row) = rows.first() else {
+    let Some(account) = accounts.into_iter().next().flatten() else {
         // Account not in DB (or its latest version was closed)
         return Err(RpcError::AccountNotFound {
             pubkey: pubkey.to_string(),
         });
     };
 
-    let owner_bytes: Vec<u8> = row.get("owner");
-    let owner = Pubkey::try_from(owner_bytes.as_slice()).map_err(|_| RpcError::InternalError)?;
+    let owner = account.owner;
 
     if !state.indexer_filter.is_program_selected(&owner) {
         return Err(RpcError::AccountOwnerExcluded {
@@ -88,15 +67,15 @@ pub async fn get_token_supply(
         });
     }
 
-    let data: Vec<u8> = row.get("data");
+    let data: &[u8] = &account.data;
 
     let mint_state =
-        StateWithExtensions::<Mint>::unpack(&data).map_err(|_| RpcError::MintDataNotFound {
+        StateWithExtensions::<Mint>::unpack(data).map_err(|_| RpcError::MintDataNotFound {
             mint: pubkey.to_string(),
         })?;
 
     let supply = mint_state.base.supply;
-    let additional_mint_data = parse_additional_mint_data(&pubkey, &data, block_time);
+    let additional_mint_data = parse_additional_mint_data(&pubkey, data, block_time);
     let additional_data = additional_mint_data
         .as_ref()
         .and_then(|d| d.spl_token_additional_data.as_ref())
