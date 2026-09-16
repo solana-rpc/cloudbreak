@@ -4,6 +4,7 @@
  */
 
 use sea_orm::DbErr;
+use solana_account_decoder::MAX_BASE58_BYTES;
 use solana_rpc_client_api::custom_error::MinContextSlotNotReachedErrorData;
 
 #[derive(thiserror::Error, Debug)]
@@ -54,6 +55,12 @@ pub enum RpcError {
     NotATokenMint { mint: String },
     #[error("Invalid param: could not find mint ({mint})")]
     MintDataNotFound { mint: String },
+    /// Matches Agave's `encode_account` limit for `binary` / `base58` encodings.
+    #[error(
+        "Encoded binary (base 58) data should be less than {} bytes, please use Base64 encoding.",
+        MAX_BASE58_BYTES
+    )]
+    Base58DataTooLarge,
     /// The requested RPC method is not enabled in this node's API config.
     #[error("Method not found")]
     MethodNotFound,
@@ -91,6 +98,7 @@ impl RpcError {
             RpcError::NotATokenAccount { .. } => -32602,
             RpcError::NotATokenMint { .. } => -32602,
             RpcError::MintDataNotFound { .. } => -32602,
+            RpcError::Base58DataTooLarge => -32600,
             RpcError::MethodNotFound => -32601,
         }
     }

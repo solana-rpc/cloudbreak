@@ -608,12 +608,9 @@ pub fn check_account_data_len_for_encoding(
             .unwrap_or(account_data_length)
             > MAX_BASE58_BYTES
     {
-        let message = format!(
-            "Encoded binary (base 58) data should be less than {MAX_BASE58_BYTES} bytes, please \
-         use Base64 encoding. pubkey: {pubkey}"
-        );
+        tracing::debug!("Account {pubkey} data is too large for base58 encoding");
 
-        return Err(RpcError::InvalidParamsWithMessage(message));
+        return Err(RpcError::Base58DataTooLarge);
     }
 
     Ok(())
