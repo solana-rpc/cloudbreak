@@ -112,16 +112,31 @@ pub async fn get_token_account_balance(
     let mint_pubkey =
         Pubkey::try_from(mint_pubkey_bytes.as_slice()).map_err(|_| RpcError::InternalError)?;
 
-    // Pass mint_data (or empty) unconditionally so the WSOL native_mint short-circuit
-    // can hardcode decimals=9 even when the mint account itself isn't in our DB —
-    // same trick we use in gAI / gTABO.
-    let mint_data: Vec<u8> = row.try_get("mint_data").ok().unwrap_or_default();
-    let additional_mint_data = parse_additional_mint_data(&mint_pubkey, &mint_data, block_time);
+    // `mint_data` is NULL when the LEFT JOIN finds no live mint row. WSOL needs no
+    // mint row: parse_additional_mint_data hardcodes its decimals.
+    let mint_data: Option<Vec<u8>> = row.try_get("mint_data").map_err(|e| {
+        tracing::error!(
+            "getTokenAccountBalance: invalid mint_data for pubkey {}: {}",
+            pubkey,
+            e
+        );
+        RpcError::InternalError
+    })?;
+    if mint_data.is_none() && mint_pubkey != spl_token_interface::native_mint::id() {
+        return Err(RpcError::MintDataNotFound {
+            mint: mint_pubkey.to_string(),
+        });
+    }
+    let additional_mint_data = parse_additional_mint_data(
+        &mint_pubkey,
+        mint_data.as_deref().unwrap_or_default(),
+        block_time,
+    );
 
     let additional_data = additional_mint_data
         .as_ref()
         .and_then(|d| d.spl_token_additional_data.as_ref())
-        .ok_or_else(|| RpcError::MintDataNotFound {
+        .ok_or_else(|| RpcError::TokenMintCouldNotBeUnpacked {
             mint: mint_pubkey.to_string(),
         })?;
 

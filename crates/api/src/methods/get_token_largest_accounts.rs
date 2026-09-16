@@ -69,8 +69,8 @@ pub async fn get_token_largest_accounts(
     })?;
 
     let Some(mint_row) = mint_rows.first() else {
-        return Err(RpcError::AccountNotFound {
-            pubkey: pubkey.to_string(),
+        return Err(RpcError::MintDataNotFound {
+            mint: pubkey.to_string(),
         });
     };
     let owner_bytes: Vec<u8> = mint_row.get("owner");
@@ -81,19 +81,20 @@ pub async fn get_token_largest_accounts(
             owner: owner.to_string(),
         });
     }
-    if !is_token_program(&owner) {
-        return Err(RpcError::NotATokenMint {
-            mint: pubkey.to_string(),
-        });
-    }
+    // Agave unpacks the mint data before it checks the owner.
     let data: Vec<u8> = mint_row.get("data");
     let additional_mint_data = parse_additional_mint_data(&pubkey, &data, block_time);
     let additional_data = additional_mint_data
         .as_ref()
         .and_then(|d| d.spl_token_additional_data.as_ref())
-        .ok_or_else(|| RpcError::MintDataNotFound {
+        .ok_or_else(|| RpcError::TokenMintCouldNotBeUnpacked {
             mint: pubkey.to_string(),
         })?;
+    if !is_token_program(&owner) {
+        return Err(RpcError::NotATokenMint {
+            mint: pubkey.to_string(),
+        });
+    }
 
     // Record presence is the tracked-mints signal: the indexer persists a record
     // for exactly the mints it tracks, so an absent record means "not tracked".

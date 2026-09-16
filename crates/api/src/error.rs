@@ -42,19 +42,21 @@ pub enum RpcError {
         "Account {pubkey} is owned by {owner}, which is excluded from this indexer's program filter; cannot serve this account"
     )]
     AccountOwnerExcluded { pubkey: String, owner: String },
-    /// Matches Agave's response for missing accounts in token-account RPCs
-    #[error("Invalid param: could not find account ({pubkey})")]
+    // Token errors carry the key for logs only; the messages are Agave's exact text.
+    #[error("Invalid param: could not find account")]
     AccountNotFound { pubkey: String },
-    /// Matches Agave's response when the account exists but is not owned by
-    /// SPL Token / Token-2022 in token-account RPCs.
-    #[error("Invalid param: not a Token account ({pubkey})")]
+    #[error("Invalid param: not a Token account")]
     NotATokenAccount { pubkey: String },
-    /// Matches Agave's response when the mint account exists but is not owned
-    /// by SPL Token / Token-2022 in mint-oriented RPCs.
-    #[error("Invalid param: not a Token mint ({mint})")]
+    #[error("Invalid param: not a Token mint")]
     NotATokenMint { mint: String },
-    #[error("Invalid param: could not find mint ({mint})")]
+    #[error("Invalid param: could not find mint")]
     MintDataNotFound { mint: String },
+    /// `getTokenSupply`: the mint account data does not unpack as a mint.
+    #[error("Invalid param: mint could not be unpacked")]
+    MintCouldNotBeUnpacked { mint: String },
+    /// `getTokenAccountBalance` / `getTokenLargestAccounts`: the mint data does not unpack.
+    #[error("Invalid param: Token mint could not be unpacked")]
+    TokenMintCouldNotBeUnpacked { mint: String },
     /// Matches Agave's `encode_account` limit for `binary` / `base58` encodings.
     #[error(
         "Encoded binary (base 58) data should be less than {} bytes, please use Base64 encoding.",
@@ -103,6 +105,8 @@ impl RpcError {
             RpcError::NotATokenAccount { .. } => -32602,
             RpcError::NotATokenMint { .. } => -32602,
             RpcError::MintDataNotFound { .. } => -32602,
+            RpcError::MintCouldNotBeUnpacked { .. } => -32602,
+            RpcError::TokenMintCouldNotBeUnpacked { .. } => -32602,
             RpcError::Base58DataTooLarge => -32600,
             RpcError::MethodNotFound => -32601,
         }
