@@ -31,7 +31,7 @@ pub async fn get_token_supply(
 
     let pubkey: Pubkey = mint
         .parse()
-        .map_err(|_| RpcError::PubkeyValidationError(mint.clone()))?;
+        .map_err(|e| RpcError::PubkeyValidationError(format!("{e:?}")))?;
 
     let commitment = commitment
         .map(|commitment_config| {

@@ -243,7 +243,7 @@ cargo run -p cloudbreak -- --config ./cloudbreak.query-tracker.toml query-tracke
 **First startup notes:**
 
 - If `[snapshot]` is configured, the indexer will download a full Solana snapshot on first start. This can be **very large** (100+ GB for mainnet) and take significant time. With the default `tracker-config.yml` (which uses the public, rate-limited `https://api.mainnet.solana.com` endpoint), the download can also be throttled, so allow extra time or point `tracker-config.yml` at your own snapshot source — see [Cluster Tracker](#cluster-tracker). For a lighter local setup, either remove the `[snapshot]` section to skip snapshot loading entirely (the indexer will begin from live gRPC data only), or index a small program like `Stake11111111111111111111111111111111111111`.
-- **The correct, healthy steady state requires the snapshot to be loaded.** When `[snapshot]` is configured, the indexer stays unhealthy until snapshot processing finishes — the database holds only the partial data streamed in live from gRPC until then, and the `service_health` row (and `getHealth`) stays unhealthy. This is expected: `getSlot` works immediately as data flows in, but health is intentionally the last thing to clear, and while it is unhealthy the slot-gated account methods (`getAccountInfo`, `getMultipleAccounts`, `getProgramAccounts`, the token methods, `simulateTransaction`) return `NODE_UNHEALTHY`. **Running without `[snapshot]` is only meant for a quick smoke test of the full setup, or for iterating on a code change that doesn't need a complete dataset** — in that mode there is no startup snapshot to wait on, so the node reports **healthy** as soon as it begins processing blocks and serves those account methods against the partial live dataset (do **not** treat a no-snapshot node as a source of complete state). See [Troubleshooting: `getHealth` returns `INTERNAL_ERROR`](#gethealth-returns-internal_error) for details.
+- **The correct, healthy steady state requires the snapshot to be loaded.** When `[snapshot]` is configured, the indexer stays unhealthy until snapshot processing finishes — the database holds only the partial data streamed in live from gRPC until then, and the `service_health` row (and `getHealth`) stays unhealthy. This is expected: `getSlot` works immediately as data flows in, but health is intentionally the last thing to clear, and while it is unhealthy the slot-gated account methods (`getAccountInfo`, `getMultipleAccounts`, `getProgramAccounts`, the token methods, `simulateTransaction`) return JSON-RPC error `-32005` (`Node is unhealthy`). **Running without `[snapshot]` is only meant for a quick smoke test of the full setup, or for iterating on a code change that doesn't need a complete dataset** — in that mode there is no startup snapshot to wait on, so the node reports **healthy** as soon as it begins processing blocks and serves those account methods against the partial live dataset (do **not** treat a no-snapshot node as a source of complete state). See [Troubleshooting: `getHealth` returns `-32603 Internal error`](#gethealth-returns--32603-internal-error) for details.
 - The API example config has `[tracing] enabled = true`, which sends traces to the Tempo instance from Docker Compose. If you're not running the compose stack, set `enabled = false` or remove the `[tracing]` section to avoid connection errors in logs.
 
 #### Manual PostgreSQL Setup (Alternative)
@@ -519,7 +519,7 @@ Controls how the API responds to requests while the node is unhealthy (the `slot
 
 | Value                | Description                                                                                                      |
 | -------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| `"json-rpc-error"`   | **(default)** Return a `NODE_UNHEALTHY` JSON-RPC error (code `-32005`) with HTTP `200 OK`.                        |
+| `"json-rpc-error"`   | **(default)** Return a JSON-RPC error `-32005` (`Node is unhealthy`) with HTTP `200 OK`.                      |
 | `"http-unavailable"` | Return an HTTP `503 Service Unavailable` response instead.                                                        |
 
 > **Note:** `http-unavailable` only applies to single requests. Batch requests always return HTTP `200 OK` with per-item JSON-RPC errors, since an HTTP status cannot be expressed per batch item.
@@ -1054,14 +1054,14 @@ curl http://localhost:8875/debug/modules/self_healing
 
 If the `[snapshot]` section is configured, the self-healing mechanism will automatically attempt to fill gaps via incremental snapshots fetched through the cluster tracker. If it's not configured (or the tracker has no source producing usable snapshots), gaps cannot be repaired automatically and require manual intervention (e.g. re-running a snapshot or restarting the indexer).
 
-### `getHealth` returns `INTERNAL_ERROR`
+### `getHealth` returns `-32603 Internal error`
 
 The `service_health` row is only flipped to healthy **after the indexer finishes snapshot processing**. The flag is never set from live gRPC streaming alone, by design — gRPC catch-up cannot produce a complete account state on its own, so the API has no way to know the dataset is correct until a snapshot has been ingested.
 
 This produces two distinct situations:
 
 - **`[snapshot]` is configured and the indexer is still loading it.** `getHealth` will return an error for the entire duration of snapshot processing (can be hours for mainnet) and clear automatically once it completes. This is expected. `getSlot` and `getProgramAccounts` work normally during this window — only `getHealth` is gated.
-- **`[snapshot]` is _not_ configured (no-snapshot / smoke-test mode).** `getHealth` will return `INTERNAL_ERROR` **permanently**, because the only code path that sets the health flag is snapshot completion. This is also expected: the no-snapshot mode is only meant for verifying the full setup wires up correctly, or for iterating on a code change that doesn't require a complete dataset. Add a `[snapshot]` section to the indexer config if you want `getHealth` to eventually clear.
+- **`[snapshot]` is _not_ configured (no-snapshot / smoke-test mode).** `getHealth` will return `-32603 Internal error` **permanently**, because the only code path that sets the health flag is snapshot completion. This is also expected: the no-snapshot mode is only meant for verifying the full setup wires up correctly, or for iterating on a code change that doesn't require a complete dataset. Add a `[snapshot]` section to the indexer config if you want `getHealth` to eventually clear.
 
 If you've configured `[snapshot]` and `getHealth` still isn't clearing after the snapshot finished downloading, check the indexer logs for snapshot-processing errors and the `service_health` row directly:
 

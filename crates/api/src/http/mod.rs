@@ -276,17 +276,31 @@ impl<T: Serialize> JsonRpcResponse<T> {
         }
     }
 
-    pub fn error(id: serde_json::Value, code: i32, message: String) -> JsonRpcResponse<()> {
+    pub fn error(
+        id: serde_json::Value,
+        code: i32,
+        message: String,
+        data: Option<serde_json::Value>,
+    ) -> JsonRpcResponse<()> {
         JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
             result: None,
             error: Some(JsonRpcError {
                 code,
                 message,
-                data: None,
+                data,
             }),
             id,
         }
+    }
+
+    pub fn from_rpc_error(id: serde_json::Value, err: &RpcError) -> JsonRpcResponse<()> {
+        Self::error(
+            id,
+            err.to_numeric_code(),
+            err.to_string(),
+            err.to_error_data(),
+        )
     }
 }
 
@@ -323,18 +337,17 @@ fn extract_optional_param<T: serde::de::DeserializeOwned>(
 }
 
 fn make_error_response(id: serde_json::Value, code: i32, message: String) -> HttpHandlerResponse {
-    make_error_response_with_status(id, code, message, StatusCode::OK)
+    let response = JsonRpcResponse::<()>::error(id, code, message, None);
+    HttpHandlerResponse {
+        status: StatusCode::OK,
+        body: ResponseBody::Buffered(serde_json::to_vec(&response).unwrap()),
+    }
 }
 
-fn make_error_response_with_status(
-    id: serde_json::Value,
-    code: i32,
-    message: String,
-    status: StatusCode,
-) -> HttpHandlerResponse {
-    let response = JsonRpcResponse::<()>::error(id, code, message);
+fn make_rpc_error_response(id: serde_json::Value, err: &RpcError) -> HttpHandlerResponse {
+    let response = JsonRpcResponse::<()>::from_rpc_error(id, err);
     HttpHandlerResponse {
-        status,
+        status: http_status_for_error(err),
         body: ResponseBody::Buffered(serde_json::to_vec(&response).unwrap()),
     }
 }

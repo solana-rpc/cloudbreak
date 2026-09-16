@@ -698,7 +698,7 @@ pub enum ProcessedCommitmentBehavior {
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum UnhealthyResponseBehavior {
-    /// Return a JSON-RPC error (`NODE_UNHEALTHY`) with HTTP `200 OK` (default).
+    /// Return JSON-RPC error `-32005` (`Node is unhealthy`) with HTTP `200 OK` (default).
     #[default]
     JsonRpcError,
     /// Return an HTTP `503 Service Unavailable` response instead.

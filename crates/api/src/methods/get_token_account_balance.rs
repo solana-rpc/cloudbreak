@@ -29,7 +29,7 @@ pub async fn get_token_account_balance(
 
     let pubkey: Pubkey = pubkey
         .parse()
-        .map_err(|_| RpcError::PubkeyValidationError(pubkey.clone()))?;
+        .map_err(|e| RpcError::PubkeyValidationError(format!("{e:?}")))?;
 
     let commitment = commitment
         .map(|commitment_config| {

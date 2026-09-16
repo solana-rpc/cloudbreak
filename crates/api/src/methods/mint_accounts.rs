@@ -29,7 +29,7 @@ pub async fn get_token_accounts_by_mint(
 ) -> Result<GpaStreamingResponse, RpcError> {
     let mint_pubkey = mint
         .parse::<Pubkey>()
-        .map_err(|_| RpcError::InvalidParams)?;
+        .map_err(|e| RpcError::PubkeyValidationError(format!("{e:?}")))?;
 
     let config = config.unwrap_or_default();
     let program = config

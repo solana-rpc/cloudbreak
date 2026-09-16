@@ -37,7 +37,7 @@ pub async fn get_account_info(
 
     let pubkey: Pubkey = pubkey
         .parse()
-        .map_err(|_| RpcError::PubkeyValidationError(pubkey.clone()))?;
+        .map_err(|e| RpcError::PubkeyValidationError(format!("{e:?}")))?;
 
     let commitment = config
         .commitment

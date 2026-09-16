@@ -64,7 +64,7 @@ pub async fn get_program_accounts(
 
     let program = program
         .parse::<solana_pubkey::Pubkey>()
-        .map_err(|_| RpcError::InvalidParams)?;
+        .map_err(|e| RpcError::PubkeyValidationError(format!("{e:?}")))?;
 
     let encoding = config
         .account_config

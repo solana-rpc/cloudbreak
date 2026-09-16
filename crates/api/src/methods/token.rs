@@ -187,7 +187,7 @@ pub async fn get_token_accounts_by_owner_or_delegate(
 
     let owner_or_delegate = owner_or_delegate
         .parse::<solana_pubkey::Pubkey>()
-        .map_err(|_| RpcError::InvalidParams)?;
+        .map_err(|e| RpcError::PubkeyValidationError(format!("{e:?}")))?;
 
     let commitment = config
         .as_ref()

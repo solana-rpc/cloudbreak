@@ -48,7 +48,7 @@ pub async fn get_multiple_accounts(
         .iter()
         .map(|pk| {
             pk.parse::<Pubkey>()
-                .map_err(|_| RpcError::PubkeyValidationError(pk.clone()))
+                .map_err(|e| RpcError::PubkeyValidationError(format!("{e:?}")))
         })
         .collect::<Result<Vec<_>, _>>()?;
 
