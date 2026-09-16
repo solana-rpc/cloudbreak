@@ -203,6 +203,12 @@ pub async fn get_token_accounts_by_owner_or_delegate(
 
     let (latest_slot, block_time) = state.latest_slot_and_block_time(commitment).await?;
 
+    if let Some(min_context_slot) = config.as_ref().and_then(|config| config.min_context_slot)
+        && latest_slot < min_context_slot
+    {
+        return Err(RpcError::MinContextSlotNotReached { context_slot: latest_slot });
+    }
+
     let (accounts_filters, program, filter_mint_data) = generate_filters_for_table(
         &filter,
         &owner_or_delegate,

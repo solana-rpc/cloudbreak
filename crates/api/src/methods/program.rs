@@ -95,21 +95,16 @@ pub async fn get_program_accounts(
 
     let (latest_slot, block_time) = state.latest_slot_and_block_time(commitment).await?;
 
-    let context_slot = if let Some(with_context) = config.with_context {
-        if with_context {
-            if let Some(min_context_slot) = config.account_config.min_context_slot
-                && latest_slot < min_context_slot
-            {
-                return Err(RpcError::MinContextSlotNotReached { context_slot: latest_slot });
-            }
+    if let Some(min_context_slot) = config.account_config.min_context_slot
+        && latest_slot < min_context_slot
+    {
+        return Err(RpcError::MinContextSlotNotReached { context_slot: latest_slot });
+    }
 
-            Some(latest_slot)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let context_slot = config
+        .with_context
+        .unwrap_or(false)
+        .then_some(latest_slot);
 
     if is_token_program {
         // There is only support gPA token programs queries that can be parsed into a gTABO or gTABD
