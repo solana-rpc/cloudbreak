@@ -123,7 +123,7 @@ async fn process_single_request(
             let healthy = db_query::get_service_health(&state.database).await;
 
             let result = if !healthy {
-                Err(RpcError::InternalError)
+                Err(state.node_unhealthy())
             } else {
                 Ok(serde_json::Value::String("ok".to_string()))
             };

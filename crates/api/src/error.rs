@@ -5,7 +5,7 @@
 
 use sea_orm::DbErr;
 use solana_account_decoder::MAX_BASE58_BYTES;
-use solana_rpc_client_api::custom_error::MinContextSlotNotReachedErrorData;
+use solana_rpc_client_api::custom_error::{MinContextSlotNotReachedErrorData, NodeUnhealthyErrorData};
 
 #[derive(thiserror::Error, Debug)]
 pub enum RpcError {
@@ -76,6 +76,11 @@ impl RpcError {
                 })
                 .ok()
             }
+            // The indexer health flag has no slot distance, so it is always unknown.
+            RpcError::NodeUnhealthy { .. } => serde_json::to_value(NodeUnhealthyErrorData {
+                num_slots_behind: None,
+            })
+            .ok(),
             _ => None,
         }
     }
