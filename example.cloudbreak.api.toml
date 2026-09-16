@@ -2,7 +2,10 @@
 host = "0.0.0.0"
 port = 4000
 max-connections = 100
-gpa-stream-batch-size = 1000
+# Unset: getProgramAccounts sends one batch, so every failure is a JSON-RPC error.
+# Set to opt in to streaming (lower memory and time to first byte); a mid-stream
+# failure then aborts the connection. See "Streamed Responses" in the README.
+# gpa-stream-batch-size = 1000
 request-timeout = "60s"
 max-multiple-accounts = 100
 

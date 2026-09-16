@@ -18,6 +18,7 @@ use sea_orm::{DatabaseConnection, EntityTrait};
 use serde::{Deserialize, Serialize};
 use solana_commitment_config::CommitmentLevel;
 use solana_rpc_client_api::response::Response as RpcResponse;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tracing::Instrument;
@@ -101,7 +102,7 @@ pub struct CloudbreakRpcState {
     pub slot_syncronizer_data: Option<Arc<RwLock<SlotSyncronizerData>>>,
     pub indexer_filter: Arc<AccountSelectorConfig>,
     pub batch_handling_max_concurrency: usize,
-    pub gpa_stream_batch_size: usize,
+    pub gpa_stream_batch_size: Option<NonZeroUsize>,
     pub request_timeout: Duration,
     pub processed_commitment: ProcessedCommitmentBehavior,
     pub unhealthy_response: UnhealthyResponseBehavior,
@@ -131,7 +132,7 @@ impl CloudbreakRpcState {
         client: Option<QueryTrackerClient>,
         indexer_filter: Arc<AccountSelectorConfig>,
         batch_handling_max_concurrency: usize,
-        gpa_stream_batch_size: usize,
+        gpa_stream_batch_size: Option<NonZeroUsize>,
         request_timeout: Duration,
         processed_commitment: ProcessedCommitmentBehavior,
         unhealthy_response: UnhealthyResponseBehavior,

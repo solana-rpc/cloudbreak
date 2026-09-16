@@ -16,7 +16,7 @@
 //! pre-allocated buffer) before being yielded as `Bytes` so that hyper produces
 //! a small number of fat HTTP body frames rather than one frame per account.
 
-use std::convert::Infallible;
+use std::io;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
@@ -55,7 +55,7 @@ pub async fn gpa_streaming_response_body(
     gpa_response: GpaStreamingResponse,
     gpa_global_start_time: Instant,
     ctx: Arc<RequestContext>,
-) -> Result<UnsyncBoxBody<Bytes, Infallible>, RpcError> {
+) -> Result<UnsyncBoxBody<Bytes, io::Error>, RpcError> {
     let _guard = metrics::InFlightRequestGuard::new("gpa_streaming");
     let mut accounts_stream = gpa_response.accounts_stream;
     let metrics_data = gpa_response.metrics_data;
@@ -68,6 +68,16 @@ pub async fn gpa_streaming_response_body(
         Some(Ok(b)) => b,
         None => Vec::new(),
     };
+
+    // Serialize the first batch before any byte is sent, so a failure here is still a
+    // JSON-RPC error response.
+    let first_batch_accounts = first_batch.len() as u64;
+    let mut first_batch_encode_ms = Duration::from_millis(0);
+    let processed_first_batch = process_first_gpa_batch(first_batch, &mut first_batch_encode_ms)
+        .map_err(|e| {
+            tracing::error!("Failed to serialize first batch: {e}");
+            RpcError::InternalError
+        })?;
 
     let streaming_response_body_wrapper =
         StreamingResponseBodyWrapper::new(gpa_response.context_slot, id);
@@ -89,42 +99,34 @@ pub async fn gpa_streaming_response_body(
             total_wall_time = tracing::field::Empty,
         );
 
-        let mut json_encode_ms = Duration::from_millis(0);
+        let mut json_encode_ms = first_batch_encode_ms;
         let mut json_bytes = 0u64;
         let mut total_cache_hits = 0u64;
         let mut total_cache_bytes = 0u64;
-        let mut accounts_count = first_batch.len() as u64;
+        let mut accounts_count = first_batch_accounts;
         json_bytes += streaming_response_body_wrapper.start.len() as u64;
 
         // Yield with the start of the JSON array
-        yield Ok::<_, Infallible>(Frame::data(Bytes::from(streaming_response_body_wrapper.start)));
+        yield Ok::<_, io::Error>(Frame::data(Bytes::from(streaming_response_body_wrapper.start)));
 
         let ProcessedFirstBatch {
             mut buf,
             mut pending_fresh,
             mut pending_cached,
-        } = match process_first_gpa_batch(first_batch, &mut json_encode_ms) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::error!("Failed to serialize first batch; truncating body: {}", e);
-                metrics::CLOUDBREAK_API_REQUESTS_TOTAL
-                    .with_label_values(&["gPA", "error"])
-                    .inc();
-                return;
-            }
-        };
+        } = processed_first_batch;
 
         while let Some(item) = accounts_stream.next().await {
             let batch = match item {
                 Ok(b) => b,
                 Err(e) => {
-                    tracing::error!("Account stream errored mid-response; truncating body: {e}" );
+                    tracing::error!("Account stream errored mid-response; aborting body: {e}");
                     metrics::CLOUDBREAK_API_REQUESTS_TOTAL
                         .with_label_values(&["gPA", "error"])
                         .inc();
 
-                    // Leaving the body partial intentionally: client will hit a JSON parse error
-                    // rather than receive a silently-truncated valid JSON.
+                    // A body error aborts the connection, so the client sees a transport error
+                    // instead of a complete response with truncated JSON.
+                    yield Err(io::Error::other(format!("account stream failed mid-response: {e}")));
                     return;
                 }
             };
@@ -148,10 +150,11 @@ pub async fn gpa_streaming_response_body(
                             serde_json::to_writer(&mut w, &keyed.account)
                         };
                         if let Err(e) = write_result {
-                            tracing::error!("Failed to serialize account in streaming body; truncating: {e}");
+                            tracing::error!("Failed to serialize account in streaming body; aborting: {e}");
                             metrics::CLOUDBREAK_API_REQUESTS_TOTAL
                                 .with_label_values(&["gPA", "error"])
                                 .inc();
+                            yield Err(io::Error::other(format!("account serialization failed: {e}")));
                             return;
                         }
                         let end = buf.len();

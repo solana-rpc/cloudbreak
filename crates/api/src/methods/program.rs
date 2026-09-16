@@ -3,6 +3,7 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -281,7 +282,8 @@ fn gpa_db_query(
     let sql = db_query::add_trace_traceparent_to_query(&sql);
 
     let queries_timeout = input.state.queries_timeout;
-    let gpa_stream_batch_size = input.state.gpa_stream_batch_size;
+    // `None` sends every row as one batch, so DB failures surface before the response starts.
+    let gpa_stream_batch_size = input.state.gpa_stream_batch_size.map(NonZeroUsize::get);
 
     let (tx, rx) = mpsc::unbounded_channel::<Result<Vec<PgRow>, RpcError>>();
 
@@ -305,7 +307,7 @@ fn gpa_db_query(
             let mut first_loop_iteration = true;
 
             let mut rows = sqlx::raw_sql(&sql).fetch(&pool);
-            let mut batch: Vec<PgRow> = Vec::with_capacity(gpa_stream_batch_size);
+            let mut batch: Vec<PgRow> = Vec::with_capacity(gpa_stream_batch_size.unwrap_or(0));
 
             loop {
                 let before = Instant::now();
@@ -352,9 +354,10 @@ fn gpa_db_query(
 
                 batch.push(row);
 
-                if batch.len() >= gpa_stream_batch_size {
-                    let to_send =
-                        std::mem::replace(&mut batch, Vec::with_capacity(gpa_stream_batch_size));
+                if let Some(batch_size) = gpa_stream_batch_size
+                    && batch.len() >= batch_size
+                {
+                    let to_send = std::mem::replace(&mut batch, Vec::with_capacity(batch_size));
                     if tx.send(Ok(to_send)).is_err() {
                         // Consumer side dropped
                         return;

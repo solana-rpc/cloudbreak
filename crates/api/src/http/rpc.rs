@@ -13,7 +13,7 @@ use solana_commitment_config::CommitmentConfig;
 use solana_rpc_client_api::config::{
     RpcAccountInfoConfig, RpcContextConfig, RpcSimulateTransactionConfig, RpcSupplyConfig,
 };
-use std::convert::Infallible;
+use std::io;
 use std::sync::Arc;
 use tokio::time::Instant;
 
@@ -695,22 +695,20 @@ async fn json_serialize_response<T: Serialize + Send + 'static>(
 }
 
 async fn gpa_streamed_to_buffered(
-    body: UnsyncBoxBody<Bytes, Infallible>,
+    body: UnsyncBoxBody<Bytes, io::Error>,
     id: serde_json::Value,
 ) -> Vec<u8> {
-    let collected = http_body_util::BodyExt::collect(body)
+    // A body error (mid-stream failure) or invalid JSON both become an internal error entry.
+    let bytes = http_body_util::BodyExt::collect(body)
         .await
-        .expect("streaming body error type is Infallible");
+        .ok()
+        .map(|collected| collected.to_bytes().to_vec())
+        .filter(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).is_ok());
 
-    let bytes = collected.to_bytes().to_vec();
-
-    // If the body was truncated mid-stream, the bytes won't be valid JSON
-    let valid = serde_json::from_slice::<serde_json::Value>(&bytes).is_ok();
-
-    if valid {
+    if let Some(bytes) = bytes {
         bytes
     } else {
-        tracing::error!(target: "api_request_errors_count", "getProgramAccounts streaming body was truncated mid-flight;");
+        tracing::error!(target: "api_request_errors_count", "getProgramAccounts streaming body failed mid-flight;");
         metrics::CLOUDBREAK_API_REQUESTS_TOTAL
             .with_label_values(&["gPA", "error"])
             .inc();

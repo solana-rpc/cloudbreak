@@ -433,22 +433,26 @@ The last three keys only take effect in the API server.
 | `port`                           | `u16`      | `4000`      | Listen port.                                                                                                                                                                                             |
 | `max-connections`                | `u32`      | `100`       | Maximum concurrent HTTP connections.                                                                                                                                                                     |
 | `batch-handling-max-concurrency` | `usize`    | `5`         | Maximum concurrent requests within a single batch JSON-RPC call.                                                                                                                                         |
-| `gpa-stream-batch-size`          | `usize`    | `1000`      | Number of accounts grouped per batch in the streaming `getProgramAccounts` pipeline (DB fetch → encoding). See [Streamed Responses](#streamed-responses).                                                |
+| `gpa-stream-batch-size`          | `usize` (non-zero) | (unset) | Unset (default): `getProgramAccounts` / `getTokenAccountsByMint` fetch and encode every account as one batch before the response starts, so every failure is a JSON-RPC error. Set it to opt in to streaming in batches of this size, which lowers peak memory and time to first byte but aborts the connection on a mid-stream failure. See [Streamed Responses](#streamed-responses). |
 | `request-timeout`                | `Duration` | `"60s"`     | Total per-request wall-clock budget (handler + body transport). When exceeded, the response stream is truncated and the request is counted under the `timeout` status. See [Streamed Responses](#streamed-responses). |
 | `max-multiple-accounts`          | `usize`    | `100`       | Maximum number of pubkeys accepted per `getMultipleAccounts` request. Requests exceeding this limit are rejected with an `InvalidParams` error.                                                          |
 
 #### Streamed Responses
 
-`getProgramAccounts` responses are emitted incrementally as a `Transfer-Encoding: chunked` JSON-RPC body. This keeps peak memory bounded and lets clients start parsing accounts before the server has finished fetching them.
+`getProgramAccounts` and `getTokenAccountsByMint` responses are written as a `Transfer-Encoding: chunked` JSON-RPC body.
 
 Pipeline:
 
-1. **DB fetch** — Postgres rows are streamed by `sqlx` and grouped into batches of `gpa-stream-batch-size` accounts.
+1. **DB fetch** — Postgres rows are read by `sqlx`. By default all rows form a single batch. With `gpa-stream-batch-size` set, rows are grouped into batches of that size.
 2. **Unbounded channel** — completed batches are pushed onto an unbounded `tokio::mpsc` channel so the database connection can close as fast as possible (no head-of-line blocking from slow encoding/clients).
 3. **Encoding** — each batch is decoded into `UiAccount`s (per-batch `spawn_blocking` to keep the runtime responsive).
 4. **JSON serialization** — encoded accounts are serialized into a 64 KB pre-allocated `BytesMut`. Whenever the buffer reaches 32 KB, the filled portion is frozen into a `Bytes` chunk and yielded as a single HTTP body frame. Accounts larger than the chunk threshold cause the buffer to grow naturally and are flushed as a single oversized frame.
 
-The first batch is always peeked synchronously before the response status line is committed — so SQL errors, parameter errors, and similar early failures still surface as a proper JSON-RPC error response, not a truncated `200`. Errors that happen mid-stream truncate the body intentionally; clients see a JSON parse error rather than a silently-truncated valid document.
+The first batch is fetched, encoded, and serialized before the response status line is committed. Any failure up to that point is a proper JSON-RPC error response.
+
+**Default (single batch).** The first batch is the whole result, so SQL errors, query timeouts, and encoding errors (for example base58 data over 128 bytes) are always JSON-RPC errors. This matches Agave, which builds the full result before it responds. The cost is that peak memory per request holds every encoded account, and the first byte waits for the full query and encoding.
+
+**Opt-in streaming (`gpa-stream-batch-size` set).** Accounts are fetched and encoded in batches, which lowers peak memory and time to first byte for large responses. The trade-off: a failure after the first batch cannot be reported as a JSON-RPC error, because HTTP `200` and part of the body are already sent. The server aborts the connection instead (HTTP/1: no final chunk; HTTP/2: stream reset). Clients see a transport error, such as an incomplete body, and must treat the request as failed and retry. A proxy in front of the API must pass the abort through, not buffer the body and end it normally. JSON-RPC batch requests are not affected: they buffer each entry, and a mid-stream failure becomes a `-32603 Internal error` entry.
 
 `request-timeout` is enforced by a `TrackedBody` wrapping the response body. On expiry the body is truncated, the `cloudbreak_api_request_duration_ms` `http_with_transport` observation is **not** recorded, and a `cloudbreak_api_requests_total{method="http",status="timeout"}` counter is incremented instead.
 
