@@ -352,7 +352,7 @@ async fn resolve_slot(
     if let Some(min_context_slot) = config.min_context_slot
         && slot < min_context_slot
     {
-        return Err(RpcError::RpcSlotBehindMinContextSlot { rpc_slot: slot });
+        return Err(RpcError::MinContextSlotNotReached { context_slot: slot });
     }
 
     Ok(slot)

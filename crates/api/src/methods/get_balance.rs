@@ -75,9 +75,7 @@ pub async fn get_balance(
     if let Some(min_context_slot) = config.min_context_slot
         && context_slot < min_context_slot
     {
-        return Err(RpcError::RpcSlotBehindMinContextSlot {
-            rpc_slot: context_slot,
-        });
+        return Err(RpcError::MinContextSlotNotReached { context_slot });
     }
 
     // `owner` and `lamports` are nullable when the LEFT JOIN finds no

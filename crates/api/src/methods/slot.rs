@@ -60,9 +60,7 @@ pub async fn get_slot(
     if let Some(min_slot) = config.as_ref().and_then(|c| c.min_context_slot)
         && rpc_latest_slot < min_slot
     {
-        return Err(RpcError::RpcSlotBehindMinContextSlot {
-            rpc_slot: rpc_latest_slot,
-        });
+        return Err(RpcError::MinContextSlotNotReached { context_slot: rpc_latest_slot });
     }
 
     tracing::debug!("get_slot: {}µs", start_time.elapsed().as_micros());

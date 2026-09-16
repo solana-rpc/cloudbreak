@@ -4,6 +4,7 @@
  */
 
 use sea_orm::DbErr;
+use solana_rpc_client_api::custom_error::MinContextSlotNotReachedErrorData;
 
 #[derive(thiserror::Error, Debug)]
 pub enum RpcError {
@@ -20,8 +21,8 @@ pub enum RpcError {
     PubkeyValidationError(String),
     #[error("Parse error")]
     ParseError,
-    #[error("RPC slot ({rpc_slot}) is behind the min context slot provided")]
-    RpcSlotBehindMinContextSlot { rpc_slot: u64 },
+    #[error("Minimum context slot has not been reached")]
+    MinContextSlotNotReached { context_slot: u64 },
     #[error("{0}")]
     InvalidParamsWithMessage(String),
     #[error("{key} excluded from account secondary indexes; this RPC method unavailable for key")]
@@ -61,7 +62,15 @@ pub enum RpcError {
 impl RpcError {
     /// JSON-RPC error `data` member. `None` omits the field from the response.
     pub fn to_error_data(&self) -> Option<serde_json::Value> {
-        None
+        match self {
+            RpcError::MinContextSlotNotReached { context_slot } => {
+                serde_json::to_value(MinContextSlotNotReachedErrorData {
+                    context_slot: *context_slot,
+                })
+                .ok()
+            }
+            _ => None,
+        }
     }
 
     pub fn to_numeric_code(&self) -> i32 {
@@ -72,7 +81,7 @@ impl RpcError {
             RpcError::InternalError => -32603,
             RpcError::PubkeyValidationError(_) => -32602,
             RpcError::ParseError => -32700,
-            RpcError::RpcSlotBehindMinContextSlot { .. } => -32000,
+            RpcError::MinContextSlotNotReached { .. } => -32016,
             RpcError::InvalidParamsWithMessage(_) => -32602,
             RpcError::KeyExcludedFromSecondaryIndex { .. } => -32010,
             RpcError::ProcessedCommitmentNotSupported => -32003,

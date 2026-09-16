@@ -100,9 +100,7 @@ pub async fn get_program_accounts(
             if let Some(min_context_slot) = config.account_config.min_context_slot
                 && latest_slot < min_context_slot
             {
-                return Err(RpcError::RpcSlotBehindMinContextSlot {
-                    rpc_slot: latest_slot,
-                });
+                return Err(RpcError::MinContextSlotNotReached { context_slot: latest_slot });
             }
 
             Some(latest_slot)
