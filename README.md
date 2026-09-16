@@ -717,7 +717,7 @@ These two are independent but related: the indexer `[programs]` determines what 
 
 ### Vote Accounts (`getVoteAccounts`)
 
-`getVoteAccounts` is optional and only served when the indexer's `[programs]` filter includes both the Vote (`Vote111111111111111111111111111111111111111`) and Stake (`Stake11111111111111111111111111111111111111`) programs. Cloudbreak checks this at startup; if either is missing, the method returns a `getVoteAccounts is not supported on this node` error and the supporting background tasks are not started.
+`getVoteAccounts` is optional and only served when the indexer's `[programs]` filter includes both the Vote (`Vote111111111111111111111111111111111111111`) and Stake (`Stake11111111111111111111111111111111111111`) programs. Cloudbreak checks this at startup; if either is missing, the method returns JSON-RPC `-32601 Method not found` and the supporting background tasks are not started.
 
 The response combines two sources. The per-account fields (commission, last vote, root slot, recent epoch credits, node pubkey) are read from the indexed Vote accounts. The per-voter activated stake and epoch-set membership (`epochVoteAccount`) come from a separate `epoch_stakes` table, since effective stake cannot be derived from a single account.
 
@@ -729,7 +729,7 @@ The recomputer detects drift by comparing the total activated stake across runs.
 
 ### Simulate Transaction (`simulateTransaction`)
 
-`simulateTransaction` is optional and only served on a **full, unfiltered index** (empty `[programs]` include and exclude lists). Simulation must be able to load any account a transaction touches — including program, lookup-table, sysvar, and feature-gate accounts — so a filtered index cannot serve it. Cloudbreak checks this at startup; if the index is filtered, the method returns a `simulateTransaction is not supported on this node` error.
+`simulateTransaction` is optional and only served on a **full, unfiltered index** (empty `[programs]` include and exclude lists). Simulation must be able to load any account a transaction touches — including program, lookup-table, sysvar, and feature-gate accounts — so a filtered index cannot serve it. Cloudbreak checks this at startup; if the index is filtered, the method returns JSON-RPC `-32601 Method not found`.
 
 The transaction is executed read-only against the indexed account state at the requested slot; nothing is committed. Cloudbreak reconstructs the cluster's actually-activated feature set at that slot from the on-chain feature accounts (rather than enabling all features), so compute-unit accounting and execution behaviour match mainnet. `replaceRecentBlockhash` substitutes the latest recorded blockhash before execution and reports it with its `lastValidBlockHeight`; `sigVerify` verifies signatures; `accounts` returns post-simulation state for the requested addresses; `innerInstructions` includes decoded inner instructions.
 

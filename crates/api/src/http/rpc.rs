@@ -147,20 +147,20 @@ async fn process_single_request(
 
             json_serialize_response(id, hash, ctx).await
         }
-        "getVoteAccounts" => {
+        // Unsupported or disabled optional methods fall through to the method-not-found arm.
+        "getVoteAccounts" if state.vote_accounts_supported => {
             let config: Option<methods::vote_accounts::GetVoteAccountsConfig> =
                 extract_param(&rpc_request.params, 0).ok().flatten();
             let result = methods::vote_accounts::get_vote_accounts(state, config).await;
             json_serialize_response(id, result, ctx).await
         }
-        // A node with supply disabled falls through to the method-not-found arm.
         "getSupply" if state.supply_enabled => {
             let config: Option<RpcSupplyConfig> =
                 extract_param(&rpc_request.params, 0).ok().flatten();
             let result = methods::get_supply::get_supply(state, config).await;
             json_serialize_response(id, result, ctx).await
         }
-        "simulateTransaction" => {
+        "simulateTransaction" if state.simulation_supported => {
             let transaction: String = match extract_param(&rpc_request.params, 0) {
                 Ok(p) => p,
                 Err(e) => return make_error_response(id, -32602, e),
@@ -637,7 +637,13 @@ async fn process_single_request(
             json_response
         }
         _ => {
-            return make_error_response(id, -32601, format!("Method not found: {}", method));
+            let reason = if matches!(method, "getVoteAccounts" | "simulateTransaction" | "getSupply") {
+                "not enabled on this node"
+            } else {
+                "unknown method"
+            };
+            tracing::debug!("Method not found: {method} ({reason})");
+            return make_rpc_error_response(id, &RpcError::MethodNotFound);
         }
     };
 

@@ -30,12 +30,6 @@ pub async fn get_vote_accounts(
     state: &CloudbreakRpcState,
     config: Option<GetVoteAccountsConfig>,
 ) -> Result<RpcVoteAccountStatus, RpcError> {
-    if !state.vote_accounts_supported {
-        return Err(RpcError::InvalidParamsWithMessage(
-            "getVoteAccounts is not supported on this node".to_string(),
-        ));
-    }
-
     let config = config.unwrap_or_default();
 
     let optional_filter = config

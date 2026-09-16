@@ -69,13 +69,6 @@ pub async fn simulate_transaction(
     transaction: String,
     config: Option<RpcSimulateTransactionConfig>,
 ) -> Result<RpcResponse<RpcSimulateTransactionResult>, RpcError> {
-    if !state.simulation_supported {
-        return Err(RpcError::InvalidParamsWithMessage(
-            "simulateTransaction is not supported on this node (requires a full, unfiltered index)"
-                .to_string(),
-        ));
-    }
-
     let config = config.unwrap_or_default();
 
     if config.sig_verify && config.replace_recent_blockhash {
