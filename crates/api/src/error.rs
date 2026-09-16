@@ -51,6 +51,8 @@ pub enum RpcError {
     NotATokenMint { mint: String },
     #[error("Invalid param: could not find mint")]
     MintDataNotFound { mint: String },
+    #[error("Invalid param: unrecognized Token program id")]
+    UnrecognizedTokenProgramId { program_id: String },
     /// `getTokenSupply`: the mint account data does not unpack as a mint.
     #[error("Invalid param: mint could not be unpacked")]
     MintCouldNotBeUnpacked { mint: String },
@@ -105,6 +107,7 @@ impl RpcError {
             RpcError::NotATokenAccount { .. } => -32602,
             RpcError::NotATokenMint { .. } => -32602,
             RpcError::MintDataNotFound { .. } => -32602,
+            RpcError::UnrecognizedTokenProgramId { .. } => -32602,
             RpcError::MintCouldNotBeUnpacked { .. } => -32602,
             RpcError::TokenMintCouldNotBeUnpacked { .. } => -32602,
             RpcError::Base58DataTooLarge => -32600,

@@ -131,13 +131,25 @@ async fn generate_filters_for_table(
                     Err(RpcError::InternalError)
                 })?;
 
-                let row = rows.first().ok_or_else(|| {
-                    tracing::error!("No row found for mint: {} at slot: {}", mint, slot);
-                    RpcError::InternalError
-                })?;
+                // The query only reads token-program rows, so a missing or closed row also
+                // covers a mint owned by another program (Agave: "not a Token mint").
+                let Some(row) = rows
+                    .first()
+                    .filter(|row| row.get::<i64, _>("lamports") > 0)
+                else {
+                    return Err(RpcError::MintDataNotFound {
+                        mint: mint.to_string(),
+                    });
+                };
 
                 let mint_data: Vec<u8> = row.get::<Vec<u8>, _>("data");
                 let token_program_pubkey: [u8; 32] = row.get::<[u8; 32], _>("owner");
+
+                if StateWithExtensions::<Mint>::unpack(&mint_data).is_err() {
+                    return Err(RpcError::TokenMintCouldNotBeUnpacked {
+                        mint: mint.to_string(),
+                    });
+                }
 
                 mint_span.record("wall_time", start_time.elapsed().as_millis() as i64);
 
@@ -158,7 +170,9 @@ async fn generate_filters_for_table(
         }
         TokenAccountsFilter::ProgramId(program_id) => {
             if !is_token_program(program_id) {
-                return Err(RpcError::InvalidParams);
+                return Err(RpcError::UnrecognizedTokenProgramId {
+                    program_id: program_id.to_string(),
+                });
             }
 
             (None, *program_id)
