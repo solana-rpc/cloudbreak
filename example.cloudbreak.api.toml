@@ -63,7 +63,9 @@ span-filter = [
   "slot_db",
   "mint_db",
   "mint_data",
-  "gpa_cache_finalize_query"
+  "gpa_cache_finalize_query",
+  "processed_read",
+  "account_db"
 ]
 
 # How to handle requests with "processed" commitment level.
@@ -89,7 +91,7 @@ enabled = false
 interval_ms = 200
 
 # Serves processed commitment for getAccountInfo, getMultipleAccounts, getBalance,
-# getTokenAccountBalance and getTokenSupply from a Yellowstone block feed held in
+# getTokenAccountBalance, getTokenSupply and getSlot from a Yellowstone block feed held in
 # memory around the Postgres confirmed slot. Other methods keep following
 # processed-commitment. Requires [slot-syncronizer] enabled = true. Startup fails
 # without it. For these methods it overrides processed-commitment = "reject":

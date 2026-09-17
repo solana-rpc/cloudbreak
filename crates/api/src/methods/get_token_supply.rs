@@ -29,7 +29,7 @@ pub async fn get_token_supply(
         .parse()
         .map_err(|_| RpcError::PubkeyValidationError(mint.clone()))?;
 
-    let read = processed::account_read(state, commitment, "getTokenSupply")?;
+    let read = processed::read(state, commitment, "getTokenSupply")?;
 
     let (latest_slot, block_time) = read.slot_and_block_time(state).await?;
 

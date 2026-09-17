@@ -4,10 +4,10 @@
  */
 
 //! Processed commitment for getAccountInfo, getMultipleAccounts, getBalance,
-//! getTokenAccountBalance and getTokenSupply. [`ProcessedBlocks`] and its
+//! getTokenAccountBalance, getTokenSupply and getSlot. [`ProcessedBlocks`] and its
 //! account rules are documented in `cloudbreak_core::modules::processed`.
 //!
-//! [`account_read`] gives each request an [`AccountRead`]. A processed request
+//! [`read`] gives each request a [`Read`]. A processed request
 //! carries the latest [`ProcessedBlocks`] while the node is healthy, the head is
 //! not below the cached confirmed slot and the cached finalized slot is not above
 //! the anchor. Otherwise it reads as `Confirmed`, even with
@@ -28,7 +28,11 @@
 //! | `Unknown` | one `getMultipleAccounts.sql` read at the anchor | the joined mint |
 //!
 //! getBalance keeps `getBalance.sql` and looks its key up in the blocks itself,
-//! with the same anchor bound for an unknown key.
+//! with the same anchor bound for an unknown key. getSlot answers the head slot
+//! from the blocks, and otherwise reads the `slots` row at the commitment.
+//!
+//! The in-memory lookup runs in a `processed_read` span with the store size in
+//! `stored_blocks` and `stored_bytes`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -48,13 +52,13 @@ use crate::slot_syncronizer::SlotSyncronizerData;
 use crate::{db_query, metrics};
 
 /// How one request reads: at a commitment, or through processed blocks.
-pub(crate) struct AccountRead {
+pub(crate) struct Read {
     pub(crate) commitment: CommitmentLevel,
     /// Set for a processed request the blocks can serve. `commitment` is then `Confirmed`.
     pub(crate) blocks: Option<Arc<ProcessedBlocks>>,
 }
 
-impl AccountRead {
+impl Read {
     /// The context slot and block time: the head block, or the cached slot at the commitment.
     pub(crate) async fn slot_and_block_time(
         &self,
@@ -75,22 +79,24 @@ impl AccountRead {
 }
 
 /// Resolves the request commitment. `method` is the metric label.
-pub(crate) fn account_read(
+pub(crate) fn read(
     state: &CloudbreakRpcState,
     commitment: Option<CommitmentConfig>,
     method: &str,
-) -> Result<AccountRead, RpcError> {
+) -> Result<Read, RpcError> {
     let commitment = commitment.map(|config| config.commitment);
     if commitment != Some(CommitmentLevel::Processed) || !state.processed.is_enabled() {
         let commitment = commitment
             .map(|commitment| resolve_commitment(commitment, state.processed_commitment))
             .transpose()?
             .unwrap_or(CommitmentLevel::Finalized);
-        return Ok(AccountRead {
+        return Ok(Read {
             commitment,
             blocks: None,
         });
     }
+    // Blocks first, so the cached slots are at least as new as the blocks.
+    let blocks = state.processed.blocks();
     let slots = state
         .slot_syncronizer_data
         .as_ref()
@@ -99,7 +105,6 @@ pub(crate) fn account_read(
                 .expect("Failed to read slot syncronizer data")
                 .clone()
         });
-    let blocks = state.processed.blocks();
     let reason = match &blocks {
         Some(blocks) => fallback_reason(blocks.slot, blocks.anchor_slot, &slots),
         None => Some("no_blocks"),
@@ -114,7 +119,7 @@ pub(crate) fn account_read(
             None
         }
     };
-    Ok(AccountRead {
+    Ok(Read {
         commitment: CommitmentLevel::Confirmed,
         blocks,
     })
@@ -207,7 +212,7 @@ impl Account {
 /// unnests it. `what` names the method in logs.
 pub(crate) async fn read_accounts(
     state: &CloudbreakRpcState,
-    read: &AccountRead,
+    read: &Read,
     keys: &[Pubkey],
     sql_template: &str,
     latest_slot: u64,
@@ -215,7 +220,9 @@ pub(crate) async fn read_accounts(
     what: &str,
 ) -> Result<Vec<Option<Account>>, RpcError> {
     let in_blocks: Vec<ProcessedAccount<'_>> = match &read.blocks {
-        Some(blocks) => keys.iter().map(|key| blocks.get_account(key)).collect(),
+        Some(blocks) => blocks
+            .read_span(what)
+            .in_scope(|| keys.iter().map(|key| blocks.get_account(key)).collect()),
         None => vec![ProcessedAccount::Unknown; keys.len()],
     };
     let unknown: Vec<Pubkey> = keys

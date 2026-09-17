@@ -16,6 +16,9 @@
 //!   bank S, so no write history is needed. A sample with no such answer is a fork or a miss.
 //! - Token methods: getBalance, getTokenAccountBalance and getTokenSupply at processed must match
 //!   the first reference at equal context slots. An error on one side only is a mismatch.
+//! - getSlot: cloudbreak processed getSlot against its confirmed getSlot read just before, and
+//!   against the highest reference processed slot. Processed can trail confirmed by the slot
+//!   syncronizer interval, so both are reported and only a cloudbreak error fails.
 //!
 //! A mismatch on a non-canonical slot is a fork, and one whose status stays unknown fails. A
 //! cloudbreak null is an excluded key when a confirmed getAccountInfo on cloudbreak at S or later
@@ -53,7 +56,7 @@ const POLL: Duration = Duration::from_millis(100);
 #[derive(Parser, Debug)]
 #[command(name = "compare-processed-accounts")]
 #[command(about = "\
-Validate processed getMultipleAccounts, getBalance, getTokenAccountBalance and getTokenSupply \
+Validate processed getMultipleAccounts, getBalance, getTokenAccountBalance, getTokenSupply and getSlot \
 against reference Agave RPCs at equal context slots and against confirmed answers at the same \
 slot, and report latency per source. A mismatch on a slot that is not canonical is a fork.")]
 pub struct Args {
@@ -131,6 +134,7 @@ pub async fn run(args: &Args) -> Result<()> {
     let tokens = cross_source(&ctx, args, &keys, &mut mismatches, &mut failures).await;
     processed_matches_confirmed(&ctx, args, &keys, &mut mismatches, &mut failures).await;
     token_methods(&ctx, args, &keys, &tokens, &mut mismatches, &mut failures).await;
+    slots_check(&ctx, args, &mut failures).await;
 
     let (mut excluded, mut forks, mut unclassified) = (0, 0, 0);
     let (mut slots, mut probes) = (HashMap::new(), HashMap::new());
@@ -383,6 +387,40 @@ async fn token_methods(
         if cb_errors > 0 {
             failures.push(format!("{method}: cloudbreak errored on {cb_errors} calls"));
         }
+    }
+}
+
+/// Check 4. Processed getSlot against confirmed getSlot and the references.
+async fn slots_check(ctx: &Ctx, args: &Args, failures: &mut Vec<String>) {
+    let slot_of = |reply: Result<(JsonValue, u128)>| reply.ok()?.0["result"].as_u64();
+    let (mut below_confirmed, mut behind) = (0, Vec::new());
+    for _ in 0..args.confirm_samples {
+        tokio::time::sleep(Duration::from_millis(args.interval_ms)).await;
+        let confirmed = json!([{"commitment": "confirmed"}]);
+        let confirmed = slot_of(call(ctx, &ctx.cloudbreak, "getSlot", confirmed).await);
+        let processed = json!([{"commitment": "processed"}]);
+        let calls = std::iter::once(&ctx.cloudbreak)
+            .chain(&ctx.references)
+            .map(|source| call(ctx, source, "getSlot", processed.clone()));
+        let slots: Vec<Option<u64>> = futures::future::join_all(calls)
+            .await
+            .into_iter()
+            .map(slot_of)
+            .collect();
+        let (Some(confirmed), Some(cb)) = (confirmed, slots[0]) else {
+            failures.push("getSlot: cloudbreak errored".to_string());
+            continue;
+        };
+        below_confirmed += usize::from(cb < confirmed);
+        if let Some(top) = slots[1..].iter().flatten().max() {
+            behind.push(top.saturating_sub(cb) as u128);
+        }
+    }
+    behind.sort_unstable();
+    let [p50, p90] = [50.0, 90.0].map(|p| percentile(&behind, p));
+    println!("getSlot: processed below confirmed in {below_confirmed} samples");
+    if !behind.is_empty() {
+        println!("getSlot: slots behind the highest reference p50 {p50} p90 {p90}");
     }
 }
 

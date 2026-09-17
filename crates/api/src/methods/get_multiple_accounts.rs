@@ -43,7 +43,7 @@ pub async fn get_multiple_accounts(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    let read = processed::account_read(state, config.commitment, "getMultipleAccounts")?;
+    let read = processed::read(state, config.commitment, "getMultipleAccounts")?;
 
     let (latest_slot, block_time) = read.slot_and_block_time(state).await?;
 

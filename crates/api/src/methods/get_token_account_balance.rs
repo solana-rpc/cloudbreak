@@ -27,7 +27,7 @@ pub async fn get_token_account_balance(
         .parse()
         .map_err(|_| RpcError::PubkeyValidationError(pubkey.clone()))?;
 
-    let read = processed::account_read(state, commitment, "getTokenAccountBalance")?;
+    let read = processed::read(state, commitment, "getTokenAccountBalance")?;
 
     let (latest_slot, block_time) = read.slot_and_block_time(state).await?;
 

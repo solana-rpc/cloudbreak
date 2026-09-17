@@ -27,6 +27,8 @@ pub(crate) struct SlotBlock {
     pub block_time: Option<i64>,
     pub received_at: Instant,
     pub accounts: HashMap<Pubkey, AccountEntry>,
+    /// Estimated heap bytes: account data plus the map table.
+    pub heap_bytes: usize,
 }
 
 impl SlotBlock {
@@ -39,6 +41,7 @@ impl SlotBlock {
     ) -> Self {
         let mut accounts = HashMap::with_capacity(block.accounts.len());
         let mut skipped = 0usize;
+        let mut data_bytes = 0usize;
 
         for account in block.accounts {
             let (Ok(pubkey), Ok(owner)) = (
@@ -51,6 +54,7 @@ impl SlotBlock {
             let entry = if account.lamports == 0 || !program_filter.is_program_selected(&owner) {
                 AccountEntry::Closed
             } else {
+                data_bytes += account.data.len();
                 AccountEntry::Live(LiveAccount {
                     lamports: account.lamports,
                     owner,
@@ -77,6 +81,7 @@ impl SlotBlock {
             parent_blockhash: block.parent_blockhash,
             block_time: block.block_time.map(|t| t.timestamp),
             received_at,
+            heap_bytes: data_bytes + accounts.capacity() * size_of::<(Pubkey, AccountEntry)>(),
             accounts,
         }
     }
@@ -162,6 +167,7 @@ pub(crate) mod tests {
         }
         assert_eq!(block.accounts[&closed_key], AccountEntry::Closed);
         assert_eq!(block.accounts[&excluded_key], AccountEntry::Closed);
+        assert!(block.heap_bytes > 3);
         assert_eq!(block.block_time, Some(1_700_000_010));
     }
 

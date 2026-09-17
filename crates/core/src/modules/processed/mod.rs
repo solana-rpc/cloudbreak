@@ -4,7 +4,7 @@
  */
 
 //! Processed commitment for getAccountInfo, getMultipleAccounts, getBalance,
-//! getTokenAccountBalance and getTokenSupply.
+//! getTokenAccountBalance, getTokenSupply and getSlot.
 //!
 //! Postgres holds confirmed data only. This module subscribes to Yellowstone
 //! blocks with accounts at processed commitment and keeps the blocks around the
@@ -24,7 +24,8 @@
 //!   closed. A write by an owner outside the API program filter is a close.
 //! - `store.rs`: the block store. One block per slot, slot statuses, the
 //!   anchor, conflicts, retention, the slot cap and the latest chained blocks.
-//! - `read.rs`: [`ProcessedBlocks::get_account`], the one read function the API calls.
+//! - `read.rs`: [`ProcessedBlocks::get_account`], the one read function the API calls,
+//!   and the `processed_read` span with the store size.
 //! - `subscribe.rs`: the feed thread. The shared gRPC client in `crate::grpc`
 //!   drives the single writer, which owns the store without a lock.
 //!

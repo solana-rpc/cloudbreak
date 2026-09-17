@@ -31,11 +31,13 @@ pub async fn get_balance(
         .parse()
         .map_err(|_| RpcError::PubkeyValidationError(pubkey.clone()))?;
 
-    let read = processed::account_read(state, config.commitment, "getBalance")?;
+    let read = processed::read(state, config.commitment, "getBalance")?;
 
     // A key written in the blocks answers from memory at the head slot.
     if let Some(blocks) = &read.blocks {
-        let lamports = match blocks.get_account(&pubkey) {
+        let span = blocks.read_span("getBalance");
+        let account = span.in_scope(|| blocks.get_account(&pubkey));
+        let lamports = match account {
             ProcessedAccount::Live(account) => Some(account.lamports),
             ProcessedAccount::Closed => Some(0),
             ProcessedAccount::Unknown => None,

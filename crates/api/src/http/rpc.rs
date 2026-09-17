@@ -204,7 +204,7 @@ async fn process_single_request(
 
             metrics::CLOUDBREAK_API_REQUEST_DURATION_MS
                 .with_label_values(&["gAI", metrics::bytes_bucket(json_response.0.len() as u64)])
-                .observe(start_time.elapsed().as_millis() as f64);
+                .observe(start_time.elapsed().as_secs_f64() * 1000.0);
 
             json_response
         }
@@ -237,7 +237,7 @@ async fn process_single_request(
                     "getBalance",
                     metrics::bytes_bucket(json_response.0.len() as u64),
                 ])
-                .observe(start_time.elapsed().as_millis() as f64);
+                .observe(start_time.elapsed().as_secs_f64() * 1000.0);
 
             json_response
         }
@@ -275,7 +275,7 @@ async fn process_single_request(
                     "getMultipleAccounts",
                     metrics::bytes_bucket(json_response.0.len() as u64),
                 ])
-                .observe(start_time.elapsed().as_millis() as f64);
+                .observe(start_time.elapsed().as_secs_f64() * 1000.0);
 
             json_response
         }
@@ -439,7 +439,7 @@ async fn process_single_request(
                     "getTokenAccountBalance",
                     metrics::bytes_bucket(json_response.0.len() as u64),
                 ])
-                .observe(start_time.elapsed().as_millis() as f64);
+                .observe(start_time.elapsed().as_secs_f64() * 1000.0);
 
             json_response
         }
@@ -478,7 +478,7 @@ async fn process_single_request(
                     "getTokenSupply",
                     metrics::bytes_bucket(json_response.0.len() as u64),
                 ])
-                .observe(start_time.elapsed().as_millis() as f64);
+                .observe(start_time.elapsed().as_secs_f64() * 1000.0);
 
             json_response
         }

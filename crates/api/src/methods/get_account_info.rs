@@ -31,7 +31,7 @@ pub async fn get_account_info(
         .parse()
         .map_err(|_| RpcError::PubkeyValidationError(pubkey.clone()))?;
 
-    let read = processed::account_read(state, config.commitment, "gAI")?;
+    let read = processed::read(state, config.commitment, "gAI")?;
 
     let (latest_slot, block_time) = read.slot_and_block_time(state).await?;
 

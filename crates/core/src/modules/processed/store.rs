@@ -210,6 +210,8 @@ impl BlockStore {
             slot: head.slot,
             block_time,
             anchor_slot: a,
+            stored_blocks: self.blocks.len(),
+            stored_bytes: self.blocks.values().map(|block| block.heap_bytes).sum(),
             blocks,
         })
     }

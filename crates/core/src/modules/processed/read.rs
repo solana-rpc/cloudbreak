@@ -31,6 +31,10 @@ pub struct ProcessedBlocks {
     pub block_time: i64,
     /// Postgres bound for unknown keys: `slot <= anchor_slot`.
     pub anchor_slot: u64,
+    /// Blocks in the store when these blocks were published.
+    pub stored_blocks: usize,
+    /// Estimated heap bytes of those stored blocks, without per-account headers.
+    pub stored_bytes: usize,
     /// Newest first.
     pub(super) blocks: Vec<Arc<SlotBlock>>,
 }
@@ -47,6 +51,16 @@ impl ProcessedBlocks {
             }
         }
         ProcessedAccount::Unknown
+    }
+
+    /// The `processed_read` span for the in-memory lookup of `method`, with the store size.
+    pub fn read_span(&self, method: &str) -> tracing::Span {
+        tracing::info_span!(
+            "processed_read",
+            method,
+            stored_blocks = self.stored_blocks,
+            stored_bytes = self.stored_bytes
+        )
     }
 }
 
