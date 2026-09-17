@@ -187,6 +187,7 @@ pub fn subscribe_grpc_with_reconnection(
                         include_transactions: Some(false),
                         include_accounts: Some(true),
                         include_entries: Some(false),
+                        cuckoo_account_include: None,
                     },
                 )]),
                 blocks_meta: HashMap::new(),

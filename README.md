@@ -729,6 +729,8 @@ The recomputer detects drift by comparing the total activated stake across runs.
 
 The transaction is executed read-only against the indexed account state at the requested slot; nothing is committed. Cloudbreak reconstructs the cluster's actually-activated feature set at that slot from the on-chain feature accounts (rather than enabling all features), so compute-unit accounting and execution behaviour match mainnet. `replaceRecentBlockhash` substitutes the latest recorded blockhash before execution and reports it with its `lastValidBlockHeight`; `sigVerify` verifies signatures; `accounts` returns post-simulation state for the requested addresses; `innerInstructions` includes decoded inner instructions.
 
+Cloudbreak accepts legacy, v0, and v1 transactions. A v1 transaction can be larger than the legacy 1232-byte packet, so the decoder applies the version's own size bound and rejects anything larger with an invalid-params error.
+
 ### Supply (`getSupply`)
 
 `getSupply` is optional. It needs a **full, unfiltered index** (empty `[programs]` include and exclude lists), `accounts-owner-map-enabled = false`, owner partitioning off (single `accounts` and `snapshot_accounts` tables), and the `[snapshot]` section. Enable the `[supply]` section on the indexer and the `[supply]` section on the API. The two must be set consistently; a node with the API section absent or disabled answers `getSupply` with method-not-found. Run it on a dedicated supply-only instance: de-partitioning removes the owner pruning that `getProgramAccounts` relies on.

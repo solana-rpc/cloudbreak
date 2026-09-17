@@ -14,15 +14,15 @@ use solana_account_decoder_client_types::{UiAccount, token::UiTokenAmount};
 use solana_address_lookup_table_interface::state::AddressLookupTable;
 use solana_clock::{Epoch, Slot};
 use solana_commitment_config::CommitmentLevel;
-use solana_compute_budget_instruction::instructions_processor::process_compute_budget_instructions;
-use solana_fee_structure::FeeDetails;
+use solana_fee::{FeeFeatures, calculate_fee_details};
 use solana_hash::Hash;
 use solana_loader_v3_interface::state::UpgradeableLoaderState;
 use solana_message::v0::{LoadedAddresses, MessageAddressTableLookup};
 use solana_message::{AddressLoader, VersionedMessage};
 use solana_precompile_error::PrecompileError;
 use solana_program_runtime::execution_budget::{
-    SVMTransactionExecutionBudget, SVMTransactionExecutionCost,
+    SVMTransactionExecutionAndFeeBudgetLimits, SVMTransactionExecutionBudget,
+    SVMTransactionExecutionCost,
 };
 use solana_program_runtime::loaded_programs::{
     BlockRelation, ForkGraph, ProgramRuntimeEnvironments,
@@ -30,6 +30,7 @@ use solana_program_runtime::loaded_programs::{
 use solana_program_runtime::program_cache_entry::ProgramCacheEntry;
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::config::RpcSimulateTransactionConfig;
+use solana_runtime_transaction::transaction_meta::TransactionConfiguration;
 use solana_rpc_client_api::response::{
     Response as RpcResponse, RpcBlockhash, RpcResponseContext, RpcSimulateTransactionResult,
 };
@@ -41,8 +42,9 @@ use solana_svm::transaction_processor::{
     TransactionProcessingConfig, TransactionProcessingEnvironment,
 };
 use solana_svm_callback::{InvokeContextCallback, TransactionProcessingCallback};
-use solana_svm_transaction::svm_message::SVMStaticMessage;
 use solana_nonce_account::verify_nonce_account;
+use solana_packet::PACKET_DATA_SIZE;
+use solana_svm_transaction::svm_message::{SVMMessage, SVMStaticMessage};
 use solana_transaction::sanitized::{MessageHash, SanitizedTransaction};
 use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_error::{AddressLoaderError, TransactionError};
@@ -220,11 +222,11 @@ pub async fn simulate_transaction(
 
     let bank = SimulationBank::new(fetched, feature_set.clone());
 
-    let compute_budget_limits = match process_compute_budget_instructions(
-        sanitized_tx.program_instructions_iter(),
+    let transaction_configuration = match TransactionConfiguration::try_from_sanitized_message(
+        sanitized_tx.message(),
         &feature_set,
     ) {
-        Ok(limits) => limits,
+        Ok(configuration) => configuration,
         Err(e) => {
             return Ok(response(
                 slot,
@@ -233,18 +235,23 @@ pub async fn simulate_transaction(
         }
     };
 
-    let signature_fee = sanitized_tx
-        .num_transaction_signatures()
-        .saturating_mul(blockhash_lamports_per_signature);
-    let fee_details = FeeDetails::new(
-        signature_fee,
-        compute_budget_limits.get_prioritization_fee(),
+    let fee_details = calculate_fee_details(
+        &sanitized_tx,
+        blockhash_lamports_per_signature,
+        transaction_configuration.priority_fee_lamports,
+        FeeFeatures {},
     );
-    let budget_and_limits = compute_budget_limits.get_compute_budget_and_limits(
-        compute_budget_limits.loaded_accounts_bytes,
+    let budget_and_limits = SVMTransactionExecutionAndFeeBudgetLimits {
+        budget: SVMTransactionExecutionBudget {
+            compute_unit_limit: u64::from(transaction_configuration.compute_unit_limit),
+            heap_size: transaction_configuration.updated_heap_bytes,
+            ..SVMTransactionExecutionBudget::new_with_defaults(
+                feature_set.is_active(&agave_feature_set::raise_cpi_nesting_limit_to_8::id()),
+            )
+        },
+        loaded_accounts_data_size_limit: transaction_configuration.loaded_accounts_data_size_limit,
         fee_details,
-        feature_set.is_active(&agave_feature_set::raise_cpi_nesting_limit_to_8::id()),
-    );
+    };
 
     let check_result: TransactionCheckResult = if runnable {
         Ok(CheckedTransactionDetails::new(
@@ -428,28 +435,76 @@ fn resolve_nonce(
     accounts: &HashMap<Pubkey, (AccountSharedData, Slot)>,
 ) -> Option<(Pubkey, u64)> {
     let message = sanitized_tx.message();
-    let nonce_address = message.get_durable_nonce()?;
+    let nonce_address = SVMMessage::get_durable_nonce(message)?;
     let (account, _) = accounts.get(nonce_address)?;
     let data = verify_nonce_account(account, message.recent_blockhash())?;
-    message
-        .get_ix_signers(0)
+    SVMStaticMessage::get_ix_signers(message, 0)
         .any(|signer| signer.to_bytes() == data.authority.to_bytes())
         .then_some((*nonce_address, data.fee_calculator.lamports_per_signature))
 }
 
+const MAX_BASE58_SIZE: usize = 1683;
+const MAX_BASE64_SIZE: usize = 5464;
+const MAX_BASE64_LEGACY_SIZE: usize = 1644;
+const V1_BASE64_PREFIX_LOWER_BOUND: &[u8] = b"gQ";
+
 /// Decode the wire transaction per the requested encoding (base58 or base64).
 fn decode_transaction(data: &str, encoding: UiTransactionEncoding) -> Result<Vec<u8>, RpcError> {
-    match encoding {
-        UiTransactionEncoding::Base58 | UiTransactionEncoding::Binary => bs58::decode(data)
-            .into_vec()
-            .map_err(|e| RpcError::InvalidParamsWithMessage(format!("invalid base58: {e}"))),
-        UiTransactionEncoding::Base64 => base64::prelude::BASE64_STANDARD
-            .decode(data)
-            .map_err(|e| RpcError::InvalidParamsWithMessage(format!("invalid base64: {e}"))),
-        other => Err(RpcError::InvalidParamsWithMessage(format!(
-            "unsupported transaction encoding: {other:?}"
-        ))),
+    let (bytes, max_raw_size) = match encoding {
+        UiTransactionEncoding::Base58 | UiTransactionEncoding::Binary => {
+            if data.len() > MAX_BASE58_SIZE {
+                return Err(RpcError::InvalidParamsWithMessage(format!(
+                    "base58 encoded {} too large: {} bytes (max: encoded/raw {}/{})",
+                    std::any::type_name::<VersionedTransaction>(),
+                    data.len(),
+                    MAX_BASE58_SIZE,
+                    PACKET_DATA_SIZE,
+                )));
+            }
+            let bytes = bs58::decode(data)
+                .into_vec()
+                .map_err(|e| RpcError::InvalidParamsWithMessage(format!("invalid base58: {e}")))?;
+            (bytes, PACKET_DATA_SIZE)
+        }
+        UiTransactionEncoding::Base64 => {
+            let (max_encoded_size, max_raw_size) = if data
+                .as_bytes()
+                .get(..2)
+                .is_some_and(|p| p >= V1_BASE64_PREFIX_LOWER_BOUND)
+            {
+                (MAX_BASE64_SIZE, solana_message::v1::MAX_TRANSACTION_SIZE)
+            } else {
+                (MAX_BASE64_LEGACY_SIZE, PACKET_DATA_SIZE)
+            };
+            if data.len() > max_encoded_size {
+                return Err(RpcError::InvalidParamsWithMessage(format!(
+                    "base64 encoded {} too large: {} bytes (max: encoded/raw {}/{})",
+                    std::any::type_name::<VersionedTransaction>(),
+                    data.len(),
+                    max_encoded_size,
+                    max_raw_size,
+                )));
+            }
+            let bytes = base64::prelude::BASE64_STANDARD
+                .decode(data)
+                .map_err(|e| RpcError::InvalidParamsWithMessage(format!("invalid base64: {e}")))?;
+            (bytes, max_raw_size)
+        }
+        other => {
+            return Err(RpcError::InvalidParamsWithMessage(format!(
+                "unsupported transaction encoding: {other:?}"
+            )));
+        }
+    };
+    if bytes.len() > max_raw_size {
+        return Err(RpcError::InvalidParamsWithMessage(format!(
+            "decoded {} too large: {} bytes (max: {} bytes)",
+            std::any::type_name::<VersionedTransaction>(),
+            bytes.len(),
+            max_raw_size
+        )));
     }
+    Ok(bytes)
 }
 
 fn response(
@@ -592,6 +647,18 @@ fn map_result(
                     .sum::<usize>() as u32,
             ),
             Some(fees.fee_details.total_fee()),
+            None,
+            None,
+        ),
+        Ok(ProcessedTransaction::NoOp(no_op)) => (
+            Some(UiTransactionError::from(TransactionError::clone(
+                &no_op.validation_error,
+            ))),
+            Some(Vec::new()),
+            none_accounts,
+            Some(no_op.compute_unit_limit),
+            Some(no_op.loaded_accounts_bytes_limit),
+            None,
             None,
             None,
         ),
@@ -990,7 +1057,7 @@ fn execute(
     for builtin in solana_builtins::BUILTINS {
         processor.add_builtin(
             builtin.program_id,
-            ProgramCacheEntry::new_builtin(0, builtin.name.len(), builtin.register_fn),
+            ProgramCacheEntry::new_builtin(0, builtin.register_fn),
         );
     }
 
@@ -1011,13 +1078,13 @@ fn execute(
 
     let config = TransactionProcessingConfig {
         account_overrides: None,
-        check_program_deployment_slot: false,
         log_messages_bytes_limit: None,
         limit_to_load_programs: true,
         recording_config: ExecutionRecordingConfig::new_single_setting(true),
         drop_on_failure: false,
         all_or_nothing: false,
-        strict_nonce_size_check: false,
+        strict_nonce_size_check: true,
+        drop_noop_transactions: true,
     };
 
     Ok(processor.load_and_execute_sanitized_transactions(
