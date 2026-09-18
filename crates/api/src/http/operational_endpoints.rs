@@ -3,11 +3,11 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+use cloudbreak_core::modules::rpc_filter_type::RpcFilterType;
 use hyper::body::Incoming;
 use hyper::{Request, StatusCode};
 use serde::Serialize;
 use solana_pubkey::Pubkey;
-use cloudbreak_core::modules::rpc_filter_type::RpcFilterType;
 use std::convert::Infallible;
 use std::str::FromStr;
 use tracing_subscriber::EnvFilter;

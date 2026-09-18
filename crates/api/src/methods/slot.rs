@@ -6,11 +6,11 @@
 use crate::{
     error::RpcError,
     http::{CloudbreakApiResponse, CloudbreakRpcState},
-    methods::resolve_commitment,
+    methods::processed,
 };
 use sea_orm::EntityTrait;
 use serde::{Deserialize, Serialize};
-use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
+use solana_commitment_config::CommitmentConfig;
 use tokio::time::Instant;
 use cloudbreak_entity::slots;
 
@@ -29,11 +29,20 @@ pub async fn get_slot(
 ) -> Result<CloudbreakApiResponse<u64>, RpcError> {
     let start_time = Instant::now();
 
-    let commitment = if let Some(commitment) = config.as_ref().and_then(|c| c.commitment) {
-        resolve_commitment(commitment.commitment, state.processed_commitment)?
-    } else {
-        CommitmentLevel::Finalized
-    };
+    let min_context_slot = config.as_ref().and_then(|c| c.min_context_slot);
+    let read = processed::read(state, config.as_ref().and_then(|c| c.commitment), "getSlot")?;
+
+    if let Some(blocks) = &read.blocks {
+        if let Some(min_slot) = min_context_slot
+            && blocks.slot < min_slot
+        {
+            return Err(RpcError::RpcSlotBehindMinContextSlot {
+                rpc_slot: blocks.slot,
+            });
+        }
+        return Ok(CloudbreakApiResponse::Response(blocks.slot));
+    }
+    let commitment = read.commitment;
 
     let slot_model = slots::Entity::find_by_id(commitment as i32)
         .one(&state.database)
@@ -50,14 +59,14 @@ pub async fn get_slot(
     };
 
     if let Some(cached_slot_data) = cached_slot_data {
-        if rpc_latest_slot - cached_slot_data == 1 {
+        if rpc_latest_slot.saturating_sub(cached_slot_data) == 1 {
             tracing::warn!(target: "slot_mismatch", "Slot mismatch: cached slot: {} - rpc latest slot: {} - commitment: {}", cached_slot_data, rpc_latest_slot, commitment);
-        } else if rpc_latest_slot - cached_slot_data > 1 {
+        } else if rpc_latest_slot.saturating_sub(cached_slot_data) > 1 {
             tracing::error!(target: "slot_mismatch", "Slot mismatch: cached slot: {} - rpc latest slot: {} - commitment: {}", cached_slot_data, rpc_latest_slot, commitment);
         }
     }
 
-    if let Some(min_slot) = config.as_ref().and_then(|c| c.min_context_slot)
+    if let Some(min_slot) = min_context_slot
         && rpc_latest_slot < min_slot
     {
         return Err(RpcError::RpcSlotBehindMinContextSlot {

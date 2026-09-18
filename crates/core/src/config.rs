@@ -753,6 +753,25 @@ pub struct ApiConfig {
     /// `[token-largest-accounts]` state.
     #[serde(rename = "token-largest-accounts", default)]
     pub token_largest_accounts: Option<MethodSection>,
+    /// Serves processed commitment for getAccountInfo, getMultipleAccounts, getBalance,
+    /// getTokenAccountBalance, getTokenSupply and getSlot. Requires `[slot-syncronizer]`.
+    #[serde(rename = "processed-accounts", default)]
+    pub processed_accounts: Option<ProcessedAccountsConfig>,
+}
+
+/// The in-memory processed blocks around the Postgres confirmed slot, fed by a
+/// Yellowstone block subscription. See `modules::processed`.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessedAccountsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Yellowstone gRPC endpoint that allows processed commitment and interslot updates.
+    #[serde(default)]
+    pub endpoint: String,
+    /// Sent as the `x-token` header.
+    #[serde(rename = "x-token", default)]
+    pub x_token: Option<String>,
 }
 
 /// Config section for an optional API method; the method is served only when
@@ -1414,6 +1433,21 @@ impl ApiConfig {
     pub fn supply_enabled(&self) -> bool {
         self.supply.as_ref().is_some_and(|supply| supply.enabled)
     }
+
+    pub fn processed_accounts_enabled(&self) -> bool {
+        self.processed_accounts
+            .as_ref()
+            .is_some_and(|processed| processed.enabled)
+    }
+
+    /// Checks the `[slot-syncronizer]` requirement of an enabled `[processed-accounts]`.
+    pub fn validate_processed_accounts(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.processed_accounts_enabled() || self.slot_syncronizer.enabled,
+            "processed-accounts requires [slot-syncronizer] enabled = true"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -1670,5 +1704,51 @@ mod tests {
         assert_eq!(c.index_eviction_interval, Duration::from_secs(3600));
         // Neutral value guard by default: candidate and incumbent scores compared as-is.
         assert_eq!(c.value_guard_creation_bias, 1.0);
+    }
+
+    const API_BASE: &str = r#"
+[database]
+url = "postgres://localhost/cloudbreak"
+
+[server]
+
+[metrics]
+"#;
+
+    fn api_config(extra: &str) -> Result<ApiConfig> {
+        Ok(toml::from_str(&format!("{API_BASE}\n{extra}"))?)
+    }
+
+    #[test]
+    fn processed_accounts_absent_or_disabled_skips_validation() {
+        for extra in [
+            "",
+            "[slot-syncronizer]\nenabled = false\ninterval_ms = 200\n\n[processed-accounts]\nenabled = false\n",
+        ] {
+            let config = api_config(extra).unwrap();
+            assert!(!config.processed_accounts_enabled());
+            config.validate_processed_accounts().unwrap();
+        }
+    }
+
+    #[test]
+    fn processed_accounts_rejects_unknown_field() {
+        let err = api_config("[processed-accounts]\nenabled = true\nretain-slots = 1\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown field"), "{err}");
+    }
+
+    #[test]
+    fn processed_accounts_requires_slot_syncronizer() {
+        let config = api_config(
+            "[slot-syncronizer]\nenabled = false\ninterval_ms = 200\n\n[processed-accounts]\nenabled = true\nendpoint = \"http://grpc\"\n",
+        )
+        .unwrap();
+        let err = config
+            .validate_processed_accounts()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("slot-syncronizer"), "{err}");
     }
 }

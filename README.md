@@ -27,15 +27,11 @@ The API server exposes the following JSON-RPC methods:
 | `getLargestAccounts`         | Returns the 20 largest accounts by lamport balance, with `filter: circulating\|nonCirculating` support. Optional; requires `[largest-accounts]` on both indexer and API. See [Largest Accounts](#largest-accounts-getlargestaccounts-gettokenlargestaccounts). |
 | `getSupply`                  | Returns the total and circulating supply in lamports plus the non-circulating account list. Optional; requires the `[supply]` section on the indexer and the `[supply]` section on the API. See [Supply](#supply-getsupply). |
 
-Only **confirmed** and **finalized** commitment levels are fully supported. By default, requests with `processed` commitment return an error. This can be overridden via the `processed-commitment` configuration option (see [API Configuration](#api-server-cloudbreakapitoml)).
+**Confirmed** and **finalized** commitment levels are supported for every method. With the optional `[processed-accounts]` section, `getAccountInfo`, `getMultipleAccounts`, `getBalance`, `getTokenAccountBalance`, `getTokenSupply` and `getSlot` also serve **processed** commitment from an in-memory block feed. Every other method handles `processed` through the `processed-commitment` option, which rejects it by default (see [API Configuration](#api-server-cloudbreakapitoml)).
 
 > **Note on `getVersion`.** The `solana-core` field returned by Cloudbreak is a *composite* string of the form `"<upstream-solana-core>-cloudbreak<cloudbreak-version>"` (e.g. `"2.0.21-cloudbreak0.1.0"`). The upstream half is the `solana-core` version reported by the gRPC source the indexer is subscribed to (persisted to the `environment_info` table on indexer startup); the suffix is Cloudbreak's own crate version. This lets clients see *both* what cluster they're effectively talking to and which Cloudbreak build is serving them. If the indexer has never written an upstream version, the prefix falls back to `"unknown"`. The response is cached in-process for 10 minutes.
 
 ## Roadmap
-
-### Processed Commitment Level
-
-Full native support for the `processed` commitment level is planned as an **optional plugin**, allowing operators to enable it when low-latency reads of unconfirmed state are needed. In the meantime, operators can set `processed-commitment = "use-confirmed"` in the API config to respond with `confirmed` data instead of rejecting `processed` requests.
 
 ### Paginated Responses
 
@@ -514,6 +510,27 @@ Example:
 processed-commitment = "use-confirmed"
 ```
 
+#### `[processed-accounts]` (optional)
+
+Serves `processed` commitment for `getAccountInfo`, `getMultipleAccounts`, `getBalance`, `getTokenAccountBalance`, `getTokenSupply` and `getSlot`. The API subscribes to Yellowstone blocks at processed commitment and keeps the blocks around the Postgres confirmed slot in memory. A key written in those blocks is answered from memory. Any other key reads Postgres at the confirmed slot. When the blocks cannot be linked to the confirmed slot, a processed request answers exactly as a confirmed request would, even with `processed-commitment = "reject"`. Other methods keep following `processed-commitment`.
+
+Requires `[slot-syncronizer]` with `enabled = true`. Startup fails without it. Each API instance carries its own block feed.
+
+| Field      | Type     | Default | Description                                                               |
+| ---------- | -------- | ------- | ------------------------------------------------------------------------- |
+| `enabled`  | `bool`   | `false` | Enable processed commitment for the methods above.                        |
+| `endpoint` | `string` | `""`    | Yellowstone gRPC endpoint that allows processed commitment and interslot updates. |
+| `x-token`  | `string` | none    | Yellowstone gRPC access token.                                            |
+
+Example:
+
+```toml
+[processed-accounts]
+enabled = true
+endpoint = "https://grpc.example:443"
+x-token = "..."
+```
+
 #### `unhealthy-response` (top-level, optional)
 
 Controls how the API responds to requests while the node is unhealthy (the `slots.health` flag is unset / the slot syncronizer reports unhealthy). This is a top-level key (not inside any section).
@@ -548,7 +565,7 @@ OpenTelemetry tracing configuration. If this section is omitted, OTel is disable
 | `max-batch-size`  | `u64`         | (none)                    | Max spans per export batch.                                          |
 | `max-queue-size`  | `u64`         | (none)                    | Max queued spans before dropping.                                    |
 | `track-idle-time` | `bool`        | (none)                    | Include idle time in spans.                                          |
-| `span-filter`     | `Vec<String>` | (none)                    | Span names to export. See `example.cloudbreak.api.toml` for the current full list (covers gPA, gTABO/gTABD, JSON encoding, HTTP transport, mint lookups, and the cache finalize span). |
+| `span-filter`     | `Vec<String>` | (none)                    | Span names to export. See `example.cloudbreak.api.toml` for the current full list (covers gPA, gTABO/gTABD, JSON encoding, HTTP transport, mint lookups, the cache finalize span, and the processed and account reads). |
 
 ### Query Tracker Service (`cloudbreak.query-tracker.toml`)
 
@@ -843,7 +860,7 @@ All metrics are emitted in the Prometheus text exposition format on each service
 | Metric                                              | Type              | Labels                 | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | --------------------------------------------------- | ----------------- | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `cloudbreak_api_requests_total`                      | Counter           | `method`, `status`     | Count of RPC method invocations grouped by outcome. `method` ∈ {`gPA`, `gTABO`, `gTABD`, `gTABM`, `gAI`, `getBalance`, `getMultipleAccounts`, `getTokenAccountBalance`, `http`}: `gPA` = `getProgramAccounts`, `gTABO` = `getTokenAccountsByOwner`, `gTABD` = `getTokenAccountsByDelegate`, `gTABM` = `getTokenAccountsByMint`, `gAI` = `getAccountInfo`, `http` is connection-level. `status` ∈ {`success`, `error`, `timeout`}: `error` is incremented on RPC-level failures (bad params, DB failure, stream-mid-error); `timeout` is incremented on `http` when the total `request-timeout` fires. The point-lookup methods (`gAI`, `getBalance`, `getMultipleAccounts`, `getTokenAccountBalance`) emit both `success` and `error`. The streaming methods (`gPA`, `gTABO`, `gTABD`, `gTABM`) emit `error` only — for their total throughput use `cloudbreak_api_request_duration_ms` instead. Note: `getSlot`, `getHealth`, `getVersion`, and `getGenesisHash` are not currently surfaced under this counter.                                                                                                                                                                          |
-| `cloudbreak_api_request_duration_ms`                 | Histogram         | `method`, `bytes`      | Per-stage request latency in milliseconds. `bytes` is the response-size bucket (`0-1KB`, `1-10KB`, `10-100KB`, `100KB-1MB`, `1MB-10MB`, `10MB-50MB`, `50MB-100MB`, `100MB-200MB`, `200MB-500MB`, `500MB+`). `method` values: `gpa` / `gpa_mint` (total in-handler time for `getProgramAccounts`, with `_mint` suffix when a token-mint filter is applied), `gpa_db` (Postgres query time), `gpa_db_first_row_time` (time-to-first-row), `gpa_encode` (account-encoding time), `gpa_json` (JSON serialization time); analogous `gtabo*` / `gtabd*` for the token-account methods; `gAI` / `getBalance` / `getMultipleAccounts` / `getTokenAccountBalance` (single observation per request — total handler + serialization time for the point-lookup methods); `http_with_transport` (end-to-end including body transport, label `bytes` reflects response size); `http_connection` (per-TCP-connection lifetime, label `bytes="0"`). |
+| `cloudbreak_api_request_duration_ms`                 | Histogram         | `method`, `bytes`      | Per-stage request latency in milliseconds. `bytes` is the response-size bucket (`0-1KB`, `1-10KB`, `10-100KB`, `100KB-1MB`, `1MB-10MB`, `10MB-50MB`, `50MB-100MB`, `100MB-200MB`, `200MB-500MB`, `500MB+`). `method` values: `gpa` / `gpa_mint` (total in-handler time for `getProgramAccounts`, with `_mint` suffix when a token-mint filter is applied), `gpa_db` (Postgres query time), `gpa_db_first_row_time` (time-to-first-row), `gpa_encode` (account-encoding time), `gpa_json` (JSON serialization time); analogous `gtabo*` / `gtabd*` for the token-account methods; `gAI` / `getBalance` / `getMultipleAccounts` / `getTokenAccountBalance` / `getTokenSupply` (single observation per request — total handler + serialization time for the point-lookup methods, in fractional milliseconds); `http_with_transport` (end-to-end including body transport, label `bytes` reflects response size); `http_connection` (per-TCP-connection lifetime, label `bytes="0"`). |
 | `cloudbreak_api_requests_by_subscription_id`         | Counter           | `subscription_id_key`  | Per-client request counter, attributed via the HTTP header configured by `[metrics].subscription-id-key` (default `x-subscription-id`). Only the four heavy methods report here: `getProgramAccounts`, `getTokenAccountsByMint`, `getTokenAccountsByOwner`, `getTokenAccountsByDelegate` — the point-lookup methods (`getAccountInfo`, `getBalance`, …) are not counted. Requests with the header absent fold into `unknown-subscription-id`. Batch requests count once per batch entry. |
 | `cloudbreak_api_data_fetched_by_subscription_id`     | Counter           | `subscription_id_key`  | Per-client cumulative response size in bytes (JSON-encoded payload). Same method scope as `cloudbreak_api_requests_by_subscription_id`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `cloudbreak_api_duration_us_by_subscription_id`      | Counter           | `subscription_id_key`  | Per-client cumulative request handling time in **microseconds** — divide by 1000 for milliseconds. Measures handler entry through the last encoded JSON chunk (the same duration the `json_encoding` span reports as `total_wall_time`), excluding HTTP body transport. Same method scope as `cloudbreak_api_requests_by_subscription_id`, so dividing the two yields a mean latency over those methods only. |
@@ -856,6 +873,8 @@ All metrics are emitted in the Prometheus text exposition format on each service
 | `cloudbreak_gpa_cache_max_bytes`                     | IntGauge          | —                      | Configured maximum size of the GPA cache in bytes (`[gpa-cache].max-total-bytes`). |
 | `cloudbreak_gpa_cache_evictions_total`               | Counter           | `used`                 | GPA cache entries evicted by cleanup to make room for a different query. `used` ∈ {`used`, `unused`} indicating whether the evicted entry had ever served a cache hit. A high rate of `unused` evictions indicates cache churn (e.g. `min-bytes-per-query` set too low). |
 | `cloudbreak_gpa_cache_evicted_bytes_total`           | Counter           | `used`                 | Total bytes evicted from the GPA cache by cleanup, with the same `used` labelling as `cloudbreak_gpa_cache_evictions_total`. |
+| `cloudbreak_api_processed_requests_total`            | Counter           | `method`, `route`, `reason` | Processed commitment requests for the methods `[processed-accounts]` serves. `route` is `view` when the processed blocks answer, `degraded` when the request reads as confirmed. `reason` is `none`, `no_blocks`, `unhealthy`, `head_behind` or `finalized_above_anchor`. Registered only when `[processed-accounts]` is enabled. |
+| `cloudbreak_api_processed_confirm_latency_ms`         | Histogram         | —                      | Time from receiving a processed block to the Postgres confirmed slot reaching it, in milliseconds. Registered only when `[processed-accounts]` is enabled. |
 
 ### Indexer (`cloudbreak-index`)
 

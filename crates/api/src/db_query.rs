@@ -89,6 +89,19 @@ pub async fn get_slot_data(db: &DatabaseConnection) -> Option<SlotSyncronizerDat
     })
 }
 
+/// Reads the blockhash that `recent_blockhashes` holds for `slot`.
+pub async fn get_blockhash_at_slot(
+    db: &DatabaseConnection,
+    slot: u64,
+) -> Result<Option<String>, sea_orm::sqlx::Error> {
+    sea_orm::sqlx::query_scalar::<_, String>(
+        "SELECT blockhash FROM recent_blockhashes WHERE slot = $1",
+    )
+    .bind(slot as i64)
+    .fetch_optional(db.get_postgres_connection_pool())
+    .await
+}
+
 /// # W3C traceparent format:
 /// 00-00000000000000000000000000000123-0000000000000123-01
 /// ^^                                                   ^^

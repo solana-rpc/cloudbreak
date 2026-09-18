@@ -1574,6 +1574,7 @@ dependencies = [
  "prometheus",
  "reqwest",
  "rust_decimal",
+ "rustls",
  "sea-orm",
  "serde",
  "serde_json",
@@ -1641,6 +1642,7 @@ dependencies = [
  "lazy_static",
  "prometheus",
  "rust_decimal",
+ "rustls",
  "sea-orm",
  "serde",
  "serde_json",
@@ -1653,6 +1655,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "yellowstone-grpc-client",
  "yellowstone-grpc-proto",
 ]
 

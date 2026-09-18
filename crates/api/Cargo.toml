@@ -16,6 +16,7 @@ authors = [
 ]
 
 [dependencies]
+rustls = { workspace = true }
 cloudbreak-core = { workspace = true }
 serde = { workspace = true }
 sea-orm = { workspace = true }
