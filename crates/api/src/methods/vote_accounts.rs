@@ -7,7 +7,8 @@ use solana_rpc_client_api::response::{RpcVoteAccountInfo, RpcVoteAccountStatus};
 use solana_vote_interface::state::VoteStateV4;
 
 use crate::{
-    error::RpcError, http::CloudbreakRpcState, modules::vote_accounts_cache::StakesSnapshot,
+    error::RpcError, http::CloudbreakRpcState, methods::resolve_commitment,
+    modules::vote_accounts_cache::StakesSnapshot,
 };
 
 /// Default per Solana docs and Agave's `DELINQUENT_VALIDATOR_SLOT_DISTANCE`.
@@ -32,12 +33,18 @@ pub async fn get_vote_accounts(
 ) -> Result<RpcVoteAccountStatus, RpcError> {
     let config = config.unwrap_or_default();
 
+    let commitment = config
+        .commitment
+        .map(|commitment| resolve_commitment(commitment, state.processed_commitment))
+        .transpose()?
+        .unwrap_or(CommitmentLevel::Finalized);
+
     let optional_filter = config
         .vote_pubkey
         .as_deref()
         .map(|s| {
             s.parse::<Pubkey>()
-                .map_err(|e| RpcError::InvalidParamsWithMessage(format!("invalid votePubkey: {e}")))
+                .map_err(|e| RpcError::PubkeyValidationError(format!("{e:?}")))
         })
         .transpose()?;
     let keep_unstaked_delinquents = config.keep_unstaked_delinquents.unwrap_or(false);
@@ -55,24 +62,26 @@ pub async fn get_vote_accounts(
         return Err(state.node_unhealthy());
     }
 
-    let finalized_slot = match state
+    // Reference slot for both the account read and the delinquency distance.
+    let reference_slot = match state
         .slot_syncronizer_data
         .as_ref()
-        .map(|d| d.read().unwrap().finalized_slot.slot)
+        .map(|d| d.read().unwrap().get_slot_for_commitment(commitment))
     {
         Some(slot) if slot > 0 => slot,
         _ => crate::db_query::get_slot_data(&state.database)
             .await
-            .map(|d| d.finalized_slot.slot)
+            .map(|d| d.get_slot_for_commitment(commitment))
             .unwrap_or(0),
     };
 
-    let vote_accounts = load_vote_account_rows(state, optional_filter.as_ref()).await?;
+    let vote_accounts =
+        load_vote_account_rows(state, optional_filter.as_ref(), reference_slot).await?;
 
     let (current, delinquent) = build_status(
         &vote_accounts,
         &stakes,
-        finalized_slot,
+        reference_slot,
         delinquent_slot_distance,
         keep_unstaked_delinquents,
     );
@@ -91,6 +100,7 @@ struct VoteAccountRow {
 async fn load_vote_account_rows(
     state: &CloudbreakRpcState,
     optional_filter: Option<&Pubkey>,
+    slot: u64,
 ) -> Result<Vec<VoteAccountRow>, RpcError> {
     let owner_bytes = VOTE_PROGRAM_ID.to_bytes().to_vec();
 
@@ -100,10 +110,10 @@ async fn load_vote_account_rows(
             SELECT DISTINCT ON (pubkey) pubkey, data, lamports
             FROM (
                 SELECT pubkey, slot, data, lamports FROM accounts
-                    WHERE owner = $1 AND pubkey = $2
+                    WHERE owner = $1 AND pubkey = $2 AND slot <= $3
                 UNION ALL
                 SELECT pubkey, slot, data, lamports FROM snapshot_accounts
-                    WHERE owner = $1 AND pubkey = $2
+                    WHERE owner = $1 AND pubkey = $2 AND slot <= $3
             ) AS u
             ORDER BY pubkey ASC, slot DESC
         )
@@ -114,9 +124,11 @@ async fn load_vote_account_rows(
         WITH latest AS (
             SELECT DISTINCT ON (pubkey) pubkey, data, lamports
             FROM (
-                SELECT pubkey, slot, data, lamports FROM accounts WHERE owner = $1
+                SELECT pubkey, slot, data, lamports FROM accounts
+                    WHERE owner = $1 AND slot <= $2
                 UNION ALL
-                SELECT pubkey, slot, data, lamports FROM snapshot_accounts WHERE owner = $1
+                SELECT pubkey, slot, data, lamports FROM snapshot_accounts
+                    WHERE owner = $1 AND slot <= $2
             ) AS u
             ORDER BY pubkey ASC, slot DESC
         )
@@ -124,14 +136,23 @@ async fn load_vote_account_rows(
         "#
     };
 
+    let slot = slot as i64;
     let stmt = if let Some(filter) = optional_filter {
         Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             sql,
-            [owner_bytes.into(), filter.to_bytes().to_vec().into()],
+            [
+                owner_bytes.into(),
+                filter.to_bytes().to_vec().into(),
+                slot.into(),
+            ],
         )
     } else {
-        Statement::from_sql_and_values(DatabaseBackend::Postgres, sql, [owner_bytes.into()])
+        Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            sql,
+            [owner_bytes.into(), slot.into()],
+        )
     };
 
     let rows = state.database.query_all(stmt).await.map_err(|e| {
@@ -160,7 +181,7 @@ async fn load_vote_account_rows(
 fn build_status(
     rows: &[VoteAccountRow],
     stakes: &StakesSnapshot,
-    finalized_slot: u64,
+    reference_slot: u64,
     delinquent_slot_distance: u64,
     keep_unstaked_delinquents: bool,
 ) -> (Vec<RpcVoteAccountInfo>, Vec<RpcVoteAccountInfo>) {
@@ -215,7 +236,7 @@ fn build_status(
 
         // Mirror Agave: a validator is delinquent when its last vote is at least
         // `delinquent_slot_distance` slots behind the reference slot
-        let is_delinquent = finalized_slot.saturating_sub(last_vote) >= delinquent_slot_distance;
+        let is_delinquent = reference_slot.saturating_sub(last_vote) >= delinquent_slot_distance;
         if is_delinquent {
             if keep_unstaked_delinquents || activated_stake > 0 {
                 delinquent.push(info);

@@ -738,6 +738,8 @@ These two are independent but related: the indexer `[programs]` determines what 
 
 `getVoteAccounts` is optional and only served when the indexer's `[programs]` filter includes both the Vote (`Vote111111111111111111111111111111111111111`) and Stake (`Stake11111111111111111111111111111111111111`) programs. Cloudbreak checks this at startup; if either is missing, the method returns JSON-RPC `-32601 Method not found` and the supporting background tasks are not started.
 
+`commitment` selects the slot the Vote accounts are read at, and the same slot is the reference for `delinquentSlotDistance`. Activated stake comes from the epoch cache below, which is per epoch, so `commitment` does not change it. `processed` follows the `processed-commitment` option; this method has no native processed support.
+
 The response combines two sources. The per-account fields (commission, last vote, root slot, recent epoch credits, node pubkey) are read from the indexed Vote accounts. The per-voter activated stake and epoch-set membership (`epochVoteAccount`) come from a separate `epoch_stakes` table, since effective stake cannot be derived from a single account.
 
 The `epoch_stakes` table is seeded from snapshot metadata. When the indexer loads a snapshot, it extracts each voter's activated stake and epoch-set membership from the snapshot's bank stakes and versioned epoch-stakes data and upserts them into the table. The API loads the latest epoch's rows into an in-memory cache on startup and polls the table every 30 s, refreshing when the epoch advances or the in-epoch stake total changes. Before the indexer has completed a snapshot pass with stake data the cache is empty, and `getVoteAccounts` returns a node-unhealthy error rather than partial results.
