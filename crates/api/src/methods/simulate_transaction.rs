@@ -85,10 +85,6 @@ pub async fn simulate_transaction(
         RpcError::InvalidParamsWithMessage(format!("failed to deserialize transaction: {e}"))
     })?;
 
-    if config.sig_verify && !versioned_tx.verify_with_results().iter().all(|ok| *ok) {
-        return Err(RpcError::TransactionSignatureVerificationFailure);
-    }
-
     let requested_addresses: Vec<Pubkey> = match &config.accounts {
         Some(accounts_config) => {
             let encoding = accounts_config.encoding.unwrap_or(UiAccountEncoding::Base64);
@@ -172,6 +168,17 @@ pub async fn simulate_transaction(
         &reserved_keys,
     )
     .map_err(|e| RpcError::InvalidParamsWithMessage(format!("invalid transaction: {e}")))?;
+
+    // Agave verifies after sanitizing and reports a bad signature inside the result,
+    // not as a JSON-RPC error.
+    if config.sig_verify
+        && let Err(e) = sanitized_tx.verify()
+    {
+        return Ok(response(
+            slot,
+            error_only(e, &config, loaded_addresses, replacement_blockhash),
+        ));
+    }
 
     if requested_addresses.len() > sanitized_tx.message().account_keys().len() {
         return Err(RpcError::InvalidParamsWithMessage(

@@ -30,9 +30,6 @@ pub enum RpcError {
     KeyExcludedFromSecondaryIndex { key: String },
     #[error("Processed commitment level is not supported")]
     ProcessedCommitmentNotSupported,
-    /// Agave's `-32003`, returned by `simulateTransaction` with `sigVerify`.
-    #[error("Transaction signature verification failure")]
-    TransactionSignatureVerificationFailure,
     #[error("Node is unhealthy")]
     NodeUnhealthy {
         /// When `true`, this is surfaced as an HTTP `503 Service Unavailable`
@@ -104,7 +101,6 @@ impl RpcError {
             RpcError::InvalidParamsWithMessage(_) => -32602,
             RpcError::KeyExcludedFromSecondaryIndex { .. } => -32010,
             RpcError::ProcessedCommitmentNotSupported => -32602,
-            RpcError::TransactionSignatureVerificationFailure => -32003,
             RpcError::NodeUnhealthy { .. } => -32005,
             RpcError::AccountOwnerExcluded { .. } => -32010,
             RpcError::AccountNotFound { .. } => -32602,
