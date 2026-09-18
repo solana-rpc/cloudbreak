@@ -505,7 +505,7 @@ Controls how the API handles requests that specify the `processed` commitment le
 
 | Value             | Description                                                                  |
 | ----------------- | ---------------------------------------------------------------------------- |
-| `"reject"`        | **(default)** Return an error when a client requests `processed` commitment. |
+| `"reject"`        | **(default)** Return JSON-RPC `-32602 Processed commitment level is not supported` when a client requests `processed` commitment. |
 | `"use-confirmed"` | Silently respond with `confirmed` data instead of rejecting the request.     |
 
 Example:

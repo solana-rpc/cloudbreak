@@ -86,9 +86,7 @@ pub async fn simulate_transaction(
     })?;
 
     if config.sig_verify && !versioned_tx.verify_with_results().iter().all(|ok| *ok) {
-        return Err(RpcError::InvalidParamsWithMessage(
-            "Transaction signature verification failure".to_string(),
-        ));
+        return Err(RpcError::TransactionSignatureVerificationFailure);
     }
 
     let requested_addresses: Vec<Pubkey> = match &config.accounts {
