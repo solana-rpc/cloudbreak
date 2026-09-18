@@ -3,21 +3,17 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-use sea_orm::sqlx::Row;
-use sea_orm::sqlx::{self};
 use solana_account_decoder::parse_token::token_amount_to_ui_amount_v3;
 use solana_account_decoder_client_types::token::UiTokenAmount;
-use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
+use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::response::{Response as RpcResponse, RpcResponseContext};
-use tokio::time::timeout;
-use tracing::Instrument;
 
 use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
 use crate::methods::token::parse_additional_mint_data;
-use crate::methods::{is_token_program, resolve_commitment};
-use crate::{db_query, metrics};
+use crate::methods::{is_token_program, processed};
+use crate::metrics;
 
 #[tracing::instrument(name = "get_token_account_balance_rpc", skip_all, fields(pubkey = %pubkey))]
 pub async fn get_token_account_balance(
@@ -31,47 +27,31 @@ pub async fn get_token_account_balance(
         .parse()
         .map_err(|e| RpcError::PubkeyValidationError(format!("{e:?}")))?;
 
-    let commitment = commitment
-        .map(|commitment_config| {
-            resolve_commitment(commitment_config.commitment, state.processed_commitment)
-        })
-        .transpose()?
-        .unwrap_or(CommitmentLevel::Finalized);
+    let read = processed::read(state, commitment, "getTokenAccountBalance")?;
 
-    let (latest_slot, block_time) = state.latest_slot_and_block_time(commitment).await?;
+    let (latest_slot, block_time) = read.slot_and_block_time(state).await?;
 
-    let sql_template = include_str!("../db/getTokenAccountBalance.sql");
-    let pubkey_hex = format!("'\\x{}'::bytea", hex::encode(pubkey.as_ref()));
-    let sql = sql_template.replace("$1", &pubkey_hex);
-    let sql = sql.replace("$2", &latest_slot.to_string());
-    let sql = db_query::add_trace_traceparent_to_query(&sql);
+    // The mint JOIN supplies the mint data the balance needs.
+    let sql_template = include_str!("../db/getAccountInfoWithMintData.sql");
+    let accounts = processed::read_accounts(
+        state,
+        &read,
+        std::slice::from_ref(&pubkey),
+        sql_template,
+        latest_slot,
+        true,
+        "getTokenAccountBalance",
+    )
+    .await?;
 
-    tracing::debug!(target: "get_token_account_balance_sql", "## sql: {}", sql);
-
-    let pool = state.database.get_postgres_connection_pool();
-    let rows = timeout(state.queries_timeout, async {
-        let span = tracing::info_span!("get_token_account_balance_db");
-        sqlx::raw_sql(&sql).fetch_all(pool).instrument(span).await
-    })
-    .await
-    .map_err(|_elapsed| {
-        tracing::error!("getTokenAccountBalance query timed out");
-        RpcError::InternalError
-    })?
-    .map_err(|e| {
-        tracing::error!("Database query error: {}", e);
-        RpcError::InternalError
-    })?;
-
-    let Some(row) = rows.first() else {
+    let Some(account) = accounts.into_iter().next().flatten() else {
         // Account not in DB (or its latest version was closed)
         return Err(RpcError::AccountNotFound {
             pubkey: pubkey.to_string(),
         });
     };
 
-    let owner_bytes: Vec<u8> = row.get("owner");
-    let owner = Pubkey::try_from(owner_bytes.as_slice()).map_err(|_| RpcError::InternalError)?;
+    let owner = account.owner;
 
     if !state.indexer_filter.is_program_selected(&owner) {
         return Err(RpcError::AccountOwnerExcluded {
@@ -86,11 +66,10 @@ pub async fn get_token_account_balance(
         });
     }
 
-    // Amount: u64 LE at bytes 64..72 of the token account data. The SQL guarantees
-    // exactly 8 bytes for token-owned accounts (and 8 zero bytes for anything else,
-    // which we've already rejected above).
-    let amount_bytes: Vec<u8> = row.get("amount");
-    let amount_array: [u8; 8] = amount_bytes.as_slice().try_into().map_err(|_| {
+    // Amount: u64 LE at bytes 64..72 of the token account data. Shorter data
+    // yields fewer bytes, as SUBSTRING does, and fails the conversion below.
+    let amount_bytes = sql_substring(&account.data, 64, 8);
+    let amount_array: [u8; 8] = amount_bytes.try_into().map_err(|_| {
         tracing::error!(
             "getTokenAccountBalance: unexpected amount length {} for pubkey {}",
             amount_bytes.len(),
@@ -100,38 +79,24 @@ pub async fn get_token_account_balance(
     })?;
     let amount = u64::from_le_bytes(amount_array);
 
-    // Mint pubkey from the generated token_mint column (bytes 0..32 of data).
-    let mint_pubkey_bytes: Vec<u8> = row.try_get("token_mint").map_err(|e| {
+    // Mint pubkey from bytes 0..32 of the token account data.
+    let mint_pubkey = Pubkey::try_from(sql_substring(&account.data, 0, 32)).map_err(|_| {
         tracing::error!(
-            "getTokenAccountBalance: missing token_mint for pubkey {}: {}",
-            pubkey,
-            e
+            "getTokenAccountBalance: invalid token mint for pubkey {}",
+            pubkey
         );
         RpcError::InternalError
     })?;
-    let mint_pubkey =
-        Pubkey::try_from(mint_pubkey_bytes.as_slice()).map_err(|_| RpcError::InternalError)?;
 
-    // `mint_data` is NULL when the LEFT JOIN finds no live mint row. WSOL needs no
-    // mint row: parse_additional_mint_data hardcodes its decimals.
-    let mint_data: Option<Vec<u8>> = row.try_get("mint_data").map_err(|e| {
-        tracing::error!(
-            "getTokenAccountBalance: invalid mint_data for pubkey {}: {}",
-            pubkey,
-            e
-        );
-        RpcError::InternalError
-    })?;
-    if mint_data.is_none() && mint_pubkey != spl_token_interface::native_mint::id() {
+    // Empty mint data means the mint row is missing or closed. WSOL needs none:
+    // parse_additional_mint_data hardcodes its decimals.
+    let mint_data = account.mint_data();
+    if mint_data.is_empty() && mint_pubkey != spl_token_interface::native_mint::id() {
         return Err(RpcError::MintDataNotFound {
             mint: mint_pubkey.to_string(),
         });
     }
-    let additional_mint_data = parse_additional_mint_data(
-        &mint_pubkey,
-        mint_data.as_deref().unwrap_or_default(),
-        block_time,
-    );
+    let additional_mint_data = parse_additional_mint_data(&mint_pubkey, mint_data, block_time);
 
     let additional_data = additional_mint_data
         .as_ref()
@@ -149,4 +114,23 @@ pub async fn get_token_account_balance(
         },
         value: ui_token_amount,
     })
+}
+
+/// The bytes `SUBSTRING(data FROM start + 1 FOR len)` returns: shorter when data ends early.
+fn sql_substring(data: &[u8], start: usize, len: usize) -> &[u8] {
+    let end = (start + len).min(data.len());
+    &data[start.min(end)..end]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sql_substring_matches_postgres_on_short_data() {
+        let data = [1u8, 2, 3, 4, 5];
+        assert_eq!(sql_substring(&data, 1, 2), &[2, 3]);
+        assert_eq!(sql_substring(&data, 3, 8), &[4, 5]);
+        assert!(sql_substring(&data, 64, 8).is_empty());
+    }
 }

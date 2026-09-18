@@ -21,6 +21,7 @@ pub mod get_token_largest_accounts;
 pub mod get_token_supply;
 pub mod mint;
 pub mod mint_accounts;
+pub(crate) mod processed;
 pub mod program;
 pub mod simulate_transaction;
 pub mod slot;

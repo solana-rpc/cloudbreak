@@ -7,6 +7,7 @@ pub mod account_owner_map;
 pub mod index_identity;
 pub mod largest_accounts;
 pub mod non_circulating;
+pub mod processed;
 pub mod query_tracker_api;
 pub mod rpc_filter_type;
 pub mod service_health;

@@ -3,16 +3,21 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+use crate::error::RpcError;
 use crate::http::server::HttpHandlerResponse;
 use crate::http::server::ResponseBody;
 use crate::modules::bandwidth;
 use crate::modules::cache::GpaProcessor;
 use crate::modules::supply_cache::SharedSupplySnapshot;
 use crate::modules::vote_accounts_cache::SharedStakesSnapshot;
-use crate::error::RpcError;
 use crate::query_tracker_client::QueryTrackerClient;
 use crate::slot_syncronizer::SlotSyncronizerData;
 use agave_feature_set::FeatureSet;
+use cloudbreak_core::modules::processed::ProcessedAccounts;
+use cloudbreak_core::{
+    AccountSelectorConfig, MethodSection, ProcessedCommitmentBehavior, UnhealthyResponseBehavior,
+};
+use cloudbreak_entity::slots;
 use hyper::StatusCode;
 use sea_orm::{DatabaseConnection, EntityTrait};
 use serde::{Deserialize, Serialize};
@@ -22,10 +27,6 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tracing::Instrument;
-use cloudbreak_core::{
-    AccountSelectorConfig, MethodSection, ProcessedCommitmentBehavior, UnhealthyResponseBehavior,
-};
-use cloudbreak_entity::slots;
 
 #[derive(Clone)]
 pub struct CachedFeatureSet {
@@ -121,6 +122,9 @@ pub struct CloudbreakRpcState {
     /// The `[token-largest-accounts]` API section; getTokenLargestAccounts is
     /// served when its `enabled` flag is set.
     pub token_largest_accounts: MethodSection,
+    /// The `[processed-accounts]` handle. The disabled handle routes every
+    /// request through `resolve_commitment`.
+    pub processed: ProcessedAccounts,
 }
 
 impl CloudbreakRpcState {
@@ -146,6 +150,7 @@ impl CloudbreakRpcState {
         supply_cache: SharedSupplySnapshot,
         largest_accounts: MethodSection,
         token_largest_accounts: MethodSection,
+        processed: ProcessedAccounts,
     ) -> Self {
         Self {
             database,
@@ -169,6 +174,7 @@ impl CloudbreakRpcState {
             feature_set_cache: Arc::new(RwLock::new(None)),
             largest_accounts,
             token_largest_accounts,
+            processed,
         }
     }
 
@@ -177,7 +183,8 @@ impl CloudbreakRpcState {
     /// response layer can decide the HTTP status purely from the error.
     pub fn node_unhealthy(&self) -> RpcError {
         RpcError::NodeUnhealthy {
-            service_unavailable: self.unhealthy_response == UnhealthyResponseBehavior::HttpUnavailable,
+            service_unavailable: self.unhealthy_response
+                == UnhealthyResponseBehavior::HttpUnavailable,
         }
     }
 
