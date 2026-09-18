@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use futures::{FutureExt, Stream};
 use tokio::time::Instant;
-use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient, Interceptor};
+use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
 use yellowstone_grpc_proto::geyser::{
     CommitmentLevel, SubscribeRequest, SubscribeRequestFilterBlocks, SubscribeRequestFilterSlots,
     SubscribeUpdate,
@@ -70,10 +70,7 @@ pub trait Subscriber: Send {
     fn on_connect_failed(&mut self);
 
     /// Runs on every new connection, before the subscribe.
-    fn on_connect(
-        &mut self,
-        client: &mut GeyserGrpcClient<impl Interceptor + Send>,
-    ) -> impl Future<Output = ()> + Send;
+    fn on_connect(&mut self, client: &mut GeyserGrpcClient) -> impl Future<Output = ()> + Send;
 
     /// Consumes one stream until it ends, errors or stalls.
     fn session(
@@ -194,6 +191,7 @@ pub fn blocks_with_accounts_request(
                 include_transactions: Some(false),
                 include_accounts: Some(true),
                 include_entries: Some(false),
+                cuckoo_account_include: None,
             },
         )]),
         blocks_meta: HashMap::new(),
@@ -207,10 +205,7 @@ pub fn blocks_with_accounts_request(
 
 async fn connect(
     options: &GrpcClientOptions,
-) -> Result<
-    GeyserGrpcClient<impl Interceptor + Send>,
-    yellowstone_grpc_client::GeyserGrpcBuilderError,
-> {
+) -> Result<GeyserGrpcClient, yellowstone_grpc_client::GeyserGrpcBuilderError> {
     GeyserGrpcClient::build_from_shared(options.endpoint.clone())
         .expect("Failed to build GeyserGrpcClient")
         .x_token(options.x_token.clone())
@@ -251,7 +246,7 @@ mod tests {
             self.attempts += 1;
         }
 
-        async fn on_connect(&mut self, _client: &mut GeyserGrpcClient<impl Interceptor + Send>) {}
+        async fn on_connect(&mut self, _client: &mut GeyserGrpcClient) {}
 
         async fn session(
             &mut self,

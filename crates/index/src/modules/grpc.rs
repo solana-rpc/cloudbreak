@@ -23,7 +23,7 @@ use tokio::{
     task::JoinHandle,
     time::{Instant, timeout},
 };
-use yellowstone_grpc_client::{GeyserGrpcClient, Interceptor};
+use yellowstone_grpc_client::GeyserGrpcClient;
 use yellowstone_grpc_proto::{
     geyser::{CommitmentLevel, SubscribeRequest, SubscribeUpdate, subscribe_update::UpdateOneof},
     tonic::Status,
@@ -131,7 +131,7 @@ impl Subscriber for IndexerSubscriber {
         metrics::increment_grpc_errors();
     }
 
-    async fn on_connect(&mut self, client: &mut GeyserGrpcClient<impl Interceptor + Send>) {
+    async fn on_connect(&mut self, client: &mut GeyserGrpcClient) {
         match client.get_version().await {
             Ok(response) => store_grpc_version(&response.version, &self.db).await,
             Err(e) => tracing::error!("Failed to get grpc version: {:?}", e),

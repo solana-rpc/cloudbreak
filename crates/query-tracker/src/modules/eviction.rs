@@ -79,6 +79,7 @@ async fn wait_out_backpressure(config: &QueryTrackerConfig) -> bool {
     if !indexer_backpressure::is_under_pressure(
         &config.indexer_metrics,
         config.indexer_metrics_threshold,
+        config.indexer_cleanup_lag_threshold,
     )
     .await
     {
@@ -95,6 +96,7 @@ async fn wait_out_backpressure(config: &QueryTrackerConfig) -> bool {
         if !indexer_backpressure::is_under_pressure(
             &config.indexer_metrics,
             config.indexer_metrics_threshold,
+            config.indexer_cleanup_lag_threshold,
         )
         .await
         {

@@ -22,8 +22,8 @@ use crate::http::CloudbreakRpcState;
 use crate::http::server::{HttpHandlerResponse, ResponseBody};
 use crate::http::streaming::gpa_streaming_response_body;
 use crate::http::{
-    JsonRpcRequest, JsonRpcResponse, RequestContext, RpcRequestPayload, extract_optional_param, extract_param,
-    http_status_for_error, make_error_response, make_error_response_with_status,
+    JsonRpcRequest, JsonRpcResponse, RequestContext, RpcRequestPayload, extract_optional_param,
+    extract_param, http_status_for_error, make_error_response, make_error_response_with_status,
 };
 use crate::methods::slot::RpcGetSlotConfig;
 use crate::methods::token::{

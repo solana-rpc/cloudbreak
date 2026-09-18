@@ -1,6 +1,9 @@
 # The buffer size for queuing finalize slot events
 finalize-slot-buffer-size = 1000
 accounts-owner-map-enabled = false
+# Finalized slots between cleanup drains. 1 drains every slot. Higher values coalesce repeat
+# touches into one delete and retain more account versions for reads to scan past.
+cleanup-interval-slots = 1
 
 # Maintains the running total-supply figure served by getSupply from a bounded
 # hot-accounts cache. Requires an empty [programs] filter,

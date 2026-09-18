@@ -3,16 +3,21 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+use crate::error::RpcError;
 use crate::http::server::HttpHandlerResponse;
 use crate::http::server::ResponseBody;
 use crate::modules::bandwidth;
 use crate::modules::cache::GpaProcessor;
 use crate::modules::supply_cache::SharedSupplySnapshot;
 use crate::modules::vote_accounts_cache::SharedStakesSnapshot;
-use crate::error::RpcError;
 use crate::query_tracker_client::QueryTrackerClient;
 use crate::slot_syncronizer::SlotSyncronizerData;
 use agave_feature_set::FeatureSet;
+use cloudbreak_core::modules::processed::ProcessedAccounts;
+use cloudbreak_core::{
+    AccountSelectorConfig, MethodSection, ProcessedCommitmentBehavior, UnhealthyResponseBehavior,
+};
+use cloudbreak_entity::slots;
 use hyper::StatusCode;
 use sea_orm::{DatabaseConnection, EntityTrait};
 use serde::{Deserialize, Serialize};
@@ -21,11 +26,6 @@ use solana_rpc_client_api::response::Response as RpcResponse;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tracing::Instrument;
-use cloudbreak_core::{
-    AccountSelectorConfig, MethodSection, ProcessedCommitmentBehavior, UnhealthyResponseBehavior,
-};
-use cloudbreak_core::modules::processed::ProcessedAccounts;
-use cloudbreak_entity::slots;
 
 #[derive(Clone)]
 pub struct CachedFeatureSet {
@@ -182,7 +182,8 @@ impl CloudbreakRpcState {
     /// response layer can decide the HTTP status purely from the error.
     pub fn node_unhealthy(&self) -> RpcError {
         RpcError::NodeUnhealthy {
-            service_unavailable: self.unhealthy_response == UnhealthyResponseBehavior::HttpUnavailable,
+            service_unavailable: self.unhealthy_response
+                == UnhealthyResponseBehavior::HttpUnavailable,
         }
     }
 

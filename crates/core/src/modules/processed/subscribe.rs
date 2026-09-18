@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use futures::{Stream, StreamExt};
 use tokio::sync::watch;
-use yellowstone_grpc_client::{GeyserGrpcClient, Interceptor};
+use yellowstone_grpc_client::GeyserGrpcClient;
 use yellowstone_grpc_proto::geyser::{
     CommitmentLevel, SlotStatus, SubscribeRequest, SubscribeUpdate, subscribe_update::UpdateOneof,
 };
@@ -88,7 +88,7 @@ impl Subscriber for FeedWriter {
 
     fn on_connect_failed(&mut self) {}
 
-    async fn on_connect(&mut self, _client: &mut GeyserGrpcClient<impl Interceptor + Send>) {}
+    async fn on_connect(&mut self, _client: &mut GeyserGrpcClient) {}
 
     async fn session(
         &mut self,
