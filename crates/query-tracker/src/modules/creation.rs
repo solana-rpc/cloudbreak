@@ -143,6 +143,7 @@ pub async fn run(store: Store, config: QueryTrackerConfig) {
         if indexer_backpressure::is_under_pressure(
             &config.indexer_metrics,
             config.indexer_metrics_threshold,
+            config.indexer_cleanup_lag_threshold,
         )
         .await
         {
