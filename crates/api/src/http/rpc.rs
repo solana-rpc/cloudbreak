@@ -13,7 +13,7 @@ use solana_commitment_config::CommitmentConfig;
 use solana_rpc_client_api::config::{
     RpcAccountInfoConfig, RpcContextConfig, RpcSimulateTransactionConfig, RpcSupplyConfig,
 };
-use std::convert::Infallible;
+use std::io;
 use std::sync::Arc;
 use tokio::time::Instant;
 
@@ -23,7 +23,7 @@ use crate::http::server::{HttpHandlerResponse, ResponseBody};
 use crate::http::streaming::gpa_streaming_response_body;
 use crate::http::{
     JsonRpcRequest, JsonRpcResponse, RequestContext, RpcRequestPayload, extract_optional_param,
-    extract_param, http_status_for_error, make_error_response, make_error_response_with_status,
+    extract_param, http_status_for_error, make_error_response, make_rpc_error_response,
 };
 use crate::methods::slot::RpcGetSlotConfig;
 use crate::methods::token::{
@@ -39,22 +39,16 @@ pub async fn handle_rpc_request(
     let body = match http_body_util::BodyExt::collect(req.into_body()).await {
         Ok(collected) => collected.to_bytes(),
         Err(e) => {
-            return make_error_response(
-                serde_json::Value::Null,
-                -32700,
-                format!("Parse error: {}", e),
-            );
+            tracing::debug!("Failed to read request body: {e}");
+            return make_rpc_error_response(serde_json::Value::Null, &RpcError::ParseError);
         }
     };
 
     let payload: RpcRequestPayload = match serde_json::from_slice(&body) {
         Ok(p) => p,
         Err(e) => {
-            return make_error_response(
-                serde_json::Value::Null,
-                -32700,
-                format!("Parse error: {}", e),
-            );
+            tracing::debug!("Failed to parse request body: {e}");
+            return make_rpc_error_response(serde_json::Value::Null, &RpcError::ParseError);
         }
     };
 
@@ -129,7 +123,7 @@ async fn process_single_request(
             let healthy = db_query::get_service_health(&state.database).await;
 
             let result = if !healthy {
-                Err(RpcError::InternalError)
+                Err(state.node_unhealthy())
             } else {
                 Ok(serde_json::Value::String("ok".to_string()))
             };
@@ -153,20 +147,20 @@ async fn process_single_request(
 
             json_serialize_response(id, hash, ctx).await
         }
-        "getVoteAccounts" => {
+        // Unsupported or disabled optional methods fall through to the method-not-found arm.
+        "getVoteAccounts" if state.vote_accounts_supported => {
             let config: Option<methods::vote_accounts::GetVoteAccountsConfig> =
                 extract_param(&rpc_request.params, 0).ok().flatten();
             let result = methods::vote_accounts::get_vote_accounts(state, config).await;
             json_serialize_response(id, result, ctx).await
         }
-        // A node with supply disabled falls through to the method-not-found arm.
         "getSupply" if state.supply_enabled => {
             let config: Option<RpcSupplyConfig> =
                 extract_param(&rpc_request.params, 0).ok().flatten();
             let result = methods::get_supply::get_supply(state, config).await;
             json_serialize_response(id, result, ctx).await
         }
-        "simulateTransaction" => {
+        "simulateTransaction" if state.simulation_supported => {
             let transaction: String = match extract_param(&rpc_request.params, 0) {
                 Ok(p) => p,
                 Err(e) => return make_error_response(id, -32602, e),
@@ -298,12 +292,7 @@ async fn process_single_request(
                     metrics::CLOUDBREAK_API_REQUESTS_TOTAL
                         .with_label_values(&["gPA", "error"])
                         .inc();
-                    return make_error_response_with_status(
-                        id,
-                        e.to_numeric_code(),
-                        e.to_error_code().to_string(),
-                        http_status_for_error(&e),
-                    );
+                    return make_rpc_error_response(id, &e);
                 }
             };
 
@@ -321,12 +310,7 @@ async fn process_single_request(
                     metrics::CLOUDBREAK_API_REQUESTS_TOTAL
                         .with_label_values(&["gPA", "error"])
                         .inc();
-                    return make_error_response_with_status(
-                        id,
-                        e.to_numeric_code(),
-                        e.to_error_code().to_string(),
-                        http_status_for_error(&e),
-                    );
+                    return make_rpc_error_response(id, &e);
                 }
             };
 
@@ -361,12 +345,7 @@ async fn process_single_request(
                     metrics::CLOUDBREAK_API_REQUESTS_TOTAL
                         .with_label_values(&["gTABM", "error"])
                         .inc();
-                    return make_error_response_with_status(
-                        id,
-                        e.to_numeric_code(),
-                        e.to_error_code().to_string(),
-                        http_status_for_error(&e),
-                    );
+                    return make_rpc_error_response(id, &e);
                 }
             };
 
@@ -384,12 +363,7 @@ async fn process_single_request(
                     metrics::CLOUDBREAK_API_REQUESTS_TOTAL
                         .with_label_values(&["gTABM", "error"])
                         .inc();
-                    return make_error_response_with_status(
-                        id,
-                        e.to_numeric_code(),
-                        e.to_error_code().to_string(),
-                        http_status_for_error(&e),
-                    );
+                    return make_rpc_error_response(id, &e);
                 }
             };
 
@@ -485,8 +459,7 @@ async fn process_single_request(
         "getLargestAccounts" => {
             // Disabled method: clean JSON-RPC "Method not found".
             if !state.largest_accounts.enabled {
-                let err = RpcError::MethodNotFound;
-                return make_error_response(id, err.to_numeric_code(), err.to_string());
+                return make_rpc_error_response(id, &RpcError::MethodNotFound);
             }
 
             let start_time = Instant::now();
@@ -528,8 +501,7 @@ async fn process_single_request(
         "getTokenLargestAccounts" => {
             // Disabled method: clean JSON-RPC "Method not found".
             if !state.token_largest_accounts.enabled {
-                let err = RpcError::MethodNotFound;
-                return make_error_response(id, err.to_numeric_code(), err.to_string());
+                return make_rpc_error_response(id, &RpcError::MethodNotFound);
             }
 
             let start_time = Instant::now();
@@ -665,7 +637,13 @@ async fn process_single_request(
             json_response
         }
         _ => {
-            return make_error_response(id, -32601, format!("Method not found: {}", method));
+            let reason = if matches!(method, "getVoteAccounts" | "simulateTransaction" | "getSupply") {
+                "not enabled on this node"
+            } else {
+                "unknown method"
+            };
+            tracing::debug!("Method not found: {method} ({reason})");
+            return make_rpc_error_response(id, &RpcError::MethodNotFound);
         }
     };
 
@@ -709,11 +687,7 @@ async fn json_serialize_response<T: Serialize + Send + 'static>(
             Ok(vec![])
         }),
         Err(e) => {
-            let response = JsonRpcResponse::<()>::error(
-                id,
-                e.to_numeric_code(),
-                e.to_error_code().to_string(),
-            );
+            let response = JsonRpcResponse::<()>::from_rpc_error(id, &e);
             serde_json::to_vec(&response)
         }
     };
@@ -727,30 +701,24 @@ async fn json_serialize_response<T: Serialize + Send + 'static>(
 }
 
 async fn gpa_streamed_to_buffered(
-    body: UnsyncBoxBody<Bytes, Infallible>,
+    body: UnsyncBoxBody<Bytes, io::Error>,
     id: serde_json::Value,
 ) -> Vec<u8> {
-    let collected = http_body_util::BodyExt::collect(body)
+    // A body error (mid-stream failure) or invalid JSON both become an internal error entry.
+    let bytes = http_body_util::BodyExt::collect(body)
         .await
-        .expect("streaming body error type is Infallible");
+        .ok()
+        .map(|collected| collected.to_bytes().to_vec())
+        .filter(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).is_ok());
 
-    let bytes = collected.to_bytes().to_vec();
-
-    // If the body was truncated mid-stream, the bytes won't be valid JSON
-    let valid = serde_json::from_slice::<serde_json::Value>(&bytes).is_ok();
-
-    if valid {
+    if let Some(bytes) = bytes {
         bytes
     } else {
-        tracing::error!(target: "api_request_errors_count", "getProgramAccounts streaming body was truncated mid-flight;");
+        tracing::error!(target: "api_request_errors_count", "getProgramAccounts streaming body failed mid-flight;");
         metrics::CLOUDBREAK_API_REQUESTS_TOTAL
             .with_label_values(&["gPA", "error"])
             .inc();
-        let err_response = JsonRpcResponse::<()>::error(
-            id,
-            RpcError::InternalError.to_numeric_code(),
-            RpcError::InternalError.to_error_code().to_string(),
-        );
+        let err_response = JsonRpcResponse::<()>::from_rpc_error(id, &RpcError::InternalError);
         serde_json::to_vec(&err_response).unwrap_or_default()
     }
 }

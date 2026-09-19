@@ -29,7 +29,7 @@ pub async fn get_account_info(
 
     let pubkey: Pubkey = pubkey
         .parse()
-        .map_err(|_| RpcError::PubkeyValidationError(pubkey.clone()))?;
+        .map_err(|e| RpcError::PubkeyValidationError(format!("{e:?}")))?;
 
     let read = processed::read(state, config.commitment, "gAI")?;
 
@@ -38,9 +38,7 @@ pub async fn get_account_info(
     if let Some(min_context_slot) = config.min_context_slot
         && latest_slot < min_context_slot
     {
-        return Err(RpcError::RpcSlotBehindMinContextSlot {
-            rpc_slot: latest_slot,
-        });
+        return Err(RpcError::MinContextSlotNotReached { context_slot: latest_slot });
     }
 
     let encoding = config.encoding.unwrap_or(UiAccountEncoding::Binary);

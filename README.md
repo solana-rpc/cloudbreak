@@ -11,7 +11,7 @@ The API server exposes the following JSON-RPC methods:
 | `getProgramAccounts`         | Returns all accounts owned by a program. Supports `memcmp`, `dataSize`, and `dataSlice` filters.                                                            |
 | `getTokenAccountsByOwner`    | Returns SPL token accounts owned by a specific wallet.                                                                                                     |
 | `getTokenAccountsByDelegate` | Returns SPL token accounts delegated to a specific address.                                                                                                |
-| `getTokenAccountsByMint`     | Returns all token accounts for a given mint. Generic implementation backed by `getProgramAccounts` + a `memcmp(offset=0, mint)` filter; the SPL Token program is used by default, override with `programId` in the config (e.g. for Token-2022). Streamed response shape, same as `getProgramAccounts`. |
+| `getTokenAccountsByMint`     | Returns all token accounts for a given mint. Generic implementation backed by `getProgramAccounts` + a `memcmp(offset=0, mint)` filter; the SPL Token program is used by default, override with `programId` in the config (e.g. for Token-2022). Only SPL Token and Token-2022 are accepted; any other `programId` returns `-32602 Invalid param: unrecognized Token program id`. Streamed response shape, same as `getProgramAccounts`. |
 | `getAccountInfo`             | Returns the latest version of a single account. Supports `base58`, `base64`, `base64+zstd`, and `jsonParsed` encodings, `dataSlice`, and `minContextSlot`. |
 | `getMultipleAccounts`        | Batched `getAccountInfo` for up to `[server].max-multiple-accounts` pubkeys per request (default `100`). Returns `null` per position for missing or indexer-filter-excluded accounts.                   |
 | `getBalance`                 | Returns the lamport balance of an account. Returns `0` for missing or closed accounts (Agave-compatible).                                                  |
@@ -239,7 +239,7 @@ cargo run -p cloudbreak -- --config ./cloudbreak.query-tracker.toml query-tracke
 **First startup notes:**
 
 - If `[snapshot]` is configured, the indexer will download a full Solana snapshot on first start. This can be **very large** (100+ GB for mainnet) and take significant time. With the default `tracker-config.yml` (which uses the public, rate-limited `https://api.mainnet.solana.com` endpoint), the download can also be throttled, so allow extra time or point `tracker-config.yml` at your own snapshot source — see [Cluster Tracker](#cluster-tracker). For a lighter local setup, either remove the `[snapshot]` section to skip snapshot loading entirely (the indexer will begin from live gRPC data only), or index a small program like `Stake11111111111111111111111111111111111111`.
-- **The correct, healthy steady state requires the snapshot to be loaded.** When `[snapshot]` is configured, the indexer stays unhealthy until snapshot processing finishes — the database holds only the partial data streamed in live from gRPC until then, and the `service_health` row (and `getHealth`) stays unhealthy. This is expected: `getSlot` works immediately as data flows in, but health is intentionally the last thing to clear, and while it is unhealthy the slot-gated account methods (`getAccountInfo`, `getMultipleAccounts`, `getProgramAccounts`, the token methods, `simulateTransaction`) return `NODE_UNHEALTHY`. **Running without `[snapshot]` is only meant for a quick smoke test of the full setup, or for iterating on a code change that doesn't need a complete dataset** — in that mode there is no startup snapshot to wait on, so the node reports **healthy** as soon as it begins processing blocks and serves those account methods against the partial live dataset (do **not** treat a no-snapshot node as a source of complete state). See [Troubleshooting: `getHealth` returns `INTERNAL_ERROR`](#gethealth-returns-internal_error) for details.
+- **The correct, healthy steady state requires the snapshot to be loaded.** When `[snapshot]` is configured, the indexer stays unhealthy until snapshot processing finishes — the database holds only the partial data streamed in live from gRPC until then, and the `service_health` row (and `getHealth`) stays unhealthy. This is expected: `getSlot` works immediately as data flows in, but health is intentionally the last thing to clear, and while it is unhealthy the slot-gated account methods (`getAccountInfo`, `getMultipleAccounts`, `getProgramAccounts`, the token methods, `simulateTransaction`) return JSON-RPC error `-32005` (`Node is unhealthy`). **Running without `[snapshot]` is only meant for a quick smoke test of the full setup, or for iterating on a code change that doesn't need a complete dataset** — in that mode there is no startup snapshot to wait on, so the node reports **healthy** as soon as it begins processing blocks and serves those account methods against the partial live dataset (do **not** treat a no-snapshot node as a source of complete state). See [Troubleshooting: `getHealth` returns `-32005 Node is unhealthy`](#gethealth-returns--32005-node-is-unhealthy) for details.
 - The API example config has `[tracing] enabled = true`, which sends traces to the Tempo instance from Docker Compose. If you're not running the compose stack, set `enabled = false` or remove the `[tracing]` section to avoid connection errors in logs.
 
 #### Manual PostgreSQL Setup (Alternative)
@@ -430,22 +430,26 @@ The last three keys only take effect in the API server.
 | `port`                           | `u16`      | `4000`      | Listen port.                                                                                                                                                                                             |
 | `max-connections`                | `u32`      | `100`       | Maximum concurrent HTTP connections.                                                                                                                                                                     |
 | `batch-handling-max-concurrency` | `usize`    | `5`         | Maximum concurrent requests within a single batch JSON-RPC call.                                                                                                                                         |
-| `gpa-stream-batch-size`          | `usize`    | `1000`      | Number of accounts grouped per batch in the streaming `getProgramAccounts` pipeline (DB fetch → encoding). See [Streamed Responses](#streamed-responses).                                                |
+| `gpa-stream-batch-size`          | `usize` (non-zero) | (unset) | Unset (default): `getProgramAccounts` / `getTokenAccountsByMint` fetch and encode every account as one batch before the response starts, so every failure is a JSON-RPC error. Set it to opt in to streaming in batches of this size, which lowers peak memory and time to first byte but aborts the connection on a mid-stream failure. See [Streamed Responses](#streamed-responses). |
 | `request-timeout`                | `Duration` | `"60s"`     | Total per-request wall-clock budget (handler + body transport). When exceeded, the response stream is truncated and the request is counted under the `timeout` status. See [Streamed Responses](#streamed-responses). |
 | `max-multiple-accounts`          | `usize`    | `100`       | Maximum number of pubkeys accepted per `getMultipleAccounts` request. Requests exceeding this limit are rejected with an `InvalidParams` error.                                                          |
 
 #### Streamed Responses
 
-`getProgramAccounts` responses are emitted incrementally as a `Transfer-Encoding: chunked` JSON-RPC body. This keeps peak memory bounded and lets clients start parsing accounts before the server has finished fetching them.
+`getProgramAccounts` and `getTokenAccountsByMint` responses are written as a `Transfer-Encoding: chunked` JSON-RPC body.
 
 Pipeline:
 
-1. **DB fetch** — Postgres rows are streamed by `sqlx` and grouped into batches of `gpa-stream-batch-size` accounts.
+1. **DB fetch** — Postgres rows are read by `sqlx`. By default all rows form a single batch. With `gpa-stream-batch-size` set, rows are grouped into batches of that size.
 2. **Unbounded channel** — completed batches are pushed onto an unbounded `tokio::mpsc` channel so the database connection can close as fast as possible (no head-of-line blocking from slow encoding/clients).
 3. **Encoding** — each batch is decoded into `UiAccount`s (per-batch `spawn_blocking` to keep the runtime responsive).
 4. **JSON serialization** — encoded accounts are serialized into a 64 KB pre-allocated `BytesMut`. Whenever the buffer reaches 32 KB, the filled portion is frozen into a `Bytes` chunk and yielded as a single HTTP body frame. Accounts larger than the chunk threshold cause the buffer to grow naturally and are flushed as a single oversized frame.
 
-The first batch is always peeked synchronously before the response status line is committed — so SQL errors, parameter errors, and similar early failures still surface as a proper JSON-RPC error response, not a truncated `200`. Errors that happen mid-stream truncate the body intentionally; clients see a JSON parse error rather than a silently-truncated valid document.
+The first batch is fetched, encoded, and serialized before the response status line is committed. Any failure up to that point is a proper JSON-RPC error response.
+
+**Default (single batch).** The first batch is the whole result, so SQL errors, query timeouts, and encoding errors (for example base58 data over 128 bytes) are always JSON-RPC errors. This matches Agave, which builds the full result before it responds. The cost is that peak memory per request holds every encoded account, and the first byte waits for the full query and encoding.
+
+**Opt-in streaming (`gpa-stream-batch-size` set).** Accounts are fetched and encoded in batches, which lowers peak memory and time to first byte for large responses. The trade-off: a failure after the first batch cannot be reported as a JSON-RPC error, because HTTP `200` and part of the body are already sent. The server aborts the connection instead (HTTP/1: no final chunk; HTTP/2: stream reset). Clients see a transport error, such as an incomplete body, and must treat the request as failed and retry. A proxy in front of the API must pass the abort through, not buffer the body and end it normally. JSON-RPC batch requests are not affected: they buffer each entry, and a mid-stream failure becomes a `-32603 Internal error` entry.
 
 `request-timeout` is enforced by a `TrackedBody` wrapping the response body. On expiry the body is truncated, the `cloudbreak_api_request_duration_ms` `http_with_transport` observation is **not** recorded, and a `cloudbreak_api_requests_total{method="http",status="timeout"}` counter is incremented instead.
 
@@ -501,7 +505,7 @@ Controls how the API handles requests that specify the `processed` commitment le
 
 | Value             | Description                                                                  |
 | ----------------- | ---------------------------------------------------------------------------- |
-| `"reject"`        | **(default)** Return an error when a client requests `processed` commitment. |
+| `"reject"`        | **(default)** Return JSON-RPC `-32602 Processed commitment level is not supported` when a client requests `processed` commitment. |
 | `"use-confirmed"` | Silently respond with `confirmed` data instead of rejecting the request.     |
 
 Example:
@@ -537,7 +541,7 @@ Controls how the API responds to requests while the node is unhealthy (the `slot
 
 | Value                | Description                                                                                                      |
 | -------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| `"json-rpc-error"`   | **(default)** Return a `NODE_UNHEALTHY` JSON-RPC error (code `-32005`) with HTTP `200 OK`.                        |
+| `"json-rpc-error"`   | **(default)** Return a JSON-RPC error `-32005` (`Node is unhealthy`) with HTTP `200 OK`.                      |
 | `"http-unavailable"` | Return an HTTP `503 Service Unavailable` response instead.                                                        |
 
 > **Note:** `http-unavailable` only applies to single requests. Batch requests always return HTTP `200 OK` with per-item JSON-RPC errors, since an HTTP status cannot be expressed per batch item.
@@ -732,7 +736,9 @@ These two are independent but related: the indexer `[programs]` determines what 
 
 ### Vote Accounts (`getVoteAccounts`)
 
-`getVoteAccounts` is optional and only served when the indexer's `[programs]` filter includes both the Vote (`Vote111111111111111111111111111111111111111`) and Stake (`Stake11111111111111111111111111111111111111`) programs. Cloudbreak checks this at startup; if either is missing, the method returns a `getVoteAccounts is not supported on this node` error and the supporting background tasks are not started.
+`getVoteAccounts` is optional and only served when the indexer's `[programs]` filter includes both the Vote (`Vote111111111111111111111111111111111111111`) and Stake (`Stake11111111111111111111111111111111111111`) programs. Cloudbreak checks this at startup; if either is missing, the method returns JSON-RPC `-32601 Method not found` and the supporting background tasks are not started.
+
+`commitment` selects the slot the Vote accounts are read at, and the same slot is the reference for `delinquentSlotDistance`. Activated stake comes from the epoch cache below, which is per epoch, so `commitment` does not change it. `processed` follows the `processed-commitment` option; this method has no native processed support.
 
 The response combines two sources. The per-account fields (commission, last vote, root slot, recent epoch credits, node pubkey) are read from the indexed Vote accounts. The per-voter activated stake and epoch-set membership (`epochVoteAccount`) come from a separate `epoch_stakes` table, since effective stake cannot be derived from a single account.
 
@@ -744,7 +750,7 @@ The recomputer detects drift by comparing the total activated stake across runs.
 
 ### Simulate Transaction (`simulateTransaction`)
 
-`simulateTransaction` is optional and only served on a **full, unfiltered index** (empty `[programs]` include and exclude lists). Simulation must be able to load any account a transaction touches — including program, lookup-table, sysvar, and feature-gate accounts — so a filtered index cannot serve it. Cloudbreak checks this at startup; if the index is filtered, the method returns a `simulateTransaction is not supported on this node` error.
+`simulateTransaction` is optional and only served on a **full, unfiltered index** (empty `[programs]` include and exclude lists). Simulation must be able to load any account a transaction touches — including program, lookup-table, sysvar, and feature-gate accounts — so a filtered index cannot serve it. Cloudbreak checks this at startup; if the index is filtered, the method returns JSON-RPC `-32601 Method not found`.
 
 The transaction is executed read-only against the indexed account state at the requested slot; nothing is committed. Cloudbreak reconstructs the cluster's actually-activated feature set at that slot from the on-chain feature accounts (rather than enabling all features), so compute-unit accounting and execution behaviour match mainnet. `replaceRecentBlockhash` substitutes the latest recorded blockhash before execution and reports it with its `lastValidBlockHeight`; `sigVerify` verifies signatures; `accounts` returns post-simulation state for the requested addresses; `innerInstructions` includes decoded inner instructions.
 
@@ -1080,16 +1086,18 @@ curl http://localhost:8875/debug/modules/self_healing
 
 If the `[snapshot]` section is configured, the self-healing mechanism will automatically attempt to fill gaps via incremental snapshots fetched through the cluster tracker. If it's not configured (or the tracker has no source producing usable snapshots), gaps cannot be repaired automatically and require manual intervention (e.g. re-running a snapshot or restarting the indexer).
 
-### `getHealth` returns `INTERNAL_ERROR`
+### `getHealth` returns `-32005 Node is unhealthy`
 
-The `service_health` row is only flipped to healthy **after the indexer finishes snapshot processing**. The flag is never set from live gRPC streaming alone, by design — gRPC catch-up cannot produce a complete account state on its own, so the API has no way to know the dataset is correct until a snapshot has been ingested.
+`getHealth` reads the `service_health` row that the indexer maintains. When the node is unhealthy it returns JSON-RPC error `-32005` with message `Node is unhealthy` and `data: {"numSlotsBehind": null}`. With `unhealthy-response = "http-unavailable"`, a single request gets HTTP `503` instead of HTTP `200`. `numSlotsBehind` is always `null`, because the indexer flag does not measure a distance from the cluster tip.
 
-This produces two distinct situations:
+The indexer keeps the node unhealthy while any of these reasons is active:
 
-- **`[snapshot]` is configured and the indexer is still loading it.** `getHealth` will return an error for the entire duration of snapshot processing (can be hours for mainnet) and clear automatically once it completes. This is expected. `getSlot` and `getProgramAccounts` work normally during this window — only `getHealth` is gated.
-- **`[snapshot]` is _not_ configured (no-snapshot / smoke-test mode).** `getHealth` will return `INTERNAL_ERROR` **permanently**, because the only code path that sets the health flag is snapshot completion. This is also expected: the no-snapshot mode is only meant for verifying the full setup wires up correctly, or for iterating on a code change that doesn't require a complete dataset. Add a `[snapshot]` section to the indexer config if you want `getHealth` to eventually clear.
+- **Startup snapshot processing.** With `[snapshot]` configured, the node stays unhealthy until the snapshot is loaded and cleaned up. This can take hours on mainnet and clears on its own. Without `[snapshot]`, this reason clears as soon as the indexer starts processing blocks, so a no-snapshot node reports healthy on a partial dataset (see [Start the Services](#4-start-the-services)).
+- **Gap filling.** A confirmed slot gap pauses finalization and marks the node unhealthy until the gap is repaired. See [Indexer shows unhealthy status](#indexer-shows-unhealthy-status).
 
-If you've configured `[snapshot]` and `getHealth` still isn't clearing after the snapshot finished downloading, check the indexer logs for snapshot-processing errors and the `service_health` row directly:
+While the node is unhealthy, `getAccountInfo`, `getMultipleAccounts`, `getProgramAccounts`, `getTokenAccountsByOwner`, `getTokenAccountsByDelegate`, `getTokenAccountsByMint`, `getTokenAccountBalance`, `getTokenSupply`, `getTokenLargestAccounts`, `getLargestAccounts`, and `simulateTransaction` return the same `-32005` error. `getSupply` does too when the slot syncronizer is enabled. `getSupply`, `getLargestAccounts`, and `getVoteAccounts` also return `-32005` while their caches or records are not ready, whatever the health flag says. `getSlot`, `getBalance`, `getVoteAccounts`, `getVersion`, and `getGenesisHash` do not check the health flag.
+
+If `[snapshot]` is configured and `getHealth` does not clear after the snapshot finished downloading, check the indexer logs for snapshot-processing errors and the `service_health` row directly:
 
 ```sh
 psql "$DATABASE_URL" -c 'SELECT * FROM service_health;'

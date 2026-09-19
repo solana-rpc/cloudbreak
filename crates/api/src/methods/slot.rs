@@ -36,9 +36,7 @@ pub async fn get_slot(
         if let Some(min_slot) = min_context_slot
             && blocks.slot < min_slot
         {
-            return Err(RpcError::RpcSlotBehindMinContextSlot {
-                rpc_slot: blocks.slot,
-            });
+            return Err(RpcError::MinContextSlotNotReached { context_slot: blocks.slot });
         }
         return Ok(CloudbreakApiResponse::Response(blocks.slot));
     }
@@ -69,9 +67,7 @@ pub async fn get_slot(
     if let Some(min_slot) = min_context_slot
         && rpc_latest_slot < min_slot
     {
-        return Err(RpcError::RpcSlotBehindMinContextSlot {
-            rpc_slot: rpc_latest_slot,
-        });
+        return Err(RpcError::MinContextSlotNotReached { context_slot: rpc_latest_slot });
     }
 
     tracing::debug!("get_slot: {}µs", start_time.elapsed().as_micros());

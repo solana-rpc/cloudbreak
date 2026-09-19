@@ -71,13 +71,6 @@ pub async fn simulate_transaction(
     transaction: String,
     config: Option<RpcSimulateTransactionConfig>,
 ) -> Result<RpcResponse<RpcSimulateTransactionResult>, RpcError> {
-    if !state.simulation_supported {
-        return Err(RpcError::InvalidParamsWithMessage(
-            "simulateTransaction is not supported on this node (requires a full, unfiltered index)"
-                .to_string(),
-        ));
-    }
-
     let config = config.unwrap_or_default();
 
     if config.sig_verify && config.replace_recent_blockhash {
@@ -91,12 +84,6 @@ pub async fn simulate_transaction(
     let mut versioned_tx: VersionedTransaction = bincode::deserialize(&tx_bytes).map_err(|e| {
         RpcError::InvalidParamsWithMessage(format!("failed to deserialize transaction: {e}"))
     })?;
-
-    if config.sig_verify && !versioned_tx.verify_with_results().iter().all(|ok| *ok) {
-        return Err(RpcError::InvalidParamsWithMessage(
-            "Transaction signature verification failure".to_string(),
-        ));
-    }
 
     let requested_addresses: Vec<Pubkey> = match &config.accounts {
         Some(accounts_config) => {
@@ -181,6 +168,17 @@ pub async fn simulate_transaction(
         &reserved_keys,
     )
     .map_err(|e| RpcError::InvalidParamsWithMessage(format!("invalid transaction: {e}")))?;
+
+    // Agave verifies after sanitizing and reports a bad signature inside the result,
+    // not as a JSON-RPC error.
+    if config.sig_verify
+        && let Err(e) = sanitized_tx.verify()
+    {
+        return Ok(response(
+            slot,
+            error_only(e, &config, loaded_addresses, replacement_blockhash),
+        ));
+    }
 
     if requested_addresses.len() > sanitized_tx.message().account_keys().len() {
         return Err(RpcError::InvalidParamsWithMessage(
@@ -359,7 +357,7 @@ async fn resolve_slot(
     if let Some(min_context_slot) = config.min_context_slot
         && slot < min_context_slot
     {
-        return Err(RpcError::RpcSlotBehindMinContextSlot { rpc_slot: slot });
+        return Err(RpcError::MinContextSlotNotReached { context_slot: slot });
     }
 
     Ok(slot)

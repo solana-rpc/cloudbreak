@@ -27,7 +27,7 @@ pub async fn get_token_supply(
 
     let pubkey: Pubkey = mint
         .parse()
-        .map_err(|_| RpcError::PubkeyValidationError(mint.clone()))?;
+        .map_err(|e| RpcError::PubkeyValidationError(format!("{e:?}")))?;
 
     let read = processed::read(state, commitment, "getTokenSupply")?;
 
@@ -62,15 +62,15 @@ pub async fn get_token_supply(
     }
 
     if !is_token_program(&owner) {
-        return Err(RpcError::NotATokenAccount {
-            pubkey: pubkey.to_string(),
+        return Err(RpcError::NotATokenMint {
+            mint: pubkey.to_string(),
         });
     }
 
     let data: &[u8] = &account.data;
 
     let mint_state =
-        StateWithExtensions::<Mint>::unpack(data).map_err(|_| RpcError::MintDataNotFound {
+        StateWithExtensions::<Mint>::unpack(data).map_err(|_| RpcError::MintCouldNotBeUnpacked {
             mint: pubkey.to_string(),
         })?;
 
@@ -79,7 +79,7 @@ pub async fn get_token_supply(
     let additional_data = additional_mint_data
         .as_ref()
         .and_then(|d| d.spl_token_additional_data.as_ref())
-        .ok_or_else(|| RpcError::MintDataNotFound {
+        .ok_or_else(|| RpcError::MintCouldNotBeUnpacked {
             mint: pubkey.to_string(),
         })?;
 

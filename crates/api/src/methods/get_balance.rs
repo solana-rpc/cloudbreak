@@ -29,7 +29,7 @@ pub async fn get_balance(
 
     let pubkey: Pubkey = pubkey
         .parse()
-        .map_err(|_| RpcError::PubkeyValidationError(pubkey.clone()))?;
+        .map_err(|e| RpcError::PubkeyValidationError(format!("{e:?}")))?;
 
     let read = processed::read(state, config.commitment, "getBalance")?;
 
@@ -46,9 +46,7 @@ pub async fn get_balance(
             if let Some(min_context_slot) = config.min_context_slot
                 && blocks.slot < min_context_slot
             {
-                return Err(RpcError::RpcSlotBehindMinContextSlot {
-                    rpc_slot: blocks.slot,
-                });
+                return Err(RpcError::MinContextSlotNotReached { context_slot: blocks.slot });
             }
             return Ok(RpcResponse {
                 context: RpcResponseContext {
@@ -109,9 +107,7 @@ pub async fn get_balance(
     if let Some(min_context_slot) = config.min_context_slot
         && context_slot < min_context_slot
     {
-        return Err(RpcError::RpcSlotBehindMinContextSlot {
-            rpc_slot: context_slot,
-        });
+        return Err(RpcError::MinContextSlotNotReached { context_slot });
     }
 
     // `owner` and `lamports` are nullable when the LEFT JOIN finds no

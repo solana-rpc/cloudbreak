@@ -25,7 +25,7 @@ pub async fn get_token_account_balance(
 
     let pubkey: Pubkey = pubkey
         .parse()
-        .map_err(|_| RpcError::PubkeyValidationError(pubkey.clone()))?;
+        .map_err(|e| RpcError::PubkeyValidationError(format!("{e:?}")))?;
 
     let read = processed::read(state, commitment, "getTokenAccountBalance")?;
 
@@ -88,15 +88,20 @@ pub async fn get_token_account_balance(
         RpcError::InternalError
     })?;
 
-    // Pass mint_data (or empty) unconditionally so the WSOL native_mint short-circuit
-    // can hardcode decimals=9 even when the mint account itself isn't in our DB.
-    let additional_mint_data =
-        parse_additional_mint_data(&mint_pubkey, account.mint_data(), block_time);
+    // Empty mint data means the mint row is missing or closed. WSOL needs none:
+    // parse_additional_mint_data hardcodes its decimals.
+    let mint_data = account.mint_data();
+    if mint_data.is_empty() && mint_pubkey != spl_token_interface::native_mint::id() {
+        return Err(RpcError::MintDataNotFound {
+            mint: mint_pubkey.to_string(),
+        });
+    }
+    let additional_mint_data = parse_additional_mint_data(&mint_pubkey, mint_data, block_time);
 
     let additional_data = additional_mint_data
         .as_ref()
         .and_then(|d| d.spl_token_additional_data.as_ref())
-        .ok_or_else(|| RpcError::MintDataNotFound {
+        .ok_or_else(|| RpcError::TokenMintCouldNotBeUnpacked {
             mint: mint_pubkey.to_string(),
         })?;
 

@@ -12,6 +12,7 @@ use solana_pubkey::Pubkey;
 use std::borrow::Cow;
 use std::fs;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::str::FromStr;
 use std::time::Duration;
 use toml::from_str;
@@ -615,11 +616,10 @@ pub struct ServerConfig {
         default = "ServerConfig::default_batch_handling_max_concurrency"
     )]
     pub batch_handling_max_concurrency: usize,
-    #[serde(
-        rename = "gpa-stream-batch-size",
-        default = "ServerConfig::default_gpa_stream_batch_size"
-    )]
-    pub gpa_stream_batch_size: usize,
+    /// Unset (default) sends all `getProgramAccounts` rows as one batch. Setting it
+    /// streams in batches of this size; see "Streamed Responses" in the README.
+    #[serde(rename = "gpa-stream-batch-size", default)]
+    pub gpa_stream_batch_size: Option<NonZeroUsize>,
     #[serde(
         rename = "request-timeout",
         default = "ServerConfig::default_request_timeout",
@@ -636,10 +636,6 @@ pub struct ServerConfig {
 impl ServerConfig {
     pub fn default_max_connections() -> u32 {
         100
-    }
-
-    pub fn default_gpa_stream_batch_size() -> usize {
-        1000
     }
 
     pub fn default_request_timeout() -> Duration {
@@ -708,7 +704,7 @@ pub enum ProcessedCommitmentBehavior {
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum UnhealthyResponseBehavior {
-    /// Return a JSON-RPC error (`NODE_UNHEALTHY`) with HTTP `200 OK` (default).
+    /// Return JSON-RPC error `-32005` (`Node is unhealthy`) with HTTP `200 OK` (default).
     #[default]
     JsonRpcError,
     /// Return an HTTP `503 Service Unavailable` response instead.

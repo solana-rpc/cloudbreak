@@ -23,7 +23,7 @@ max-batch-size = 1000
 # processed-commitment = "reject"
 
 # How to respond to requests while the node is unhealthy.
-# "json-rpc-error" (default) — return a NODE_UNHEALTHY JSON-RPC error with HTTP 200.
+# "json-rpc-error" (default) — return a JSON-RPC error -32005 ("Node is unhealthy") with HTTP 200.
 # "http-unavailable" — return an HTTP 503 Service Unavailable response instead.
 #   (Note: only applies to single requests; batch requests always return HTTP 200
 #    with per-item JSON-RPC errors.)
