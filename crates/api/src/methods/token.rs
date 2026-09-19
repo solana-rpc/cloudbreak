@@ -90,9 +90,12 @@ async fn generate_filters_for_table(
 
     if let Some(additional_filters) = additional_filters {
         for filter in additional_filters {
-            filter
-                .verify()
-                .map_err(|e| RpcError::InvalidParamsWithMessage(format!("Invalid param: {e}")))?;
+            filter.verify().map_err(|e| {
+                RpcError::InvalidParamsWithMessage(format!(
+                    "Invalid param: {}",
+                    e.invalid_param_text()
+                ))
+            })?;
 
             let filter_str = SqlDataSliceFilter::new(&filter, table, true).to_string();
             if let Some(filter_str) = filter_str {

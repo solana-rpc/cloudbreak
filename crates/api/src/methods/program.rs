@@ -182,9 +182,12 @@ pub async fn get_program_accounts(
 
     if let Some(ref filters) = config.filters {
         for filter in filters {
-            filter
-                .verify()
-                .map_err(|e| RpcError::InvalidParamsWithMessage(format!("Invalid param: {e}")))?;
+            filter.verify().map_err(|e| {
+                RpcError::InvalidParamsWithMessage(format!(
+                    "Invalid param: {}",
+                    e.invalid_param_text()
+                ))
+            })?;
         }
     }
 
