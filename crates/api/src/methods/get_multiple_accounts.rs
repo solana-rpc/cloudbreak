@@ -39,7 +39,7 @@ pub async fn get_multiple_accounts(
         .iter()
         .map(|pk| {
             pk.parse::<Pubkey>()
-                .map_err(|_| RpcError::PubkeyValidationError(pk.clone()))
+                .map_err(|e| RpcError::PubkeyValidationError(format!("{e:?}")))
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -50,9 +50,7 @@ pub async fn get_multiple_accounts(
     if let Some(min_context_slot) = config.min_context_slot
         && latest_slot < min_context_slot
     {
-        return Err(RpcError::RpcSlotBehindMinContextSlot {
-            rpc_slot: latest_slot,
-        });
+        return Err(RpcError::MinContextSlotNotReached { context_slot: latest_slot });
     }
 
     // Short-circuit for an empty input list, return `value: []` without touching the DB.

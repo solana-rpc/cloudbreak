@@ -2,7 +2,10 @@
 host = "0.0.0.0"
 port = 4000
 max-connections = 100
-gpa-stream-batch-size = 1000
+# Unset: getProgramAccounts sends one batch, so every failure is a JSON-RPC error.
+# Set to opt in to streaming (lower memory and time to first byte); a mid-stream
+# failure then aborts the connection. See "Streamed Responses" in the README.
+# gpa-stream-batch-size = 1000
 request-timeout = "60s"
 max-multiple-accounts = 100
 
@@ -74,7 +77,7 @@ span-filter = [
 # processed-commitment = "reject"
 
 # How to respond to requests while the node is unhealthy.
-# "json-rpc-error" (default) — return a NODE_UNHEALTHY JSON-RPC error with HTTP 200.
+# "json-rpc-error" (default) — return a JSON-RPC error -32005 ("Node is unhealthy") with HTTP 200.
 # "http-unavailable" — return an HTTP 503 Service Unavailable response instead.
 #   (Note: only applies to single requests; batch requests always return HTTP 200
 #    with per-item JSON-RPC errors.)

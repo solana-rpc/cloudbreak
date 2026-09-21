@@ -134,4 +134,5 @@ SELECT
     deduplicated_program_accounts.token_mint,
     mints.mint_data
 FROM deduplicated_program_accounts
-LEFT JOIN mints ON deduplicated_program_accounts.token_mint = mints.pubkey;
+LEFT JOIN mints ON deduplicated_program_accounts.token_mint = mints.pubkey
+ORDER BY deduplicated_program_accounts.pubkey ASC;
