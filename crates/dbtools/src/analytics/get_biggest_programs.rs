@@ -20,11 +20,19 @@ pub async fn get_biggest_programs(database_url: &str) {
     println!("########################################################");
     println!("Getting biggest programs from snapshot accounts partitions");
     println!("########################################################");
+
+    let partition_rows = db
+        .query_all(Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename LIKE 'snapshot_accounts_p%' ORDER BY tablename",
+        ))
+        .await
+        .expect("Failed to query pg_tables for snapshot_accounts partitions");
+
     let mut owners = Vec::new();
-    for partition in 0..64 {
-        let partition_owners =
-            get_biggest_programs_from_table(&db, &format!("snapshot_accounts_p{}", partition))
-                .await;
+    for row in partition_rows {
+        let table: String = row.try_get("", "tablename").unwrap();
+        let partition_owners = get_biggest_programs_from_table(&db, &table).await;
         if let Some(biggest_owner) = partition_owners.first() {
             owners.push(biggest_owner.to_string());
         }
