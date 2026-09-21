@@ -9,6 +9,7 @@ use base64::Engine as _;
 use rust_decimal::prelude::ToPrimitive;
 use sea_orm::sqlx::{self, Row};
 use solana_account::{AccountSharedData, ReadableAccount};
+use solana_account_decoder::parse_account_data::AccountAdditionalDataV3;
 use solana_account_decoder::{UiAccountEncoding, encode_ui_account};
 use solana_account_decoder_client_types::{UiAccount, token::UiTokenAmount};
 use solana_address_lookup_table_interface::state::AddressLookupTable;
@@ -60,6 +61,8 @@ use tracing::Instrument;
 use crate::db_query;
 use crate::error::RpcError;
 use crate::http::{CachedFeatureSet, CloudbreakRpcState};
+use crate::methods::is_token_program;
+use crate::methods::token::parse_additional_mint_data;
 
 /// Default cluster lamports-per-signature
 const LAMPORTS_PER_SIGNATURE: u64 = 5000;
@@ -111,7 +114,7 @@ pub async fn simulate_transaction(
 
     let original_blockhash = *versioned_tx.message.recent_blockhash();
 
-    let slot = resolve_slot(state, &config).await?;
+    let (slot, block_time) = resolve_slot(state, &config).await?;
 
     let tip = latest_blockhash(state, slot).await?;
     let replacement_blockhash = if config.replace_recent_blockhash {
@@ -207,6 +210,19 @@ pub async fn simulate_transaction(
         .filter_map(|key| fetched.get(key).map(|entry| (*key, entry.clone())))
         .collect();
 
+    // jsonParsed on a token account needs the mint's decimals, so read the mints
+    // behind the requested addresses before execution.
+    let mint_keys = requested_mint_addresses(&fetched, &requested_addresses);
+    let mint_accounts: HashMap<Pubkey, AccountSharedData> = if mint_keys.is_empty() {
+        HashMap::new()
+    } else {
+        fetch_accounts(state, slot, &mint_keys)
+            .await?
+            .into_iter()
+            .map(|(key, (account, _))| (key, account))
+            .collect()
+    };
+
     let nonce = resolve_nonce(&sanitized_tx, &fetched);
     let blockhash_recent = config.replace_recent_blockhash
         || blockhash_is_recent(state, slot, &original_blockhash.to_string()).await?;
@@ -278,6 +294,8 @@ pub async fn simulate_transaction(
         loaded_addresses,
         replacement_blockhash,
         &fallback_accounts,
+        &mint_accounts,
+        block_time,
     )?;
     Ok(response(slot, value))
 }
@@ -342,17 +360,19 @@ fn parse_feature_activated_at(data: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(data[1..9].try_into().ok()?))
 }
 
+/// Returns the slot to simulate against and its block time. The block time feeds
+/// the interest-bearing and scaled-UI mint extensions when encoding jsonParsed.
 async fn resolve_slot(
     state: &CloudbreakRpcState,
     config: &RpcSimulateTransactionConfig,
-) -> Result<u64, RpcError> {
+) -> Result<(u64, i64), RpcError> {
     let commitment = config
         .commitment
         .map(|c| crate::methods::resolve_commitment(c.commitment, state.processed_commitment))
         .transpose()?
         .unwrap_or(CommitmentLevel::Finalized);
 
-    let (slot, _) = state.latest_slot_and_block_time(commitment).await?;
+    let (slot, block_time) = state.latest_slot_and_block_time(commitment).await?;
 
     if let Some(min_context_slot) = config.min_context_slot
         && slot < min_context_slot
@@ -360,7 +380,7 @@ async fn resolve_slot(
         return Err(RpcError::MinContextSlotNotReached { context_slot: slot });
     }
 
-    Ok(slot)
+    Ok((slot, block_time))
 }
 
 async fn blockhash_is_recent(
@@ -552,6 +572,8 @@ fn map_result(
     loaded_addresses: UiLoadedAddresses,
     replacement_blockhash: Option<RpcBlockhash>,
     fallback_accounts: &HashMap<Pubkey, (AccountSharedData, Slot)>,
+    mint_accounts: &HashMap<Pubkey, AccountSharedData>,
+    block_time: i64,
 ) -> Result<RpcSimulateTransactionResult, RpcError> {
     let (pre_balances, post_balances, pre_token_balances, post_token_balances) =
         extract_balances(output.balance_collector);
@@ -618,6 +640,8 @@ fn map_result(
                     config,
                     &executed.loaded_transaction.accounts,
                     fallback_accounts,
+                    mint_accounts,
+                    block_time,
                 )
             };
             (
@@ -767,6 +791,8 @@ fn build_requested_accounts(
     config: &RpcSimulateTransactionConfig,
     post_accounts: &[(Pubkey, AccountSharedData)],
     fallback_accounts: &HashMap<Pubkey, (AccountSharedData, Slot)>,
+    mint_accounts: &HashMap<Pubkey, AccountSharedData>,
+    block_time: i64,
 ) -> Option<Vec<Option<UiAccount>>> {
     let accounts_config = config.accounts.as_ref()?;
     let encoding = accounts_config
@@ -782,10 +808,61 @@ fn build_requested_accounts(
                 .find(|(key, _)| key == &pubkey)
                 .map(|(_, acc)| acc)
                 .or_else(|| fallback_accounts.get(&pubkey).map(|(acc, _)| acc))?;
-            Some(encode_ui_account(&pubkey, account, encoding, None, None))
+            let additional_mint_data =
+                additional_mint_data(account, mint_accounts, encoding, block_time);
+            Some(encode_ui_account(
+                &pubkey,
+                account,
+                encoding,
+                additional_mint_data,
+                None,
+            ))
         })
         .collect();
     Some(out)
+}
+
+/// Decimals for a token account under `jsonParsed`; without them the encoder falls
+/// back to base64. Empty mint data still resolves WSOL through the native-mint path.
+fn additional_mint_data(
+    account: &AccountSharedData,
+    mint_accounts: &HashMap<Pubkey, AccountSharedData>,
+    encoding: UiAccountEncoding,
+    block_time: i64,
+) -> Option<AccountAdditionalDataV3> {
+    if !matches!(encoding, UiAccountEncoding::JsonParsed) || !is_token_program(account.owner()) {
+        return None;
+    }
+    let mint_pubkey = token_mint_from_data(account.data())?;
+    let mint_data = mint_accounts
+        .get(&mint_pubkey)
+        .map(|mint| mint.data())
+        .unwrap_or(&[]);
+    parse_additional_mint_data(&mint_pubkey, mint_data, block_time)
+}
+
+/// Mint pubkey held in bytes 0..32 of a token account
+fn token_mint_from_data(data: &[u8]) -> Option<Pubkey> {
+    if data.len() < 32 {
+        return None;
+    }
+    Pubkey::try_from(&data[..32]).ok()
+}
+
+/// Mints behind the requested addresses that are token accounts
+fn requested_mint_addresses(
+    fetched: &HashMap<Pubkey, (AccountSharedData, Slot)>,
+    requested: &[Pubkey],
+) -> Vec<Pubkey> {
+    let mut keys: Vec<Pubkey> = requested
+        .iter()
+        .filter_map(|key| fetched.get(key))
+        .filter(|(account, _)| is_token_program(account.owner()))
+        .filter_map(|(account, _)| token_mint_from_data(account.data()))
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys
 }
 
 /// In-memory account store the SVM reads through; the callback only serves what was pre-fetched here
@@ -1092,4 +1169,113 @@ fn execute(
         &environment,
         &config,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::methods::LEGACY_TOKEN_PROGRAM_ID;
+    use solana_account::Account;
+
+    const MINT_DECIMALS: u8 = 6;
+
+    fn account(data: Vec<u8>, owner: Pubkey) -> AccountSharedData {
+        AccountSharedData::from(Account {
+            lamports: 1,
+            data,
+            owner,
+            executable: false,
+            rent_epoch: 0,
+        })
+    }
+
+    /// 82-byte SPL mint: supply at 36, decimals at 44, initialized at 45
+    fn mint_account() -> AccountSharedData {
+        let mut data = vec![0u8; 82];
+        data[44] = MINT_DECIMALS;
+        data[45] = 1;
+        account(data, LEGACY_TOKEN_PROGRAM_ID)
+    }
+
+    fn token_account(mint: &Pubkey) -> AccountSharedData {
+        let mut data = vec![0u8; 165];
+        data[..32].copy_from_slice(mint.as_ref());
+        account(data, LEGACY_TOKEN_PROGRAM_ID)
+    }
+
+    fn mints(mint: Pubkey) -> HashMap<Pubkey, AccountSharedData> {
+        HashMap::from([(mint, mint_account())])
+    }
+
+    #[test]
+    fn json_parsed_token_account_resolves_its_mint_decimals() {
+        let mint = Pubkey::new_unique();
+        let resolved = additional_mint_data(
+            &token_account(&mint),
+            &mints(mint),
+            UiAccountEncoding::JsonParsed,
+            0,
+        )
+        .expect("token account under jsonParsed must resolve its mint");
+        assert_eq!(
+            resolved
+                .spl_token_additional_data
+                .expect("decimals")
+                .decimals,
+            MINT_DECIMALS
+        );
+    }
+
+    #[test]
+    fn other_encodings_and_owners_resolve_no_mint() {
+        let mint = Pubkey::new_unique();
+        assert!(
+            additional_mint_data(
+                &token_account(&mint),
+                &mints(mint),
+                UiAccountEncoding::Base64,
+                0
+            )
+            .is_none()
+        );
+        let system_owned = account(vec![0u8; 165], Pubkey::default());
+        assert!(
+            additional_mint_data(
+                &system_owned,
+                &mints(mint),
+                UiAccountEncoding::JsonParsed,
+                0
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn a_missing_mint_row_falls_back_instead_of_failing() {
+        let mint = Pubkey::new_unique();
+        assert!(
+            additional_mint_data(
+                &token_account(&mint),
+                &HashMap::new(),
+                UiAccountEncoding::JsonParsed,
+                0
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn only_token_accounts_contribute_mint_addresses_to_fetch() {
+        let mint = Pubkey::new_unique();
+        let token = Pubkey::new_unique();
+        let wallet = Pubkey::new_unique();
+        let fetched = HashMap::from([
+            (token, (token_account(&mint), 1u64)),
+            (wallet, (account(Vec::new(), Pubkey::default()), 1u64)),
+        ]);
+        assert_eq!(
+            requested_mint_addresses(&fetched, &[token, wallet]),
+            vec![mint]
+        );
+    }
 }
