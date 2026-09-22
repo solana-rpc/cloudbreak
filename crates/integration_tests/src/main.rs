@@ -24,6 +24,8 @@ mod logging;
 mod response_comparison;
 mod sources;
 mod utils;
+mod verification;
+mod verify;
 
 #[derive(Parser)]
 #[command(name = "integration_tests")]
@@ -57,6 +59,8 @@ enum Commands {
     CompareGenesisHash(compare_genesis_hash::Args),
     /// Compare getVersion: cloudbreak's composite string should embed the cluster's solana-core
     CompareVersion(compare_version::Args),
+    /// Run one method against an endpoint and write the verification result document
+    Verify(verify::Args),
     /// Get slot (legacy)
     GetSlot(get_slot::Args),
 }
@@ -84,6 +88,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::CompareGenesisHash(args) => compare_genesis_hash::run(&args).await?,
         Commands::CompareVersion(args) => compare_version::run(&args).await?,
         Commands::Benchmark(args) => benchmark::run(&args).await?,
+        Commands::Verify(args) => verify::run(&args).await?,
         Commands::GetSlot(args) => get_slot::run(&args).await?,
     }
 

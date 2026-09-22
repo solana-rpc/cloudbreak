@@ -37,11 +37,32 @@ pub enum RequestType {
     SimulateTransaction,
 }
 
+/// One finished run: the tallies, plus the requests backpressure never sent.
+pub struct RunOutcome {
+    pub stats: BenchStats,
+    pub dropped: u64,
+}
+
 pub async fn run(args: &BenchmarkArgs) -> Result<()> {
     let config_content = std::fs::read_to_string(&args.config)?;
     let config: Config = toml::from_str(&config_content)?;
-    let request_type = args.request_type;
+    let outcome = run_with_config(config, args.request_type).await?;
 
+    if outcome.stats.total_mismatches > 0 {
+        anyhow::bail!(
+            "{} mismatch(es) detected (excluding {} no-context mismatches)",
+            outcome.stats.total_mismatches,
+            outcome.stats.total_no_context_mismatches,
+        );
+    }
+
+    Ok(())
+}
+
+/// The run itself, with the config already in hand. `verify` builds its config
+/// from the embedded profile instead of a file, and reads the tallies rather
+/// than the exit status.
+pub async fn run_with_config(config: Config, request_type: RequestType) -> Result<RunOutcome> {
     let Config {
         benchmark,
         rpc1,
@@ -64,6 +85,7 @@ pub async fn run(args: &BenchmarkArgs) -> Result<()> {
         duration_secs,
         timeout_secs,
         start_on_first_request,
+        startup_timeout_secs,
         target_gbits,
     } = benchmark;
 
@@ -121,12 +143,23 @@ pub async fn run(args: &BenchmarkArgs) -> Result<()> {
         let mut idx: usize = 0;
         let mut pending: VecDeque<sources::BenchRequest> = VecDeque::new();
         let mut drained_initial = false;
+        // Bounds the wait for the first request. Without it a source that
+        // yields nothing spins here forever and the run never reports.
+        let startup_deadline = Instant::now() + Duration::from_secs(startup_timeout_secs);
 
         // Will make the requests loop infinitely until the deadline is reached
         loop {
             if let Some(deadline) = deadline
                 && Instant::now() >= deadline
             {
+                break;
+            }
+            if deadline.is_none() && Instant::now() >= startup_deadline {
+                tracing::warn!(
+                    target: "bench_source",
+                    "no request arrived within {}s; ending the run with no samples",
+                    startup_timeout_secs,
+                );
                 break;
             }
             ticker.tick().await;
@@ -231,15 +264,7 @@ pub async fn run(args: &BenchmarkArgs) -> Result<()> {
         target_gbits,
     );
 
-    if stats.total_mismatches > 0 {
-        anyhow::bail!(
-            "{} mismatch(es) detected (excluding {} no-context mismatches)",
-            stats.total_mismatches,
-            stats.total_no_context_mismatches,
-        );
-    }
-
-    Ok(())
+    Ok(RunOutcome { stats, dropped })
 }
 
 pub struct BenchResult {
@@ -255,6 +280,34 @@ pub struct BenchResult {
     /// surfacing the rescue count in the summary; doesn't affect the
     /// match/mismatch tallies (those reflect the final verdict).
     recovered_by_retry: bool,
+    /// Set when rpc1 failed to answer and rpc2 answered. Counts as an error
+    /// against rpc1 and carries no latency or size.
+    rpc1_error: bool,
+}
+
+/// What one comparison pass produced. A send that fails on rpc1 alone is a
+/// verdict on rpc1; any other send failure is not.
+enum PairOutcome {
+    /// Both endpoints answered and the comparison ran.
+    Compared(Box<ComparisonOutcome>),
+    /// rpc1 failed where rpc2 answered.
+    Rpc1Error(String),
+    /// rpc2 failed alone, or both failed. Says nothing about rpc1.
+    NoVerdict,
+}
+
+/// Splits a send pair into its four parts, or into the outcome that ends the
+/// pass. Only rpc1 failing while rpc2 answered convicts rpc1.
+#[allow(clippy::type_complexity)]
+fn classify_pair(
+    r1: Result<(JsonValue, u128)>,
+    r2: Result<(JsonValue, u128)>,
+) -> std::result::Result<(JsonValue, u128, JsonValue, u128), PairOutcome> {
+    match (r1, r2) {
+        (Ok((json1, dur1)), Ok((json2, dur2))) => Ok((json1, dur1, json2, dur2)),
+        (Err(e), Ok(_)) => Err(PairOutcome::Rpc1Error(format!("{e:#}"))),
+        (Ok(_), Err(_)) | (Err(_), Err(_)) => Err(PairOutcome::NoVerdict),
+    }
 }
 
 /// Result of one full comparison pass (rpc1 + rpc2 + slot compensation +
@@ -289,7 +342,7 @@ async fn run_comparison(
     retry_with_context: bool,
     db_probe_ctx: Option<&DbProbeCtx>,
     bw_meter: &Arc<crate::bandwidth::BwMeter>,
-) -> Result<ComparisonOutcome> {
+) -> Result<PairOutcome> {
     let mut iterations: Option<Vec<response_comparison::IterationCapture>> = comparison_config
         .save_compensation_iterations
         .then(Vec::new);
@@ -304,8 +357,10 @@ async fn run_comparison(
         bw_meter,
     )
     .await;
-    let (json1, duration1) = r1?;
-    let (json2, duration2) = r2?;
+    let (json1, duration1, json2, duration2) = match classify_pair(r1, r2) {
+        Ok(parts) => parts,
+        Err(outcome) => return Ok(outcome),
+    };
 
     if let Some(it) = iterations.as_mut() {
         it.push(response_comparison::IterationCapture {
@@ -358,8 +413,10 @@ async fn run_comparison(
             bw_meter,
         )
         .await;
-        let (ctx_json1, ctx_dur1) = ctx_r1?;
-        let (ctx_json2, ctx_dur2) = ctx_r2?;
+        let (ctx_json1, ctx_dur1, ctx_json2, ctx_dur2) = match classify_pair(ctx_r1, ctx_r2) {
+            Ok(parts) => parts,
+            Err(outcome) => return Ok(outcome),
+        };
 
         if let Some(it) = iterations.as_mut() {
             it.push(response_comparison::IterationCapture {
@@ -398,12 +455,12 @@ async fn run_comparison(
         context_retry_retries = ctx_retries;
     }
 
-    Ok(ComparisonOutcome {
+    Ok(PairOutcome::Compared(Box::new(ComparisonOutcome {
         response_comparison,
         compare_result,
         internal_retries: retries + context_retry_retries,
         iterations,
-    })
+    })))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -453,6 +510,7 @@ async fn process_request(
             slots_behind: None,
             no_context_mismatch: false,
             recovered_by_retry: false,
+            rpc1_error: false,
         }) {
             tracing::error!("results_tx.send Error: {}", e);
         }
@@ -505,7 +563,7 @@ async fn process_request(
     };
 
     let original_start = Instant::now();
-    let original = run_comparison(
+    let original = match run_comparison(
         client,
         rpc1,
         rpc2,
@@ -517,7 +575,34 @@ async fn process_request(
         db_probe_ctx_ref,
         bw_meter,
     )
-    .await?;
+    .await?
+    {
+        PairOutcome::Compared(outcome) => *outcome,
+        // rpc1 failed where the reference answered. Record it as a verdict on
+        // rpc1 instead of dropping the request from the run.
+        PairOutcome::Rpc1Error(detail) => {
+            tracing::error!(
+                target: "bench_compare::error",
+                "💥 {} failed where {} answered: {}",
+                rpc1.name, rpc2.name, detail,
+            );
+            if let Err(e) = results_tx.send(BenchResult {
+                duration: 0,
+                size: 0,
+                encoding: encoding.clone(),
+                rpc_name: rpc1.name.clone(),
+                correct_response: None,
+                slots_behind: None,
+                no_context_mismatch: false,
+                recovered_by_retry: false,
+                rpc1_error: true,
+            }) {
+                tracing::error!("results_tx.send Error: {}", e);
+            }
+            return Ok(());
+        }
+        PairOutcome::NoVerdict => return Ok(()),
+    };
     let original_elapsed_ms = original_start.elapsed().as_millis();
 
     utils::print_request_result(
@@ -540,6 +625,7 @@ async fn process_request(
         slots_behind: None,
         no_context_mismatch: false,
         recovered_by_retry: false,
+        rpc1_error: false,
     }) {
         tracing::error!("results_tx.send Error: {}", e);
     }
@@ -554,7 +640,14 @@ async fn process_request(
         None
     } else if let Some(handle) = scheduled_retry_handle {
         match handle.await {
-            Ok(Ok(outcome)) => Some(outcome),
+            // A retry only fires after the original already produced a
+            // verdict, so its own send failures are logged, not counted again.
+            Ok(Ok(PairOutcome::Compared(outcome))) => Some(*outcome),
+            Ok(Ok(PairOutcome::Rpc1Error(detail))) => {
+                tracing::error!("scheduled retry: {} failed: {}", rpc1.name, detail);
+                None
+            }
+            Ok(Ok(PairOutcome::NoVerdict)) => None,
             Ok(Err(e)) => {
                 tracing::error!("scheduled retry comparison failed: {}", e);
                 None
@@ -579,7 +672,12 @@ async fn process_request(
         )
         .await
         {
-            Ok(outcome) => Some(outcome),
+            Ok(PairOutcome::Compared(outcome)) => Some(*outcome),
+            Ok(PairOutcome::Rpc1Error(detail)) => {
+                tracing::error!("on-mismatch retry: {} failed: {}", rpc1.name, detail);
+                None
+            }
+            Ok(PairOutcome::NoVerdict) => None,
             Err(e) => {
                 tracing::error!("on-mismatch retry comparison failed: {}", e);
                 None
@@ -600,6 +698,7 @@ async fn process_request(
             slots_behind: None,
             no_context_mismatch: false,
             recovered_by_retry: false,
+            rpc1_error: false,
         }) {
             tracing::error!("results_tx.send Error: {}", e);
         }
@@ -612,6 +711,7 @@ async fn process_request(
             slots_behind: None,
             no_context_mismatch: false,
             recovered_by_retry: false,
+            rpc1_error: false,
         }) {
             tracing::error!("results_tx.send Error: {}", e);
         }
@@ -645,6 +745,7 @@ async fn process_request(
         slots_behind: verdict_outcome.compare_result.context_matches.slots_behind,
         no_context_mismatch: verdict_outcome.compare_result.is_no_context_mismatch(),
         recovered_by_retry,
+        rpc1_error: false,
     }) {
         tracing::error!("results_tx.send Error: {}", e);
     }
@@ -741,21 +842,23 @@ struct BucketKey {
     encoding: String,
 }
 
-struct BenchStats {
+pub struct BenchStats {
     buckets: HashMap<BucketKey, Vec<u128>>,
-    rpc1_name: String,
-    total_requests: u64,
-    total_mismatches: u64,
-    total_no_context_mismatches: u64,
-    total_matches: u64,
+    pub rpc1_name: String,
+    pub total_requests: u64,
+    pub total_mismatches: u64,
+    pub total_no_context_mismatches: u64,
+    pub total_matches: u64,
     /// Count of comparisons where the original mismatched but the retry-in-place
     /// rescued the request. Contributes to `total_matches` (i.e. the final
     /// verdict), not in addition to it.
-    total_recovered_by_retry: u64,
-    start_time: Instant,
-    total_with_context: u64,
-    total_compared: u64,
-    slot_diffs: Vec<i64>,
+    pub total_recovered_by_retry: u64,
+    /// Requests where rpc1 failed to answer and rpc2 answered.
+    pub total_rpc1_errors: u64,
+    pub start_time: Instant,
+    pub total_with_context: u64,
+    pub total_compared: u64,
+    pub slot_diffs: Vec<i64>,
 }
 
 impl BenchStats {
@@ -768,6 +871,7 @@ impl BenchStats {
             total_no_context_mismatches: 0,
             total_matches: 0,
             total_recovered_by_retry: 0,
+            total_rpc1_errors: 0,
             start_time: Instant::now(),
             total_with_context: 0,
             total_compared: 0,
@@ -777,6 +881,13 @@ impl BenchStats {
 
     fn record(&mut self, result: BenchResult) {
         self.total_requests += 1;
+
+        // An rpc1 error carries no latency or size, so it stays out of the
+        // buckets and out of the comparison tallies.
+        if result.rpc1_error {
+            self.total_rpc1_errors += 1;
+            return;
+        }
 
         match result.correct_response {
             Some(true) => {
@@ -856,6 +967,20 @@ impl BenchStats {
             );
         }
 
+        if self.total_rpc1_errors > 0 {
+            // The comparison path emits one latency result per endpoint, so
+            // `total_requests` is not the number of verdicts. Rate against the
+            // verdicts: comparisons plus errors.
+            let verdicts = self.total_compared + self.total_rpc1_errors;
+            println!(
+                "{} errors (reference answered): {} ({:.2}% of {} verdicts)",
+                self.rpc1_name,
+                self.total_rpc1_errors,
+                self.total_rpc1_errors as f64 / verdicts as f64 * 100.0,
+                verdicts,
+            );
+        }
+
         if self.total_matches + self.total_mismatches + self.total_no_context_mismatches > 0 {
             println!(
                 "Comparisons: {} matches, {} mismatches, {} no-context mismatches (possible slot lag)",
@@ -929,7 +1054,11 @@ impl BenchStats {
         let has_comparison = rpc_names.len() == 2;
         let w = if has_comparison { 140 } else { 90 };
 
-        if has_comparison {
+        if rpc_names.is_empty() {
+            // No request completed, so there is no latency to bucket. The
+            // error counts above carry the whole story.
+            println!("\nNo latency samples.");
+        } else if has_comparison {
             let name1 = &rpc_names[0];
             let name2 = &rpc_names[1];
             println!(

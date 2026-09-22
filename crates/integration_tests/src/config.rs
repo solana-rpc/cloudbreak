@@ -66,6 +66,11 @@ pub struct BenchmarkConfig {
     #[serde(default)]
     pub start_on_first_request: bool,
 
+    /// How long to wait for the first request when `start_on_first_request`
+    /// is set. A source that yields nothing ends the run instead of hanging.
+    #[serde(default = "defaults::startup_timeout_secs")]
+    pub startup_timeout_secs: u64,
+
     /// Optional bandwidth cap in Gbit/s, enforced against *actual received*
     /// rpc1 response bytes. Acts as an upper bound together with `target_rps`:
     /// if byte throughput hits this limit below `target_rps`, effective RPS is
@@ -190,6 +195,9 @@ pub struct ComparisonConfig {
 mod defaults {
     pub fn max_in_flight() -> usize {
         100
+    }
+    pub fn startup_timeout_secs() -> u64 {
+        60
     }
     pub fn timeout_secs() -> u64 {
         30

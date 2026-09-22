@@ -1,0 +1,64 @@
+# Policy for `integration_tests verify`. Compiled into the binary with
+# `include_str!`, so it ships inside the same signed release as the code.
+#
+# This file holds no endpoint and no URL. Targets arrive as flags, so nothing
+# internal is published here. See crates/integration_tests/README.md.
+
+[default]
+target_rps = 20
+duration_secs = 30
+timeout_secs = 20
+max_in_flight = 100
+start_on_first_request = true
+# A source that yields nothing ends the run instead of hanging. The run then
+# reports UNKNOWN, which is not a pass.
+startup_timeout_secs = 60
+target_gbits = 1.0
+
+# A run below the sample floor reports UNKNOWN: one failure would swing the
+# rate past the threshold.
+min_samples = 100
+# At or above this share of failed verdicts the run reports CRITICAL. Below it,
+# and above zero, WARNING.
+error_rate_critical = 0.01
+
+[default.comparison]
+ratio = 1.0
+enable_slot_compensation = true
+slot_compensation_max_retries = 20
+slot_compensation_interval_ms = 100
+# The alloc is thrown away after the run, and the result document carries the
+# counts. Saving payloads to disk would only risk logging them.
+save_mismatches = false
+save_compensation_iterations = false
+save_db_probe_iterations = false
+
+[default.retry_in_place]
+# Rescue-only. `retry_after_ms` is left unset on purpose: scheduling a retry for
+# every request doubles traffic on both endpoints, and this runs on shared
+# infrastructure.
+enabled = true
+save_rescued = false
+
+[default.print_config]
+# Stdout reaches VictoriaLogs with 90-day retention, so the run stays quiet.
+# Sampling would dump full request and response payloads.
+min_request_bytes = 0
+min_request_duration_ms = 0
+min_request_account_count = 0
+log_matches = false
+log_mismatches = true
+log_rescues = false
+log_no_context_mismatches = true
+log_compare_errors = true
+log_individual_requests = false
+
+# Per-method overrides, merged over [default].
+
+[method.simulate-transaction]
+# A recentBlockhash is accepted for about 60 seconds, so replayed requests must
+# be fresh. This method has no fixture and needs --source-url.
+[method.simulate-transaction.source]
+window_seconds = 30
+poll_interval_secs = 5
+replay_once = true

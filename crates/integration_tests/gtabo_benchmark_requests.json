@@ -1,0 +1,182 @@
+[
+  {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "getTokenAccountsByOwner",
+    "params": [
+      "5tzFkiKscXHK5ZXCGbXZxdw7gTjjD1mBwuoFbhUvuAi9",
+      {
+        "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+      },
+      {
+        "encoding": "jsonParsed",
+        "commitment": "confirmed"
+      }
+    ]
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": 2,
+    "method": "getTokenAccountsByOwner",
+    "params": [
+      "5tzFkiKscXHK5ZXCGbXZxdw7gTjjD1mBwuoFbhUvuAi9",
+      {
+        "mint": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+      },
+      {
+        "encoding": "base64",
+        "commitment": "confirmed"
+      }
+    ]
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": 3,
+    "method": "getTokenAccountsByOwner",
+    "params": [
+      "5tzFkiKscXHK5ZXCGbXZxdw7gTjjD1mBwuoFbhUvuAi9",
+      {
+        "mint": "So11111111111111111111111111111111111111112"
+      },
+      {
+        "encoding": "base64+zstd",
+        "commitment": "confirmed"
+      }
+    ]
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": 4,
+    "method": "getTokenAccountsByOwner",
+    "params": [
+      "5tzFkiKscXHK5ZXCGbXZxdw7gTjjD1mBwuoFbhUvuAi9",
+      {
+        "mint": "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"
+      },
+      {
+        "encoding": "jsonParsed",
+        "commitment": "confirmed"
+      }
+    ]
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": 5,
+    "method": "getTokenAccountsByOwner",
+    "params": [
+      "5tzFkiKscXHK5ZXCGbXZxdw7gTjjD1mBwuoFbhUvuAi9",
+      {
+        "mint": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
+      },
+      {
+        "encoding": "base64",
+        "commitment": "confirmed"
+      }
+    ]
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": 6,
+    "method": "getTokenAccountsByOwner",
+    "params": [
+      "H8sMJSCQxfKiFTCfDR3DUMLPwcRbM61LGFJ8N4dK3WjS",
+      {
+        "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+      },
+      {
+        "encoding": "base64+zstd",
+        "commitment": "confirmed"
+      }
+    ]
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": 7,
+    "method": "getTokenAccountsByOwner",
+    "params": [
+      "H8sMJSCQxfKiFTCfDR3DUMLPwcRbM61LGFJ8N4dK3WjS",
+      {
+        "mint": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+      },
+      {
+        "encoding": "jsonParsed",
+        "commitment": "confirmed"
+      }
+    ]
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": 8,
+    "method": "getTokenAccountsByOwner",
+    "params": [
+      "H8sMJSCQxfKiFTCfDR3DUMLPwcRbM61LGFJ8N4dK3WjS",
+      {
+        "mint": "So11111111111111111111111111111111111111112"
+      },
+      {
+        "encoding": "base64",
+        "commitment": "confirmed"
+      }
+    ]
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": 9,
+    "method": "getTokenAccountsByOwner",
+    "params": [
+      "H8sMJSCQxfKiFTCfDR3DUMLPwcRbM61LGFJ8N4dK3WjS",
+      {
+        "mint": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
+      },
+      {
+        "encoding": "base64+zstd",
+        "commitment": "confirmed"
+      }
+    ]
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": 10,
+    "method": "getTokenAccountsByOwner",
+    "params": [
+      "H8sMJSCQxfKiFTCfDR3DUMLPwcRbM61LGFJ8N4dK3WjS",
+      {
+        "mint": "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn"
+      },
+      {
+        "encoding": "jsonParsed",
+        "commitment": "confirmed"
+      }
+    ]
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": 11,
+    "method": "getTokenAccountsByOwner",
+    "params": [
+      "FWznbcNXWQuHTawe9RxvQ2LdCENssh12dsznf4RiouN5",
+      {
+        "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+      },
+      {
+        "encoding": "base64",
+        "commitment": "confirmed"
+      }
+    ]
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": 12,
+    "method": "getTokenAccountsByOwner",
+    "params": [
+      "FWznbcNXWQuHTawe9RxvQ2LdCENssh12dsznf4RiouN5",
+      {
+        "mint": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+      },
+      {
+        "encoding": "base64+zstd",
+        "commitment": "confirmed"
+      }
+    ]
+  }
+]

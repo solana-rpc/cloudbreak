@@ -104,6 +104,48 @@ cargo run --bin integration_tests -- benchmark -c custom.toml gpa
 | `get-multiple-accounts`       | `base64`                                                                                                        |
 | `get-balance` / `get-token-account-balance` | `none` (these methods have no `encoding` field)                                                   |
 
+### `verify`
+
+Runs one method against one endpoint, compares every response against a reference endpoint, and writes the result document the shared verification runner collects. See ACC-372.
+
+```sh
+integration_tests verify \
+  --method gpa \
+  --endpoint http://cloudbreak:8899 \
+  --reference-endpoint http://agave:8899 \
+  --json-file /alloc/data/result.json
+```
+
+`verify` is a wrapper around `benchmark`. The comparison is the assertion. It adds three things: a fixed policy, a pass or fail verdict, and the result document.
+
+| Argument | Description |
+| -- | -- |
+| `--method` | The request type to exercise. Same values as `benchmark` |
+| `--endpoint` | The endpoint under test |
+| `--reference-endpoint` | The endpoint treated as the source of truth |
+| `--json-file` | Where to write the result document |
+| `--source-file` | Read requests from this file instead of the built-in fixture |
+| `--source-url` | Read requests from VictoriaLogs instead of the built-in fixture |
+| `--profile` | Override the built-in profile. For local use |
+| `--endpoint-name` | Name for the endpoint under test in logs and in the document |
+
+**Policy lives in `verify-profile.toml`**, compiled into the binary with `include_str!`. It holds the rate, the duration, the comparison settings and the thresholds. It holds no endpoint and no URL, because this repo keeps internal endpoints out of git. Targets always arrive as flags.
+
+**Requests come from a fixture by default.** `gpa` and `gtabo` each ship a checked-in request set, also compiled in. A fixed set makes a gate run reproducible: a failure can be re-run with the same input. `--source-url` switches to live VictoriaLogs traffic, which is representative but different every run.
+
+**Status.** Each check reports `OK`, `WARNING`, `CRITICAL` or `UNKNOWN`, and the run takes the worst. The exit code is zero on `OK` and `WARNING`, non-zero otherwise.
+
+| Condition | Status |
+| -- | -- |
+| No verdicts, or fewer than `min_samples` | `UNKNOWN` |
+| No failed verdicts | `OK` |
+| Failed verdicts below `error_rate_critical` | `WARNING` |
+| Failed verdicts at or above `error_rate_critical` | `CRITICAL` |
+
+A failed verdict is a mismatch, a no-context mismatch, or a request the endpoint under test failed to answer while the reference answered. Two cases are deliberately not failures: both endpoints returning an error, and the reference failing alone. Neither convicts the endpoint under test.
+
+An empty run is never a pass. Zero verdicts reports `UNKNOWN`, because it means the harness failed rather than that the target is healthy.
+
 ### `compare` (legacy)
 
 Compares the full set of pubkeys returned by `getProgramAccounts` between two endpoints, then checks transaction history for any differences.
@@ -153,6 +195,7 @@ Controls load generation.
 | `target_rps`    | _(required)_ | Target requests per second. Requests are spawned at this rate independently of response latency |
 | `max_in_flight` | `100`        | Maximum concurrent in-flight requests. Requests beyond this limit are dropped                   |
 | `duration_secs` | `0`          | How long to run in seconds. `0` exits immediately (should be set)                               |
+| `startup_timeout_secs` | `60`  | How long to wait for the first request when `start_on_first_request` is set. A source that yields nothing ends the run instead of hanging forever |
 | `target_gbits`  | _(none)_     | Optional bandwidth cap in **Gbit/s**, enforced against the actual received rpc1 response bytes. Works together with `target_rps`: if throughput hits this limit below the target RPS, effective RPS is throttled so the average stays under the cap. Omit (or `0`) to disable — the average Gbit/s is still reported either way |
 
 ### `[source]`
