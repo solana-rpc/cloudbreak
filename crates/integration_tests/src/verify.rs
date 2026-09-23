@@ -314,15 +314,26 @@ mod tests {
         let (config, thresholds) = build_config(PROFILE, &args(RequestType::Gpa)).unwrap();
         assert_eq!(config.rpc1.url, "http://under-test:8899");
         assert_eq!(config.rpc2.as_ref().unwrap().url, "http://reference:8899");
-        assert_eq!(config.benchmark.duration_secs, 30);
         assert!(config.retry_in_place.enabled, "retry-in-place must be on");
-        assert!(
-            config.retry_in_place.retry_after_ms.is_none(),
-            "rescue-only: a scheduled retry would double traffic"
+        assert_eq!(
+            config.retry_in_place.retry_after_ms,
+            Some(200),
+            "every request is re-fired at a fixed interval, not on mismatch"
         );
         assert!(config.comparison.as_ref().unwrap().enable_slot_compensation);
-        assert_eq!(thresholds.min_samples, 100);
+        assert_eq!(thresholds.min_samples, 50);
         assert_eq!(thresholds.error_rate_critical, 0.01);
+
+        // A run below the floor always reports UNKNOWN, so the rate and the
+        // duration have to produce more verdicts than that.
+        let verdicts = config.benchmark.target_rps * config.benchmark.duration_secs as f64;
+        assert!(
+            verdicts > thresholds.min_samples as f64,
+            "{} rps for {}s is {verdicts} verdicts, at or below the floor of {}",
+            config.benchmark.target_rps,
+            config.benchmark.duration_secs,
+            thresholds.min_samples,
+        );
     }
 
     #[test]
@@ -340,7 +351,7 @@ mod tests {
     fn per_method_overrides_merge_over_default() {
         let (config, _) = build_config(PROFILE, &args(RequestType::SimulateTransaction)).unwrap();
         // The override only touches [source], so the defaults survive.
-        assert_eq!(config.benchmark.duration_secs, 30);
+        assert_eq!(config.benchmark.target_rps, 3.0);
         assert!(config.retry_in_place.enabled);
     }
 

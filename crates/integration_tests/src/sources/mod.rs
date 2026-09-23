@@ -137,7 +137,15 @@ pub async fn load_requests_from_source(
                         Ok(new_requests) => {
                             let new_requests =
                                 retain_unseen(new_requests, &mut seen, replay_once);
-                            if replay_once && new_requests.is_empty() {
+                            // Keep the previous pool. An empty window means the
+                            // query found nothing, not that there is nothing to
+                            // send, and publishing it starves the spawner until
+                            // the next poll.
+                            if new_requests.is_empty() {
+                                tracing::warn!(
+                                    target: "bench_source",
+                                    "Refresh returned no requests; keeping the current pool"
+                                );
                                 continue;
                             }
                             tracing::info!(

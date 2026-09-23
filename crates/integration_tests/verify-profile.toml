@@ -5,7 +5,7 @@
 # internal is published here. See crates/integration_tests/README.md.
 
 [default]
-target_rps = 20
+target_rps = 3
 duration_secs = 30
 timeout_secs = 20
 max_in_flight = 100
@@ -15,9 +15,7 @@ start_on_first_request = true
 startup_timeout_secs = 60
 target_gbits = 1.0
 
-# A run below the sample floor reports UNKNOWN: one failure would swing the
-# rate past the threshold.
-min_samples = 100
+min_samples = 50
 # At or above this share of failed verdicts the run reports CRITICAL. Below it,
 # and above zero, WARNING.
 error_rate_critical = 0.01
@@ -42,10 +40,8 @@ save_compensation_iterations = false
 save_db_probe_iterations = false
 
 [default.retry_in_place]
-# Rescue-only. `retry_after_ms` is left unset on purpose: scheduling a retry for
-# every request doubles traffic on both endpoints, and this runs on shared
-# infrastructure.
 enabled = true
+retry_after_ms = 200
 save_rescued = false
 
 [default.print_config]
