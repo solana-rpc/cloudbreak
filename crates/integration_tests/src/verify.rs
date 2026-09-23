@@ -23,8 +23,10 @@ use crate::{
 const PROFILE: &str = include_str!("../verify-profile.toml");
 
 /// Request sets, compiled in. A fixed set makes a gate run reproducible.
-const GPA_FIXTURE: &str = include_str!("../gpa_benchmark_requests.json");
-const GTABO_FIXTURE: &str = include_str!("../gtabo_benchmark_requests.json");
+/// Separate from the benchmark fixtures, whose requests are deliberately heavy
+/// for load testing and often return nothing or time out.
+const GPA_FIXTURE: &str = include_str!("../gpa_verify_requests.json");
+const GTABO_FIXTURE: &str = include_str!("../gtabo_verify_requests.json");
 
 #[derive(Parser, Debug)]
 #[command(name = "verify")]

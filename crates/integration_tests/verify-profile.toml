@@ -22,6 +22,14 @@ min_samples = 100
 # and above zero, WARNING.
 error_rate_critical = 0.01
 
+[default.source]
+# Only read by --source-url runs. VictoriaLogs replays real traffic, where one
+# getProgramAccounts response can reach hundreds of megabytes. Bound it, or a
+# single request saturates the run.
+min_request_size = 500
+max_request_size = 1000000
+inject_context = true
+
 [default.comparison]
 ratio = 1.0
 enable_slot_compensation = true
