@@ -58,39 +58,49 @@ impl CleanupExecutor for DatabaseConnection {
 /// `skip_snapshot` is the startup rule: while the snapshot load is running that table has no
 /// indexes and is still taking rows, so its keys go to the one-shot instead.
 ///
+/// `batch_size` caps the keys per statement. Every `snapshot_accounts` chunk still runs before
+/// any `accounts` chunk, so a failure part way through leaves masks in place.
+///
 /// Returns the keys that had no older version in `accounts`.
 pub async fn drain_all<E: CleanupExecutor>(
     executor: &E,
     taken: &Taken,
     query_timeout: Duration,
     skip_snapshot: bool,
+    batch_size: usize,
 ) -> Result<usize, DbErr> {
+    let batch_size = batch_size.max(1);
+
     if !skip_snapshot {
         for (form, items) in forms(taken) {
-            run_statement(
-                executor,
-                SNAPSHOT_ACCOUNTS_TABLE,
-                "cleanup_snapshot_accounts",
-                form,
-                items,
-                query_timeout,
-            )
-            .await?;
+            for chunk in items.chunks(batch_size) {
+                run_statement(
+                    executor,
+                    SNAPSHOT_ACCOUNTS_TABLE,
+                    "cleanup_snapshot_accounts_batch",
+                    form,
+                    chunk,
+                    query_timeout,
+                )
+                .await?;
+            }
         }
     }
 
     let mut new_accounts = 0;
     for (form, items) in forms(taken) {
-        let deleted = run_statement(
-            executor,
-            ACCOUNTS_TABLE,
-            "cleanup_accounts",
-            form,
-            items,
-            query_timeout,
-        )
-        .await?;
-        new_accounts += items.len().saturating_sub(deleted as usize);
+        for chunk in items.chunks(batch_size) {
+            let deleted = run_statement(
+                executor,
+                ACCOUNTS_TABLE,
+                "cleanup_accounts_batch",
+                form,
+                chunk,
+                query_timeout,
+            )
+            .await?;
+            new_accounts += chunk.len().saturating_sub(deleted as usize);
+        }
     }
     Ok(new_accounts)
 }
@@ -135,7 +145,7 @@ pub async fn delete_below_uniform_cutoff<E: CleanupExecutor>(
         deleted_total += run_statement(
             executor,
             SNAPSHOT_ACCOUNTS_TABLE,
-            "cleanup_startup_snapshot_accounts",
+            "cleanup_startup_snapshot_accounts_batch",
             KeyForm::Unrouted,
             &items,
             query_timeout,
@@ -316,7 +326,7 @@ pub(crate) mod tests {
         Taken {
             routed: routed_keys,
             unrouted: unrouted_keys,
-            oldest_stamp: 0,
+            ..Default::default()
         }
     }
 
@@ -325,7 +335,7 @@ pub(crate) mod tests {
         let executor = RecordingExecutor::default();
         let batch = taken(vec![(routed(1, 1), 100)], vec![(unrouted(2), 100)]);
 
-        drain_all(&executor, &batch, Duration::from_secs(5), false)
+        drain_all(&executor, &batch, Duration::from_secs(5), false, 500)
             .await
             .expect("succeeds");
 
@@ -345,7 +355,7 @@ pub(crate) mod tests {
         let executor = RecordingExecutor::failing("snapshot_accounts");
         let batch = taken(vec![(routed(1, 1), 100)], vec![]);
 
-        let result = drain_all(&executor, &batch, Duration::from_secs(5), false).await;
+        let result = drain_all(&executor, &batch, Duration::from_secs(5), false, 500).await;
 
         assert!(result.is_err());
         assert_eq!(
@@ -355,12 +365,51 @@ pub(crate) mod tests {
         );
     }
 
+    fn unrouted_keys(count: u8) -> Vec<(CleanupKey, u64)> {
+        (1..=count).map(|byte| (unrouted(byte), 100)).collect()
+    }
+
+    #[tokio::test]
+    async fn a_drain_chunks_each_form_at_the_batch_size() {
+        let executor = RecordingExecutor::default();
+        let batch = taken(vec![], unrouted_keys(5));
+
+        drain_all(&executor, &batch, Duration::from_secs(5), false, 2)
+            .await
+            .expect("succeeds");
+
+        let issued = executor.issued();
+        assert_eq!(issued.len(), 6, "5 keys at 2 per statement is 3 per table");
+        assert!(
+            issued[..3]
+                .iter()
+                .all(|s| s.starts_with("snapshot_accounts"))
+        );
+        assert!(issued[3..].iter().all(|s| s.starts_with("accounts")));
+    }
+
+    #[tokio::test]
+    async fn a_failed_snapshot_chunk_stops_every_later_statement() {
+        allow_db_errors();
+        let executor = RecordingExecutor::failing("snapshot_accounts");
+        let batch = taken(vec![], unrouted_keys(5));
+
+        let result = drain_all(&executor, &batch, Duration::from_secs(5), false, 2).await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            executor.issued(),
+            vec!["snapshot_accounts:unrouted".to_string()],
+            "no accounts chunk may run after a failed snapshot chunk"
+        );
+    }
+
     #[tokio::test]
     async fn the_snapshot_half_is_skipped_during_startup() {
         let executor = RecordingExecutor::default();
         let batch = taken(vec![(routed(1, 1), 100)], vec![]);
 
-        drain_all(&executor, &batch, Duration::from_secs(5), true)
+        drain_all(&executor, &batch, Duration::from_secs(5), true, 500)
             .await
             .expect("succeeds");
 
@@ -372,7 +421,7 @@ pub(crate) mod tests {
         let executor = RecordingExecutor::default();
         let batch = taken(vec![(routed(1, 1), 100)], vec![(unrouted(2), 200)]);
 
-        drain_all(&executor, &batch, Duration::from_secs(5), true)
+        drain_all(&executor, &batch, Duration::from_secs(5), true, 500)
             .await
             .expect("succeeds");
 

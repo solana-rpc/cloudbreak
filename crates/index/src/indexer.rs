@@ -138,6 +138,7 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
         Arc::new(db.clone()),
         updated_accounts_during_startup.clone(),
         Duration::from_secs(config.database.finalize_slot_queries_timeout),
+        config.cleanup_batch_size,
     );
 
     let slot_finalizer = SlotFinalizer::spawn(

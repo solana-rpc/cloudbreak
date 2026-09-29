@@ -5,8 +5,9 @@
 
 //! The spawned drainer.
 //!
-//! One task, one batch at a time. A failed drain is queued again and reattempted on the next
-//! round, never inside this one: every failed statement counts against the process-wide
+//! One task, one window at a time. A drain covers the oldest `cleanup-interval-slots` slots and
+//! issues them in `cleanup-batch-size` chunks. A failed drain is queued again and reattempted on
+//! the next round, never inside this one: every failed statement counts against the process-wide
 //! `max-db-errors-threshold`, so a batch that fails forever must cost one error per slot, which
 //! is what the inline cleanup it replaces cost.
 //!
@@ -16,6 +17,8 @@
 
 use std::sync::Arc;
 use std::time::Duration;
+
+use tokio::time::Instant;
 
 use super::CleanupHandle;
 use super::persist::{self, CleanupExecutor};
@@ -27,13 +30,14 @@ pub fn spawn_cleanup_drainer<E>(
     executor: Arc<E>,
     startup: UpdatedAccountsDuringStartup,
     query_timeout: Duration,
+    batch_size: usize,
 ) -> tokio::task::JoinHandle<()>
 where
     E: CleanupExecutor,
 {
     tokio::spawn(async move {
         let _guard = metrics::TokioTaskCounterGuard::new("finalize_cleanup_drainer");
-        run(handle, executor, startup, query_timeout).await;
+        run(handle, executor, startup, query_timeout, batch_size).await;
     })
 }
 
@@ -42,26 +46,31 @@ async fn run<E: CleanupExecutor>(
     executor: Arc<E>,
     startup: UpdatedAccountsDuringStartup,
     query_timeout: Duration,
+    batch_size: usize,
 ) {
     loop {
         handle.wait_for_work().await;
         handle.note_drain();
 
-        let taken = handle.take_all();
+        let taken = handle.take_window();
         if taken.is_empty() {
             handle.finish();
             continue;
         }
 
         let keys = taken.len();
-        match persist::drain_all(
+        let start_time = Instant::now();
+        let result = persist::drain_all(
             executor.as_ref(),
             &taken,
             query_timeout,
             startup.is_startup(),
+            batch_size,
         )
-        .await
-        {
+        .await;
+        metrics::record_finalize_slot(start_time.elapsed().as_secs_f64(), "total");
+
+        match result {
             Ok(new_accounts) => {
                 handle.finish();
                 metrics::record_new_accounts_in_slot(new_accounts, "new_accounts_in_slot");
@@ -103,6 +112,7 @@ mod tests {
             executor,
             ready_startup(),
             Duration::from_secs(5),
+            500,
         );
         for _ in 0..200 {
             if handle.is_quiescent() {
@@ -140,6 +150,7 @@ mod tests {
             executor,
             ready_startup(),
             Duration::from_secs(5),
+            500,
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
         task.abort();
