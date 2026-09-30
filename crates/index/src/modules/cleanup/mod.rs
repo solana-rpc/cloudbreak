@@ -109,6 +109,10 @@ impl CleanupHandle {
         self.lock().reinsert(taken);
     }
 
+    pub fn has_backlog(&self) -> bool {
+        self.lock().has_backlog()
+    }
+
     pub fn note_drain(&self) {
         self.lock().note_drain();
     }

@@ -48,8 +48,13 @@ async fn run<E: CleanupExecutor>(
     query_timeout: Duration,
     batch_size: usize,
 ) {
+    let mut drain_again = false;
     loop {
-        handle.wait_for_work().await;
+        // One wake can stand for many enqueues, so a backlog drains without waiting for more.
+        if !drain_again {
+            handle.wait_for_work().await;
+        }
+        drain_again = false;
         handle.note_drain();
 
         let taken = handle.take_window();
@@ -74,6 +79,7 @@ async fn run<E: CleanupExecutor>(
             Ok(new_accounts) => {
                 handle.finish();
                 metrics::record_new_accounts_in_slot(new_accounts, "new_accounts_in_slot");
+                drain_again = handle.has_backlog();
             }
             Err(error) => {
                 handle.reinsert(taken);
@@ -135,6 +141,24 @@ mod tests {
         assert_eq!(
             executor.issued(),
             vec!["snapshot_accounts:routed", "accounts:routed"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_backlog_drains_to_empty_from_a_single_wake() {
+        let handle = CleanupHandle::new(1);
+        let executor = Arc::new(RecordingExecutor::default());
+        for slot in 100..105u64 {
+            handle.enqueue(slot, &[(routed(1, slot as u8), slot)]);
+        }
+
+        drain_once(&handle, executor.clone()).await;
+
+        assert!(handle.is_quiescent(), "five queued slots, one stored wake");
+        assert_eq!(
+            executor.issued().len(),
+            10,
+            "one statement per table per slot"
         );
     }
 

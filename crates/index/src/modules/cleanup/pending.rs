@@ -286,6 +286,11 @@ impl Pending {
             || span >= self.interval_slots
     }
 
+    /// `true` while at least one full window is still queued.
+    pub(crate) fn has_backlog(&self) -> bool {
+        self.slots.len() as u64 >= self.interval_slots
+    }
+
     pub(crate) fn note_drain(&mut self) {
         self.enqueued_since_drain = 0;
         self.last_drain_slot = Some(self.high_water);
