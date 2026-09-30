@@ -238,6 +238,10 @@ impl Pending {
                 taken.unrouted.push((key, cutoff));
             }
         }
+        // Grouped by owner, a chunk prunes to few hash partitions instead of all of them.
+        taken
+            .routed
+            .sort_unstable_by_key(|(key, _)| (key.owner, key.pubkey));
 
         self.in_flight_stamp = (!taken.is_empty()).then_some(oldest_stamp);
         taken
@@ -520,6 +524,35 @@ pub(crate) mod tests {
             cutoff_of(&pending, &routed(1, 3)),
             Some(102),
             "a slot outside the window stays queued"
+        );
+    }
+
+    #[test]
+    fn routed_keys_come_out_grouped_by_owner() {
+        let mut pending = Pending::new(1);
+        pending.enqueue(
+            100,
+            &[
+                (routed(3, 1), 100),
+                (routed(1, 9), 100),
+                (routed(2, 5), 100),
+                (routed(1, 2), 100),
+                (routed(3, 4), 100),
+            ],
+        );
+
+        let taken = pending.take_window();
+        let order: Vec<CleanupKey> = taken.routed.iter().map(|(key, _)| *key).collect();
+
+        assert_eq!(
+            order,
+            vec![
+                routed(1, 2),
+                routed(1, 9),
+                routed(2, 5),
+                routed(3, 1),
+                routed(3, 4)
+            ]
         );
     }
 
