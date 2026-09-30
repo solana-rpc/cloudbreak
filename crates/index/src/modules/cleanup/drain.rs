@@ -6,10 +6,10 @@
 //! The spawned drainer.
 //!
 //! One task, one window at a time. A drain covers the oldest `cleanup-interval-slots` slots and
-//! issues them in `cleanup-batch-size` chunks. A failed drain is queued again and reattempted on
-//! the next round, never inside this one: every failed statement counts against the process-wide
-//! `max-db-errors-threshold`, so a batch that fails forever must cost one error per slot, which
-//! is what the inline cleanup it replaces cost.
+//! issues them in `cleanup-batch-size` chunks, all chunks of one table at once. A failed drain is
+//! queued again and reattempted on the next round, never inside this one. Every failed chunk
+//! counts against the process-wide `max-db-errors-threshold`, so one bad round can cost as many
+//! errors as the failing table has chunks.
 //!
 //! Not health gated. It publishes no state and deletes only rows the read paths already hide,
 //! and the unhealthy window is a gap fill, which is when the queue holds the most work. This
