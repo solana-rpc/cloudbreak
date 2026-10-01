@@ -41,33 +41,33 @@ program_accounts AS (
 -- {snapshot_filters}
 ),
 
-max_slot AS (
-    SELECT
-        program_accounts.pubkey,
-        MAX(program_accounts.slot) AS slot
-    FROM program_accounts
-    GROUP BY program_accounts.pubkey
-),
-
--- this is only handling the deduplication for same (pubkey, slot)
--- pairs, the rest is handled by the inner join
+-- Latest version per account, then drop closed ones
 deduplicated_program_accounts AS (
-    SELECT DISTINCT ON (program_accounts.pubkey)
-        program_accounts.pubkey,
-        program_accounts.owner,
-        program_accounts.lamports,
-        program_accounts.slot,
-        program_accounts.executable,
-        program_accounts.rent_epoch,
-        program_accounts.data,
-        program_accounts.token_mint,
-        program_accounts.token_owner
-    FROM program_accounts
-    INNER JOIN max_slot
-        ON
-            program_accounts.slot = max_slot.slot
-            AND program_accounts.pubkey = max_slot.pubkey
-    WHERE program_accounts.lamports > 0
+    SELECT
+        latest.pubkey,
+        latest.owner,
+        latest.lamports,
+        latest.slot,
+        latest.executable,
+        latest.rent_epoch,
+        latest.data,
+        latest.token_mint,
+        latest.token_owner
+    FROM (
+        SELECT DISTINCT ON (program_accounts.pubkey)
+            program_accounts.pubkey,
+            program_accounts.owner,
+            program_accounts.lamports,
+            program_accounts.slot,
+            program_accounts.executable,
+            program_accounts.rent_epoch,
+            program_accounts.data,
+            program_accounts.token_mint,
+            program_accounts.token_owner
+        FROM program_accounts
+        ORDER BY program_accounts.pubkey ASC, program_accounts.slot DESC
+    ) AS latest
+    WHERE latest.lamports > 0
 ),
 
 -- Get unique mints we need to look up
@@ -78,7 +78,7 @@ needed_mints AS (
 ),
 
 -- Gather all mint account versions from both tables
-all_mint_versions AS NOT MATERIALIZED (
+all_mint_versions AS (
     SELECT
         accounts.pubkey,
         accounts.data,
@@ -102,25 +102,13 @@ all_mint_versions AS NOT MATERIALIZED (
         AND snapshot_accounts.slot <= $2
 ),
 
--- Get latest slot per mint
-mint_max_slot AS NOT MATERIALIZED (
-    SELECT
-        pubkey,
-        MAX(slot) AS slot
-    FROM all_mint_versions
-    GROUP BY pubkey
-),
-
--- Deduplicated mints
-mints AS NOT MATERIALIZED (
+-- Latest version per mint
+mints AS (
     SELECT DISTINCT ON (all_mint_versions.pubkey)
         all_mint_versions.pubkey,
         all_mint_versions.data AS mint_data
     FROM all_mint_versions
-    INNER JOIN mint_max_slot
-        ON
-            all_mint_versions.pubkey = mint_max_slot.pubkey
-            AND all_mint_versions.slot = mint_max_slot.slot
+    ORDER BY all_mint_versions.pubkey ASC, all_mint_versions.slot DESC
 )
 
 SELECT
