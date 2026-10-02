@@ -60,4 +60,6 @@ FROM (
     FROM program_accounts
     ORDER BY program_accounts.pubkey ASC, program_accounts.slot DESC
 ) AS latest
-WHERE lamports > 0;
+WHERE lamports > 0
+-- DISTINCT ON already sorts by pubkey; this makes the output order explicit.
+ORDER BY latest.pubkey ASC;

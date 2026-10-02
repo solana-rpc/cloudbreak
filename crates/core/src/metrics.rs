@@ -109,6 +109,18 @@ lazy_static::lazy_static! {
         &["kind"],
     )
     .expect("Failed to create non-circulating changes counter");
+
+    /// Time from receiving a processed block to the store applying the Postgres
+    /// anchor that covers it, for blocks on the confirmed chain. Includes the
+    /// slot syncronizer poll.
+    pub static ref PROCESSED_CONFIRM_LATENCY_MS: Histogram = Histogram::with_opts(
+        HistogramOpts::new("cloudbreak_api_processed_confirm_latency_ms", "Processed block receipt to Postgres confirmed, in milliseconds")
+            .buckets(vec![
+                100.0, 200.0, 300.0, 400.0, 500.0, 750.0, 1_000.0, 1_500.0, 2_000.0, 3_000.0,
+                5_000.0, 10_000.0, 20_000.0,
+            ]),
+    )
+    .expect("Failed to create processed confirm latency histogram");
 }
 
 /// We use a guard to increment the current tokio tasks metric when a task is created and

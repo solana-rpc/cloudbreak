@@ -4,6 +4,7 @@
  */
 
 use cloudbreak_core::ApiConfig;
+use cloudbreak_core::metrics::PROCESSED_CONFIRM_LATENCY_MS;
 use hyper::StatusCode;
 use prometheus::{
     HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
@@ -33,7 +34,7 @@ lazy_static::lazy_static! {
             "Total API request latency in milliseconds, labeled by method."
         )
         .buckets(vec![
-            1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 150.0, 200.0, 300.0, 400.0, 500.0, 650.0, 800.0,
+            0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 150.0, 200.0, 300.0, 400.0, 500.0, 650.0, 800.0,
             1000.0, 1500.0, 2000.0, 3000.0, 4000.0, 5000.0, 6000.0, 7000.0, 8000.0, 9000.0, 10000.0, 12000.0,
             14000.0, 16000.0, 18000.0, 20000.0, 25000.0, 30000.0, 40000.0, 50000.0, 80000.0, 100000.0,
             150000.0, 200000.0, 300000.0
@@ -159,6 +160,15 @@ lazy_static::lazy_static! {
         &["used"],
     ).unwrap();
 
+    /// Processed commitment requests for the methods served from processed blocks,
+    /// labelled by `route` (`view` or `degraded`) and `reason` (`none` or the fallback reason).
+    pub static ref CLOUDBREAK_API_PROCESSED_REQUESTS_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new(
+            "cloudbreak_api_processed_requests_total",
+            "Processed commitment requests, labelled by method, route and degrade reason"
+        ),
+        &["method", "route", "reason"],
+    ).unwrap();
     /// Queries accepted for caching that are queued on, or running on, the
     /// blocking pool. Expected to sit near 0; a sustained value means insertion
     /// is falling behind the requests producing it, which delays entries becoming
@@ -304,6 +314,11 @@ pub fn setup_metrics(config: &ApiConfig) -> anyhow::Result<()> {
             &METRICS_REGISTRY,
             config.metrics.client_ip_bandwidth_enabled,
         );
+
+        if config.processed_accounts_enabled() {
+            register!(CLOUDBREAK_API_PROCESSED_REQUESTS_TOTAL);
+            register!(PROCESSED_CONFIRM_LATENCY_MS);
+        }
     });
 
     // Set the max connections as a reference metric at startup

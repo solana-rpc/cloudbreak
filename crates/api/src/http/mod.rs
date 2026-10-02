@@ -3,28 +3,30 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+use crate::error::RpcError;
 use crate::http::server::HttpHandlerResponse;
 use crate::http::server::ResponseBody;
 use crate::modules::bandwidth;
 use crate::modules::cache::GpaProcessor;
 use crate::modules::supply_cache::SharedSupplySnapshot;
 use crate::modules::vote_accounts_cache::SharedStakesSnapshot;
-use crate::error::RpcError;
 use crate::query_tracker_client::QueryTrackerClient;
 use crate::slot_syncronizer::SlotSyncronizerData;
 use agave_feature_set::FeatureSet;
+use cloudbreak_core::modules::processed::ProcessedAccounts;
+use cloudbreak_core::{
+    AccountSelectorConfig, MethodSection, ProcessedCommitmentBehavior, UnhealthyResponseBehavior,
+};
+use cloudbreak_entity::slots;
 use hyper::StatusCode;
 use sea_orm::{DatabaseConnection, EntityTrait};
 use serde::{Deserialize, Serialize};
 use solana_commitment_config::CommitmentLevel;
 use solana_rpc_client_api::response::Response as RpcResponse;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tracing::Instrument;
-use cloudbreak_core::{
-    AccountSelectorConfig, MethodSection, ProcessedCommitmentBehavior, UnhealthyResponseBehavior,
-};
-use cloudbreak_entity::slots;
 
 #[derive(Clone)]
 pub struct CachedFeatureSet {
@@ -101,7 +103,7 @@ pub struct CloudbreakRpcState {
     pub slot_syncronizer_data: Option<Arc<RwLock<SlotSyncronizerData>>>,
     pub indexer_filter: Arc<AccountSelectorConfig>,
     pub batch_handling_max_concurrency: usize,
-    pub gpa_stream_batch_size: usize,
+    pub gpa_stream_batch_size: Option<NonZeroUsize>,
     pub request_timeout: Duration,
     pub processed_commitment: ProcessedCommitmentBehavior,
     pub unhealthy_response: UnhealthyResponseBehavior,
@@ -120,6 +122,9 @@ pub struct CloudbreakRpcState {
     /// The `[token-largest-accounts]` API section; getTokenLargestAccounts is
     /// served when its `enabled` flag is set.
     pub token_largest_accounts: MethodSection,
+    /// The `[processed-accounts]` handle. The disabled handle routes every
+    /// request through `resolve_commitment`.
+    pub processed: ProcessedAccounts,
 }
 
 impl CloudbreakRpcState {
@@ -131,7 +136,7 @@ impl CloudbreakRpcState {
         client: Option<QueryTrackerClient>,
         indexer_filter: Arc<AccountSelectorConfig>,
         batch_handling_max_concurrency: usize,
-        gpa_stream_batch_size: usize,
+        gpa_stream_batch_size: Option<NonZeroUsize>,
         request_timeout: Duration,
         processed_commitment: ProcessedCommitmentBehavior,
         unhealthy_response: UnhealthyResponseBehavior,
@@ -145,6 +150,7 @@ impl CloudbreakRpcState {
         supply_cache: SharedSupplySnapshot,
         largest_accounts: MethodSection,
         token_largest_accounts: MethodSection,
+        processed: ProcessedAccounts,
     ) -> Self {
         Self {
             database,
@@ -168,6 +174,7 @@ impl CloudbreakRpcState {
             feature_set_cache: Arc::new(RwLock::new(None)),
             largest_accounts,
             token_largest_accounts,
+            processed,
         }
     }
 
@@ -176,7 +183,8 @@ impl CloudbreakRpcState {
     /// response layer can decide the HTTP status purely from the error.
     pub fn node_unhealthy(&self) -> RpcError {
         RpcError::NodeUnhealthy {
-            service_unavailable: self.unhealthy_response == UnhealthyResponseBehavior::HttpUnavailable,
+            service_unavailable: self.unhealthy_response
+                == UnhealthyResponseBehavior::HttpUnavailable,
         }
     }
 
@@ -276,17 +284,31 @@ impl<T: Serialize> JsonRpcResponse<T> {
         }
     }
 
-    pub fn error(id: serde_json::Value, code: i32, message: String) -> JsonRpcResponse<()> {
+    pub fn error(
+        id: serde_json::Value,
+        code: i32,
+        message: String,
+        data: Option<serde_json::Value>,
+    ) -> JsonRpcResponse<()> {
         JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
             result: None,
             error: Some(JsonRpcError {
                 code,
                 message,
-                data: None,
+                data,
             }),
             id,
         }
+    }
+
+    pub fn from_rpc_error(id: serde_json::Value, err: &RpcError) -> JsonRpcResponse<()> {
+        Self::error(
+            id,
+            err.to_numeric_code(),
+            err.to_string(),
+            err.to_error_data(),
+        )
     }
 }
 
@@ -323,18 +345,17 @@ fn extract_optional_param<T: serde::de::DeserializeOwned>(
 }
 
 fn make_error_response(id: serde_json::Value, code: i32, message: String) -> HttpHandlerResponse {
-    make_error_response_with_status(id, code, message, StatusCode::OK)
+    let response = JsonRpcResponse::<()>::error(id, code, message, None);
+    HttpHandlerResponse {
+        status: StatusCode::OK,
+        body: ResponseBody::Buffered(serde_json::to_vec(&response).unwrap()),
+    }
 }
 
-fn make_error_response_with_status(
-    id: serde_json::Value,
-    code: i32,
-    message: String,
-    status: StatusCode,
-) -> HttpHandlerResponse {
-    let response = JsonRpcResponse::<()>::error(id, code, message);
+fn make_rpc_error_response(id: serde_json::Value, err: &RpcError) -> HttpHandlerResponse {
+    let response = JsonRpcResponse::<()>::from_rpc_error(id, err);
     HttpHandlerResponse {
-        status,
+        status: http_status_for_error(err),
         body: ResponseBody::Buffered(serde_json::to_vec(&response).unwrap()),
     }
 }

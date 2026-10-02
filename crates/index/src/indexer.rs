@@ -131,12 +131,22 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
         prune_slot_tx.subscribe(),
     );
 
+    // The finalize worker hands each slot's cleanup keys here and returns.
+    let cleanup = modules::cleanup::CleanupHandle::new(config.cleanup_interval_slots);
+    modules::cleanup::spawn_cleanup_drainer(
+        cleanup.clone(),
+        Arc::new(db.clone()),
+        updated_accounts_during_startup.clone(),
+        Duration::from_secs(config.database.finalize_slot_queries_timeout),
+    );
+
     let slot_finalizer = SlotFinalizer::spawn(
         db.clone(),
         config.clone(),
         updated_accounts_during_startup.clone(),
         health.clone(),
         prune_slot_tx,
+        cleanup,
     );
 
     let indexer_state = IndexerState {
@@ -332,5 +342,12 @@ pub async fn process_update(
 pub struct AccountsReceivedPerBlock {
     pub block_time: Option<UnixTimestamp>,
     pub accounts: Vec<Vec<u8>>,
+    /// Owner of each entry in `accounts` (same order). Empty when the owner map is disabled,
+    /// which makes the finalize cleanup fall back to the no-owner SQL.
+    pub accounts_owners: Vec<Vec<u8>>,
     pub closed_accounts: Vec<Vec<u8>>,
+    /// (pubkey, owner) pairs that owner-route the closed-account cleanup, captured at save time
+    /// from the owner map. Includes the old-owner pairs for in-slot owner changes.
+    pub closed_cleanup_pubkeys: Vec<Vec<u8>>,
+    pub closed_cleanup_owners: Vec<Vec<u8>>,
 }

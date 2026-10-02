@@ -49,6 +49,10 @@ excluded-programs = [
 # --- backpressure ---
 indexer-metrics = "localhost:8875"
 indexer-metrics-threshold = 5
+# Defers CREATE and DROP INDEX when the indexer's cleanup backlog exceeds this many slots.
+# The finalize queue stops reflecting database pressure once cleanup runs off the finalize
+# worker, so this is the second signal. An indexer that does not publish it reads as no pressure.
+indexer-cleanup-lag-threshold = 32
 max-auto-indexes = 100
 
 # --- eviction (usage-based; off by default) ---

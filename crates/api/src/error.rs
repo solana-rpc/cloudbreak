@@ -4,25 +4,26 @@
  */
 
 use sea_orm::DbErr;
+use solana_account_decoder::MAX_BASE58_BYTES;
+use solana_rpc_client_api::custom_error::{MinContextSlotNotReachedErrorData, NodeUnhealthyErrorData};
 
 #[derive(thiserror::Error, Debug)]
 pub enum RpcError {
-    #[error("Database error: {0}")]
+    #[error("Internal error")]
     DatabaseError(#[from] DbErr),
-    #[error("Invalid parameters")]
+    #[error("Invalid params")]
     InvalidParams,
     #[error("Invalid request")]
     InvalidRequest,
     #[error("Internal error")]
     InternalError,
-    #[error("Pubkey validation error")]
+    /// Holds the `Debug` form of the parse error, as Agave's `verify_pubkey` does.
+    #[error("Invalid param: {0}")]
     PubkeyValidationError(String),
     #[error("Parse error")]
     ParseError,
-    #[error("RPC slot ({rpc_slot}) is behind the min context slot provided")]
-    RpcSlotBehindMinContextSlot { rpc_slot: u64 },
-    #[error("Subscription ID not found in extensions")]
-    SubscriptionIdNotFound,
+    #[error("Minimum context slot has not been reached")]
+    MinContextSlotNotReached { context_slot: u64 },
     #[error("{0}")]
     InvalidParamsWithMessage(String),
     #[error("{key} excluded from account secondary indexes; this RPC method unavailable for key")]
@@ -41,64 +42,50 @@ pub enum RpcError {
         "Account {pubkey} is owned by {owner}, which is excluded from this indexer's program filter; cannot serve this account"
     )]
     AccountOwnerExcluded { pubkey: String, owner: String },
-    /// Matches Agave's response for missing accounts in token-account RPCs
-    #[error("Invalid param: could not find account ({pubkey})")]
+    // Token errors carry the key for logs only; the messages are Agave's exact text.
+    #[error("Invalid param: could not find account")]
     AccountNotFound { pubkey: String },
-    /// Matches Agave's response when the account exists but is not owned by
-    /// SPL Token / Token-2022 in token-account RPCs.
-    #[error("Invalid param: not a Token account ({pubkey})")]
+    #[error("Invalid param: not a Token account")]
     NotATokenAccount { pubkey: String },
-    /// Matches Agave's response when the mint account exists but is not owned
-    /// by SPL Token / Token-2022 in mint-oriented RPCs.
-    #[error("Invalid param: not a Token mint ({mint})")]
+    #[error("Invalid param: not a Token mint")]
     NotATokenMint { mint: String },
-    #[error("Invalid param: could not find mint ({mint})")]
+    #[error("Invalid param: could not find mint")]
     MintDataNotFound { mint: String },
+    #[error("Invalid param: unrecognized Token program id")]
+    UnrecognizedTokenProgramId { program_id: String },
+    /// `getTokenSupply`: the mint account data does not unpack as a mint.
+    #[error("Invalid param: mint could not be unpacked")]
+    MintCouldNotBeUnpacked { mint: String },
+    /// `getTokenAccountBalance` / `getTokenLargestAccounts`: the mint data does not unpack.
+    #[error("Invalid param: Token mint could not be unpacked")]
+    TokenMintCouldNotBeUnpacked { mint: String },
+    /// Matches Agave's `encode_account` limit for `binary` / `base58` encodings.
+    #[error(
+        "Encoded binary (base 58) data should be less than {} bytes, please use Base64 encoding.",
+        MAX_BASE58_BYTES
+    )]
+    Base58DataTooLarge,
     /// The requested RPC method is not enabled in this node's API config.
     #[error("Method not found")]
     MethodNotFound,
 }
 
 impl RpcError {
-    pub const fn to_error_code(&self) -> &'static str {
+    /// JSON-RPC error `data` member. `None` omits the field from the response.
+    pub fn to_error_data(&self) -> Option<serde_json::Value> {
         match self {
-            RpcError::DatabaseError(db_err) => match db_err {
-                DbErr::ConnectionAcquire(_) => "DB_POOL_EXHAUSTED",
-                DbErr::TryIntoErr { .. } => "DB_TRY_INTO_ERROR",
-                DbErr::Conn(_) => "DB_CONNECTION_ERROR",
-                DbErr::Exec(_) => "DB_EXECUTION_ERROR",
-                DbErr::Query(_) => "DB_QUERY_ERROR",
-                DbErr::ConvertFromU64(_) => "DB_U64_CONVERSION_ERROR",
-                DbErr::UnpackInsertId => "DB_UNPACK_INSERT_ID",
-                DbErr::UpdateGetPrimaryKey => "DB_UPDATE_PK_ERROR",
-                DbErr::RecordNotFound(_) => "DB_RECORD_NOT_FOUND",
-                DbErr::AttrNotSet(_) => "DB_ATTRIBUTE_NOT_SET",
-                DbErr::Custom(_) => "DB_CUSTOM_ERROR",
-                DbErr::Type(_) => "DB_TYPE_ERROR",
-                DbErr::Json(_) => "DB_JSON_ERROR",
-                DbErr::Migration(_) => "DB_MIGRATION_ERROR",
-                DbErr::RecordNotInserted => "DB_NOT_INSERTED",
-                DbErr::RecordNotUpdated => "DB_NOT_UPDATED",
-            },
-            RpcError::InvalidRequest => "INVALID_REQUEST",
-            RpcError::InvalidParams => "INVALID_PARAMS",
-            RpcError::InternalError => "INTERNAL_ERROR",
-            RpcError::PubkeyValidationError(_) => "PUBKEY_VALIDATION_ERROR",
-            RpcError::ParseError => "PARSE_ERROR",
-            RpcError::RpcSlotBehindMinContextSlot { rpc_slot: _ } => {
-                "RPC_SLOT_BEHIND_MIN_CONTEXT_SLOT"
+            RpcError::MinContextSlotNotReached { context_slot } => {
+                serde_json::to_value(MinContextSlotNotReachedErrorData {
+                    context_slot: *context_slot,
+                })
+                .ok()
             }
-            RpcError::SubscriptionIdNotFound => "SUBSCRIPTION_ID_NOT_FOUND",
-            RpcError::InvalidParamsWithMessage(_) => "INVALID_PARAMS_WITH_MESSAGE",
-            RpcError::KeyExcludedFromSecondaryIndex { .. } => "KEY_EXCLUDED_FROM_SECONDARY_INDEX",
-            RpcError::ProcessedCommitmentNotSupported => "PROCESSED_COMMITMENT_NOT_SUPPORTED",
-            RpcError::NodeUnhealthy { .. } => "NODE_UNHEALTHY",
-            RpcError::AccountOwnerExcluded { .. } => "ACCOUNT_OWNER_EXCLUDED",
-            RpcError::AccountNotFound { .. } => "Invalid param: could not find account",
-            RpcError::NotATokenAccount { .. } => "Invalid param: not a Token account",
-            RpcError::NotATokenMint { .. } => "Invalid param: not a Token mint",
-            RpcError::MintDataNotFound { .. } => "Invalid param: could not find mint",
-            RpcError::MethodNotFound => "METHOD_NOT_FOUND",
+            // The indexer health flag has no slot distance, so it is always unknown.
+            RpcError::NodeUnhealthy { .. } => serde_json::to_value(NodeUnhealthyErrorData {
+                num_slots_behind: None,
+            })
+            .ok(),
+            _ => None,
         }
     }
 
@@ -110,17 +97,20 @@ impl RpcError {
             RpcError::InternalError => -32603,
             RpcError::PubkeyValidationError(_) => -32602,
             RpcError::ParseError => -32700,
-            RpcError::RpcSlotBehindMinContextSlot { .. } => -32000,
-            RpcError::SubscriptionIdNotFound => -32001,
+            RpcError::MinContextSlotNotReached { .. } => -32016,
             RpcError::InvalidParamsWithMessage(_) => -32602,
             RpcError::KeyExcludedFromSecondaryIndex { .. } => -32010,
-            RpcError::ProcessedCommitmentNotSupported => -32003,
+            RpcError::ProcessedCommitmentNotSupported => -32602,
             RpcError::NodeUnhealthy { .. } => -32005,
             RpcError::AccountOwnerExcluded { .. } => -32010,
             RpcError::AccountNotFound { .. } => -32602,
             RpcError::NotATokenAccount { .. } => -32602,
             RpcError::NotATokenMint { .. } => -32602,
             RpcError::MintDataNotFound { .. } => -32602,
+            RpcError::UnrecognizedTokenProgramId { .. } => -32602,
+            RpcError::MintCouldNotBeUnpacked { .. } => -32602,
+            RpcError::TokenMintCouldNotBeUnpacked { .. } => -32602,
+            RpcError::Base58DataTooLarge => -32600,
             RpcError::MethodNotFound => -32601,
         }
     }

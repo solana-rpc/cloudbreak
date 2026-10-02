@@ -78,6 +78,17 @@ pub enum RpcFilterError {
     InvalidValueCmp,
 }
 
+impl RpcFilterError {
+    /// Text for the `Invalid param: {}` message. Agave formats the upstream error
+    /// with `{:?}`, so unwrap our transparent variant to match it byte for byte.
+    pub fn invalid_param_text(&self) -> String {
+        match self {
+            RpcFilterError::Memcmp(err) => format!("{err:?}"),
+            RpcFilterError::InvalidValueCmp => self.to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ValueCmp {
     pub left: Operand,
@@ -260,6 +271,37 @@ impl Comparator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Strings captured from Agave 4.2.2 (nyc205) and 4.3.0-rc.0 (fra286).
+    #[test]
+    fn test_invalid_param_text_matches_agave() {
+        let oversized = RpcFilterType::Memcmp(Memcmp::new(
+            0,
+            MemcmpEncodedBytes::Base58("1".repeat(200)),
+        ));
+        let err = oversized.verify().unwrap_err();
+        assert_eq!(err.invalid_param_text(), "DataTooLarge");
+
+        let bad_base58 =
+            RpcFilterType::Memcmp(Memcmp::new(0, MemcmpEncodedBytes::Base58("0OIl".into())));
+        assert_eq!(
+            bad_base58.verify().unwrap_err().invalid_param_text(),
+            "Base58DecodeError(InvalidCharacter { character: '0', index: 0 })"
+        );
+
+        let bad_base64 =
+            RpcFilterType::Memcmp(Memcmp::new(0, MemcmpEncodedBytes::Base64("!!!!".into())));
+        assert_eq!(
+            bad_base64.verify().unwrap_err().invalid_param_text(),
+            "Base64DecodeError(InvalidByte(0, 33))"
+        );
+
+        // No Agave counterpart, so this one keeps its own Display text.
+        assert_eq!(
+            RpcFilterError::InvalidValueCmp.invalid_param_text(),
+            "invalid ValueCmp filter"
+        );
+    }
 
     #[test]
     fn test_values_match_constant() {

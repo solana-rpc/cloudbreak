@@ -4,11 +4,12 @@
  */
 
 -- $1 = pubkey  (bytea literal)
--- $2 = commitment level (integer)
+-- $2 = slot bound: a slot literal, or a subquery on the slots table.
+--      No row when the bound is NULL, so a missing slots entry answers no rows.
 WITH latest_slot AS (
     SELECT slot
-    FROM slots
-    WHERE commitment = $2
+    FROM (SELECT $2::bigint AS slot) AS bound
+    WHERE slot IS NOT NULL
 ),
 
 all_versions AS (

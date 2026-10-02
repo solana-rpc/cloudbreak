@@ -90,9 +90,12 @@ async fn generate_filters_for_table(
 
     if let Some(additional_filters) = additional_filters {
         for filter in additional_filters {
-            filter
-                .verify()
-                .map_err(|e| RpcError::InvalidParamsWithMessage(format!("Invalid param: {e}")))?;
+            filter.verify().map_err(|e| {
+                RpcError::InvalidParamsWithMessage(format!(
+                    "Invalid param: {}",
+                    e.invalid_param_text()
+                ))
+            })?;
 
             let filter_str = SqlDataSliceFilter::new(&filter, table, true).to_string();
             if let Some(filter_str) = filter_str {
@@ -131,13 +134,25 @@ async fn generate_filters_for_table(
                     Err(RpcError::InternalError)
                 })?;
 
-                let row = rows.first().ok_or_else(|| {
-                    tracing::error!("No row found for mint: {} at slot: {}", mint, slot);
-                    RpcError::InternalError
-                })?;
+                // The query only reads token-program rows, so a missing or closed row also
+                // covers a mint owned by another program (Agave: "not a Token mint").
+                let Some(row) = rows
+                    .first()
+                    .filter(|row| row.get::<i64, _>("lamports") > 0)
+                else {
+                    return Err(RpcError::MintDataNotFound {
+                        mint: mint.to_string(),
+                    });
+                };
 
                 let mint_data: Vec<u8> = row.get::<Vec<u8>, _>("data");
                 let token_program_pubkey: [u8; 32] = row.get::<[u8; 32], _>("owner");
+
+                if StateWithExtensions::<Mint>::unpack(&mint_data).is_err() {
+                    return Err(RpcError::TokenMintCouldNotBeUnpacked {
+                        mint: mint.to_string(),
+                    });
+                }
 
                 mint_span.record("wall_time", start_time.elapsed().as_millis() as i64);
 
@@ -158,7 +173,9 @@ async fn generate_filters_for_table(
         }
         TokenAccountsFilter::ProgramId(program_id) => {
             if !is_token_program(program_id) {
-                return Err(RpcError::InvalidParams);
+                return Err(RpcError::UnrecognizedTokenProgramId {
+                    program_id: program_id.to_string(),
+                });
             }
 
             (None, *program_id)
@@ -187,7 +204,7 @@ pub async fn get_token_accounts_by_owner_or_delegate(
 
     let owner_or_delegate = owner_or_delegate
         .parse::<solana_pubkey::Pubkey>()
-        .map_err(|_| RpcError::InvalidParams)?;
+        .map_err(|e| RpcError::PubkeyValidationError(format!("{e:?}")))?;
 
     let commitment = config
         .as_ref()
@@ -202,6 +219,12 @@ pub async fn get_token_accounts_by_owner_or_delegate(
         .unwrap_or(CommitmentLevel::Finalized);
 
     let (latest_slot, block_time) = state.latest_slot_and_block_time(commitment).await?;
+
+    if let Some(min_context_slot) = config.as_ref().and_then(|config| config.min_context_slot)
+        && latest_slot < min_context_slot
+    {
+        return Err(RpcError::MinContextSlotNotReached { context_slot: latest_slot });
+    }
 
     let (accounts_filters, program, filter_mint_data) = generate_filters_for_table(
         &filter,
@@ -608,12 +631,9 @@ pub fn check_account_data_len_for_encoding(
             .unwrap_or(account_data_length)
             > MAX_BASE58_BYTES
     {
-        let message = format!(
-            "Encoded binary (base 58) data should be less than {MAX_BASE58_BYTES} bytes, please \
-         use Base64 encoding. pubkey: {pubkey}"
-        );
+        tracing::debug!("Account {pubkey} data is too large for base58 encoding");
 
-        return Err(RpcError::InvalidParamsWithMessage(message));
+        return Err(RpcError::Base58DataTooLarge);
     }
 
     Ok(())

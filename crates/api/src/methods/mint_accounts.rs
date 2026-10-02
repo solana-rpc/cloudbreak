@@ -6,7 +6,7 @@
 use crate::{
     error::RpcError,
     http::CloudbreakRpcState,
-    methods::{LEGACY_TOKEN_PROGRAM_ID, program::GpaStreamingResponse},
+    methods::{LEGACY_TOKEN_PROGRAM_ID, is_token_program, program::GpaStreamingResponse},
 };
 use cloudbreak_core::modules::rpc_filter_type::{Memcmp, RpcFilterType, RpcProgramAccountsConfig};
 use serde::{Deserialize, Serialize};
@@ -29,12 +29,22 @@ pub async fn get_token_accounts_by_mint(
 ) -> Result<GpaStreamingResponse, RpcError> {
     let mint_pubkey = mint
         .parse::<Pubkey>()
-        .map_err(|_| RpcError::InvalidParams)?;
+        .map_err(|e| RpcError::PubkeyValidationError(format!("{e:?}")))?;
 
     let config = config.unwrap_or_default();
-    let program = config
-        .program_id
-        .unwrap_or_else(|| LEGACY_TOKEN_PROGRAM_ID.to_string());
+    // Only a token program lays a mint out in the first 32 bytes, which is what the filter matches.
+    let program = match config.program_id {
+        Some(program_id) => {
+            let parsed = program_id
+                .parse::<Pubkey>()
+                .map_err(|e| RpcError::PubkeyValidationError(format!("{e:?}")))?;
+            if !is_token_program(&parsed) {
+                return Err(RpcError::UnrecognizedTokenProgramId { program_id });
+            }
+            program_id
+        }
+        None => LEGACY_TOKEN_PROGRAM_ID.to_string(),
+    };
 
     let gpa_config = RpcProgramAccountsConfig {
         filters: Some(vec![RpcFilterType::Memcmp(Memcmp::new_raw_bytes(

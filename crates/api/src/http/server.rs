@@ -4,6 +4,7 @@
  */
 
 use std::convert::Infallible;
+use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -110,7 +111,7 @@ async fn handle_request(
     req: Request<Incoming>,
     state: Arc<CloudbreakRpcState>,
     header_keys: Arc<HeaderKeys>,
-) -> Result<Response<UnsyncBoxBody<Bytes, Infallible>>, Infallible> {
+) -> Result<Response<UnsyncBoxBody<Bytes, io::Error>>, Infallible> {
     let request_start = Instant::now();
     let inflight_guard = metrics::InFlightRequestGuard::new("http");
     let request_timeout = state.request_timeout;
@@ -139,9 +140,11 @@ async fn handle_request(
         },
     };
 
-    let inner_body: UnsyncBoxBody<Bytes, Infallible> = match handler_response.body {
+    let inner_body: UnsyncBoxBody<Bytes, io::Error> = match handler_response.body {
         ResponseBody::Buffered(bytes) => {
-            let stream = futures::stream::once(async move { Ok(Frame::data(Bytes::from(bytes))) });
+            let stream = futures::stream::once(async move {
+                Ok::<_, io::Error>(Frame::data(Bytes::from(bytes)))
+            });
             BodyExt::boxed_unsync(StreamBody::new(stream))
         }
         ResponseBody::Streaming(body) => body,
@@ -185,10 +188,11 @@ pub struct HttpHandlerResponse {
 ///
 /// `Streaming` is for endpoints that emit their response body incrementally —
 /// the body is already a hyper-compatible `BoxBody` produced by the handler
-/// (see `crate::http::streaming`).
+/// (see `crate::http::streaming`). A body error makes hyper abort the connection
+/// (HTTP/1) or reset the stream (HTTP/2) instead of ending the body normally.
 pub enum ResponseBody {
     Buffered(Vec<u8>),
-    Streaming(UnsyncBoxBody<Bytes, Infallible>),
+    Streaming(UnsyncBoxBody<Bytes, io::Error>),
 }
 
 /// Wraps the outgoing response body so we can observe the full

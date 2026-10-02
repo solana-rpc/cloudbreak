@@ -9,7 +9,8 @@ all_mints AS (
     SELECT
         data,
         slot,
-        owner
+        owner,
+        lamports
     FROM accounts
     WHERE
         owner
@@ -21,7 +22,8 @@ all_mints AS (
     SELECT
         data,
         slot,
-        owner
+        owner,
+        lamports
     FROM snapshot_accounts
     WHERE
         owner
@@ -33,7 +35,8 @@ all_mints AS (
     SELECT
         data,
         slot,
-        owner
+        owner,
+        lamports
     FROM accounts
     WHERE
         owner
@@ -45,7 +48,8 @@ all_mints AS (
     SELECT
         data,
         slot,
-        owner
+        owner,
+        lamports
     FROM snapshot_accounts
     WHERE
         owner
@@ -56,6 +60,7 @@ all_mints AS (
 
 SELECT
     data,
-    owner
+    owner,
+    lamports
 FROM all_mints
 ORDER BY slot DESC LIMIT 1;

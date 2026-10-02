@@ -2,7 +2,10 @@
 host = "0.0.0.0"
 port = 4000
 max-connections = 100
-gpa-stream-batch-size = 1000
+# Unset: getProgramAccounts sends one batch, so every failure is a JSON-RPC error.
+# Set to opt in to streaming (lower memory and time to first byte); a mid-stream
+# failure then aborts the connection. See "Streamed Responses" in the README.
+# gpa-stream-batch-size = 1000
 request-timeout = "60s"
 max-multiple-accounts = 100
 
@@ -63,7 +66,9 @@ span-filter = [
   "slot_db",
   "mint_db",
   "mint_data",
-  "gpa_cache_finalize_query"
+  "gpa_cache_finalize_query",
+  "processed_read",
+  "account_db"
 ]
 
 # How to handle requests with "processed" commitment level.
@@ -72,7 +77,7 @@ span-filter = [
 # processed-commitment = "reject"
 
 # How to respond to requests while the node is unhealthy.
-# "json-rpc-error" (default) — return a NODE_UNHEALTHY JSON-RPC error with HTTP 200.
+# "json-rpc-error" (default) — return a JSON-RPC error -32005 ("Node is unhealthy") with HTTP 200.
 # "http-unavailable" — return an HTTP 503 Service Unavailable response instead.
 #   (Note: only applies to single requests; batch requests always return HTTP 200
 #    with per-item JSON-RPC errors.)
@@ -87,6 +92,19 @@ span-filter = [
 [slot-syncronizer]
 enabled = false
 interval_ms = 200
+
+# Serves processed commitment for getAccountInfo, getMultipleAccounts, getBalance,
+# getTokenAccountBalance, getTokenSupply and getSlot from a Yellowstone block feed held in
+# memory around the Postgres confirmed slot. Other methods keep following
+# processed-commitment. Requires [slot-syncronizer] enabled = true. Startup fails
+# without it. For these methods it overrides processed-commitment = "reject":
+# when no processed blocks can be proven, a processed request
+# answers exactly as a confirmed request would. Each API instance carries its own
+# full block feed.
+# [processed-accounts]
+# enabled = false
+# endpoint = "https://grpc.example:443"
+# x-token = "..."
 
 # Optional module: cache configuration for the GPA queries.
 [gpa-cache]

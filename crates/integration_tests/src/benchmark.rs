@@ -1119,7 +1119,7 @@ fn size_category_ord(cat: &str) -> u8 {
     }
 }
 
-fn percentile(sorted: &[u128], pct: f64) -> u128 {
+pub(crate) fn percentile(sorted: &[u128], pct: f64) -> u128 {
     if sorted.is_empty() {
         return 0;
     }
