@@ -4,10 +4,14 @@
  */
 
 use cloudbreak_core::ApiConfig;
-use cloudbreak_core::metrics::PROCESSED_CONFIRM_LATENCY_MS;
+use cloudbreak_core::metrics::{
+    PROCESSED_CONFIRM_LATENCY_MS, SLOT_LAG_LAST_SLOT, SLOT_LAG_MS, SLOT_LAG_SLOTS,
+    SLOT_LAG_UNMATCHED_TOTAL,
+};
 use hyper::StatusCode;
 use prometheus::{
-    HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
+    HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
+    TextEncoder,
 };
 use sea_orm::DatabaseConnection;
 use std::{
@@ -162,6 +166,23 @@ lazy_static::lazy_static! {
 
     /// Processed commitment requests for the methods served from processed blocks,
     /// labelled by `route` (`view` or `degraded`) and `reason` (`none` or the fallback reason).
+    /// Slot advances the slot syncronizer applied, by commitment and source (notify, poll, resync).
+    pub static ref CLOUDBREAK_API_SLOT_SYNC_UPDATES_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("cloudbreak_api_slot_sync_updates_total", "Slot advances applied by the slot syncronizer, by commitment and source"),
+        &["commitment", "source"],
+    ).unwrap();
+
+    /// Slots the safety poll found whose notification never arrived.
+    pub static ref CLOUDBREAK_API_SLOT_SYNC_MISSED_NOTIFICATIONS_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("cloudbreak_api_slot_sync_missed_notifications_total", "Slots found by the poll without a notification, by commitment"),
+        &["commitment"],
+    ).unwrap();
+
+    /// Reconnects of the slot notification listener.
+    pub static ref CLOUDBREAK_API_SLOT_SYNC_LISTENER_RECONNECTS_TOTAL: IntCounter = IntCounter::new(
+        "cloudbreak_api_slot_sync_listener_reconnects_total", "Reconnects of the slot notification listener"
+    ).unwrap();
+
     pub static ref CLOUDBREAK_API_PROCESSED_REQUESTS_TOTAL: IntCounterVec = IntCounterVec::new(
         Opts::new(
             "cloudbreak_api_processed_requests_total",
@@ -318,6 +339,19 @@ pub fn setup_metrics(config: &ApiConfig) -> anyhow::Result<()> {
         if config.processed_accounts_enabled() {
             register!(CLOUDBREAK_API_PROCESSED_REQUESTS_TOTAL);
             register!(PROCESSED_CONFIRM_LATENCY_MS);
+        }
+
+        if config.slot_syncronizer.enabled {
+            register!(CLOUDBREAK_API_SLOT_SYNC_UPDATES_TOTAL);
+            register!(CLOUDBREAK_API_SLOT_SYNC_MISSED_NOTIFICATIONS_TOTAL);
+            register!(CLOUDBREAK_API_SLOT_SYNC_LISTENER_RECONNECTS_TOTAL);
+        }
+
+        if config.slot_lag_enabled() {
+            register!(SLOT_LAG_MS);
+            register!(SLOT_LAG_UNMATCHED_TOTAL);
+            register!(SLOT_LAG_LAST_SLOT);
+            register!(SLOT_LAG_SLOTS);
         }
     });
 

@@ -11,4 +11,5 @@ pub mod processed;
 pub mod query_tracker_api;
 pub mod rpc_filter_type;
 pub mod service_health;
+pub mod slot_lag;
 pub mod supply;

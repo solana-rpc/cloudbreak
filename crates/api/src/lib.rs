@@ -7,7 +7,8 @@ use futures::future;
 use sea_orm::{ConnectOptions, Database};
 use std::sync::Arc;
 use std::time::Duration;
-use cloudbreak_core::modules::processed::ProcessedAccounts;
+use cloudbreak_core::modules::processed::{self, ProcessedAccounts};
+use cloudbreak_core::modules::slot_lag::SlotLag;
 use cloudbreak_core::{ApiConfig, EnvironmentInfo, TryLoadConfig};
 
 use crate::{
@@ -32,7 +33,7 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
     let config = ApiConfig::try_load(config)?;
     config.validate_processed_accounts()?;
 
-    if config.processed_accounts_enabled() {
+    if config.grpc().is_some() {
         rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
             .expect("Failed to install rustls crypto provider");
@@ -79,8 +80,14 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
     };
 
     let (anchor_tx, anchor_rx) = tokio::sync::watch::channel(None);
+    let slot_lag = config.slot_lag_enabled().then(SlotLag::default);
     let (mut slot_syncronizer_handle, slot_syncronizer_data) =
-        match slot_syncronizer::start_slot_syncronizer(database.clone(), &config, anchor_tx) {
+        match slot_syncronizer::start_slot_syncronizer(
+            database.clone(),
+            &config,
+            anchor_tx,
+            slot_lag.clone(),
+        ) {
             Some((handle, data)) => (future::Either::Left(handle), Some(data)),
             None => (future::Either::Right(future::pending()), None),
         };
@@ -175,9 +182,14 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
     }
 
     let processed =
-        ProcessedAccounts::from_config(config.processed_accounts.as_ref(), indexer_filter.clone())?;
-    processed.spawn(anchor_rx);
+        ProcessedAccounts::from_config(config.processed_accounts.as_ref(), indexer_filter.clone());
+    if let Some(grpc) = config.grpc() {
+        processed::validate_grpc(grpc)?;
+        processed::spawn_feed(grpc, &processed, anchor_rx, slot_lag.unwrap_or_default());
+    }
+    info!("grpc feed: enabled: {}", config.grpc().is_some());
     info!("processed accounts: enabled: {}", processed.is_enabled());
+    info!("slot lag tracker: enabled: {}", config.slot_lag_enabled());
 
     let state = CloudbreakRpcState::new(
         database,

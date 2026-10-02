@@ -89,22 +89,28 @@ span-filter = [
 # [supply]
 # enabled = false
 
+# Slots arrive by Postgres LISTEN/NOTIFY. interval_ms is the safety read of `slots`.
 [slot-syncronizer]
 enabled = false
 interval_ms = 200
 
-# Serves processed commitment for getAccountInfo, getMultipleAccounts, getBalance,
-# getTokenAccountBalance, getTokenSupply and getSlot from a Yellowstone block feed held in
-# memory around the Postgres confirmed slot. Other methods keep following
-# processed-commitment. Requires [slot-syncronizer] enabled = true. Startup fails
-# without it. For these methods it overrides processed-commitment = "reject":
-# when no processed blocks can be proven, a processed request
-# answers exactly as a confirmed request would. Each API instance carries its own
-# full block feed.
-# [processed-accounts]
+# The API gRPC feed: Yellowstone blocks with accounts and slot statuses at processed
+# commitment. Each API instance carries its own full block feed. With [slot-syncronizer]
+# enabled, its slot statuses are compared with Postgres in the cloudbreak_slot_lag_* metrics.
+# [grpc]
 # enabled = false
 # endpoint = "https://grpc.example:443"
 # x-token = "..."
+
+# Serves processed commitment for getAccountInfo, getMultipleAccounts, getBalance,
+# getTokenAccountBalance, getTokenSupply and getSlot from the [grpc] block feed held in
+# memory around the Postgres confirmed slot. Other methods keep following
+# processed-commitment. Requires [grpc] and [slot-syncronizer] enabled = true. Startup
+# fails without them. For these methods it overrides processed-commitment = "reject":
+# when no processed blocks can be proven, a processed request
+# answers exactly as a confirmed request would.
+# [processed-accounts]
+# enabled = false
 
 # Optional module: cache configuration for the GPA queries.
 [gpa-cache]

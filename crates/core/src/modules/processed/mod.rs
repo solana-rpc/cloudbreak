@@ -31,7 +31,7 @@
 //!
 //! # Runtime model
 //!
-//! [`ProcessedAccounts::spawn`] starts the `processed-feed` thread. After every
+//! [`spawn_feed`] starts the `grpc-feed` thread. After every
 //! block, slot status or anchor change the writer prunes, selects the latest
 //! chained blocks and publishes them behind an `RwLock`. A request clones one
 //! `Arc` and holds no lock while it reads. A block leaves memory when the last
@@ -67,13 +67,14 @@
 //! # Enable rules
 //!
 //! The API `[processed-accounts]` section with `enabled = true` turns it on.
-//! Otherwise [`ProcessedAccounts::default()`] is a no-op handle: `spawn` does
-//! nothing and `blocks` returns `None`.
+//! Otherwise [`ProcessedAccounts::default()`] is a no-op handle: the feed drops
+//! blocks and `blocks` returns `None`. The feed itself runs whenever `[grpc]` is
+//! enabled, and reports confirmed and finalized slot statuses to [`SlotLag`].
 //!
 //! # Node requirements
 //!
-//! - A Yellowstone endpoint that allows processed commitment and
-//!   `interslot_updates`, plus its x-token.
+//! - `[grpc]` enabled: a Yellowstone endpoint that allows processed commitment
+//!   and `interslot_updates`, plus its x-token.
 //! - `[slot-syncronizer]` enabled, which publishes the [`Anchor`].
 //! - No owner map, no program filter change, no indexer change, no
 //!   `replay_stored_slots`. Each API instance carries a full block feed.
@@ -111,7 +112,8 @@ use std::time::Duration;
 use solana_pubkey::Pubkey;
 use yellowstone_grpc_client::GeyserGrpcClient;
 
-use crate::config::{AccountSelectorConfig, ProcessedAccountsConfig};
+use crate::config::{AccountSelectorConfig, ApiGrpcConfig, ProcessedAccountsConfig};
+use crate::modules::slot_lag::SlotLag;
 
 /// Bound on connecting and on each request.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -151,7 +153,6 @@ pub(crate) enum AccountEntry {
 }
 
 struct Shared {
-    config: ProcessedAccountsConfig,
     program_filter: Arc<AccountSelectorConfig>,
     latest: RwLock<Option<Arc<ProcessedBlocks>>>,
 }
@@ -172,32 +173,21 @@ pub struct ProcessedAccounts(Option<Arc<Shared>>);
 
 impl ProcessedAccounts {
     /// Returns the disabled handle when the section is absent or disabled.
-    /// Otherwise checks the endpoint and x-token. Does not connect.
     pub fn from_config(
         config: Option<&ProcessedAccountsConfig>,
         program_filter: Arc<AccountSelectorConfig>,
-    ) -> anyhow::Result<Self> {
-        let Some(config) = config.filter(|c| c.enabled) else {
-            return Ok(Self::default());
-        };
-        GeyserGrpcClient::build_from_shared(config.endpoint.clone())?
-            .x_token(config.x_token.clone())?;
-        Ok(Self(Some(Arc::new(Shared {
-            config: config.clone(),
+    ) -> Self {
+        if !config.is_some_and(|c| c.enabled) {
+            return Self::default();
+        }
+        Self(Some(Arc::new(Shared {
             program_filter,
             latest: RwLock::new(None),
-        }))))
+        })))
     }
 
     pub fn is_enabled(&self) -> bool {
         self.0.is_some()
-    }
-
-    /// Starts the `processed-feed` thread. No-op when disabled.
-    pub fn spawn(&self, anchor_rx: tokio::sync::watch::Receiver<Option<Anchor>>) {
-        if let Some(shared) = &self.0 {
-            subscribe::spawn_feed(shared.clone(), anchor_rx);
-        }
     }
 
     /// The blocks for one request, or `None` when no chain can be proven.
@@ -211,47 +201,68 @@ impl ProcessedAccounts {
     }
 }
 
+/// Checks the `[grpc]` endpoint and x-token. Does not connect.
+pub fn validate_grpc(grpc: &ApiGrpcConfig) -> anyhow::Result<()> {
+    GeyserGrpcClient::build_from_shared(grpc.endpoint.clone())?.x_token(grpc.x_token.clone())?;
+    Ok(())
+}
+
+/// Starts the `grpc-feed` thread. It feeds `processed` when enabled and reports confirmed
+/// and finalized slot statuses to `slot_lag`.
+pub fn spawn_feed(
+    grpc: &ApiGrpcConfig,
+    processed: &ProcessedAccounts,
+    anchor_rx: tokio::sync::watch::Receiver<Option<Anchor>>,
+    slot_lag: SlotLag,
+) {
+    subscribe::spawn_feed(grpc, processed.0.clone(), anchor_rx, slot_lag);
+}
+
 #[cfg(test)]
 mod tests {
     use super::store::tests::{TestChain, anchor_at};
     use super::*;
 
-    pub(super) fn config(endpoint: &str) -> ProcessedAccountsConfig {
-        ProcessedAccountsConfig {
+    pub(super) fn handle() -> ProcessedAccounts {
+        ProcessedAccounts::from_config(
+            Some(&ProcessedAccountsConfig { enabled: true }),
+            Arc::new(AccountSelectorConfig::default()),
+        )
+    }
+
+    fn grpc(endpoint: &str) -> ApiGrpcConfig {
+        ApiGrpcConfig {
             enabled: true,
             endpoint: endpoint.to_string(),
             x_token: None,
         }
     }
 
-    pub(super) fn handle(config: &ProcessedAccountsConfig) -> anyhow::Result<ProcessedAccounts> {
-        ProcessedAccounts::from_config(Some(config), Arc::new(AccountSelectorConfig::default()))
-    }
-
     #[test]
-    fn from_config_gates_on_enabled_and_checks_the_endpoint() {
+    fn from_config_gates_on_enabled() {
         let disabled = ProcessedAccounts::default();
         assert!(!disabled.is_enabled());
-        let (_tx, rx) = tokio::sync::watch::channel(None);
-        disabled.spawn(rx);
         assert!(disabled.blocks().is_none());
 
-        let mut off = config("");
-        off.enabled = false;
-        assert!(!handle(&off).unwrap().is_enabled());
-        let none = ProcessedAccounts::from_config(None, Arc::new(AccountSelectorConfig::default()));
-        assert!(!none.unwrap().is_enabled());
+        let filter = Arc::new(AccountSelectorConfig::default());
+        let off = ProcessedAccountsConfig { enabled: false };
+        assert!(!ProcessedAccounts::from_config(Some(&off), filter.clone()).is_enabled());
+        assert!(!ProcessedAccounts::from_config(None, filter).is_enabled());
 
-        assert!(handle(&config("not a uri")).is_err());
-
-        let enabled = handle(&config("http://grpc:10000")).unwrap();
+        let enabled = handle();
         assert!(enabled.is_enabled());
         assert!(enabled.blocks().is_none());
     }
 
     #[test]
+    fn validate_grpc_checks_the_endpoint() {
+        assert!(validate_grpc(&grpc("not a uri")).is_err());
+        validate_grpc(&grpc("http://grpc:10000")).unwrap();
+    }
+
+    #[test]
     fn blocks_returns_the_latest_blocks() {
-        let handle = handle(&config("http://grpc:10000")).unwrap();
+        let handle = handle();
         let shared = handle.0.as_ref().unwrap();
         let mut chain = TestChain::new();
         chain.linear(101, 101);

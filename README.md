@@ -492,12 +492,31 @@ Connects the API to the query tracker service for reporting GPA query patterns.
 
 #### `[slot-syncronizer]` (optional)
 
-Periodically syncs the latest slot from the database for consistency checks. Enabled by default; omit this section or set `enabled = false` to disable.
+Keeps the confirmed and finalized slots and the service health in memory. The indexer's `slots_notify` trigger sends every real change of a `slots` row on the Postgres channel `cloudbreak_slots`, and the API applies it as soon as it arrives. A read of `slots` every `interval_ms` is the safety net: it applies anything a lost notification left behind and counts it in `cloudbreak_api_slot_sync_missed_notifications_total`. Enabled by default; omit this section or set `enabled = false` to disable.
 
-| Key           | Type   | Default | Description                          |
-| ------------- | ------ | ------- | ------------------------------------ |
-| `enabled`     | `bool` | `true`  | Enable/disable slot synchronization. |
-| `interval_ms` | `u64`  | `200`   | Sync interval in milliseconds.       |
+| Key           | Type   | Default | Description                                    |
+| ------------- | ------ | ------- | ---------------------------------------------- |
+| `enabled`     | `bool` | `true`  | Enable/disable slot synchronization.           |
+| `interval_ms` | `u64`  | `200`   | Safety read interval in milliseconds.          |
+
+#### `[grpc]` (optional)
+
+The API gRPC feed: Yellowstone blocks with accounts and slot statuses at processed commitment. `[processed-accounts]` requires it. With `[slot-syncronizer]` also enabled, the feed's confirmed and finalized slot statuses are compared with the Postgres notifications in the `cloudbreak_slot_lag_*` metrics. Each API instance carries its own full block feed.
+
+| Field      | Type     | Default | Description                                                                       |
+| ---------- | -------- | ------- | --------------------------------------------------------------------------------- |
+| `enabled`  | `bool`   | `false` | Start the gRPC feed.                                                              |
+| `endpoint` | `string` | `""`    | Yellowstone gRPC endpoint that allows processed commitment and interslot updates. |
+| `x-token`  | `string` | none    | Yellowstone gRPC access token.                                                    |
+
+Example:
+
+```toml
+[grpc]
+enabled = true
+endpoint = "https://grpc.example:443"
+x-token = "..."
+```
 
 #### `processed-commitment` (top-level, optional)
 
@@ -518,21 +537,17 @@ processed-commitment = "use-confirmed"
 
 Serves `processed` commitment for `getAccountInfo`, `getMultipleAccounts`, `getBalance`, `getTokenAccountBalance`, `getTokenSupply` and `getSlot`. The API subscribes to Yellowstone blocks at processed commitment and keeps the blocks around the Postgres confirmed slot in memory. A key written in those blocks is answered from memory. Any other key reads Postgres at the confirmed slot. When the blocks cannot be linked to the confirmed slot, a processed request answers exactly as a confirmed request would, even with `processed-commitment = "reject"`. Other methods keep following `processed-commitment`.
 
-Requires `[slot-syncronizer]` with `enabled = true`. Startup fails without it. Each API instance carries its own block feed.
+Requires `[grpc]` and `[slot-syncronizer]` with `enabled = true`. Startup fails without them.
 
-| Field      | Type     | Default | Description                                                               |
-| ---------- | -------- | ------- | ------------------------------------------------------------------------- |
-| `enabled`  | `bool`   | `false` | Enable processed commitment for the methods above.                        |
-| `endpoint` | `string` | `""`    | Yellowstone gRPC endpoint that allows processed commitment and interslot updates. |
-| `x-token`  | `string` | none    | Yellowstone gRPC access token.                                            |
+| Field     | Type   | Default | Description                                        |
+| --------- | ------ | ------- | -------------------------------------------------- |
+| `enabled` | `bool` | `false` | Enable processed commitment for the methods above. |
 
 Example:
 
 ```toml
 [processed-accounts]
 enabled = true
-endpoint = "https://grpc.example:443"
-x-token = "..."
 ```
 
 #### `unhealthy-response` (top-level, optional)
@@ -794,7 +809,7 @@ The map also speeds up the finalize-slot cleanup. The `accounts` and `snapshot_a
 
 ### Slot Synchronizer
 
-The API server's `[slot-syncronizer]` section controls periodic slot fetching from the database. Enabled by default (200ms interval). Disable with `enabled = false` if not needed.
+The API server's `[slot-syncronizer]` section keeps the latest slots in memory from Postgres `LISTEN`/`NOTIFY` on `cloudbreak_slots`, with a safety read of `slots` every `interval_ms` (200 ms by default). Disable with `enabled = false` if not needed.
 
 ### Query Tracker Integration
 
@@ -881,6 +896,13 @@ All metrics are emitted in the Prometheus text exposition format on each service
 | `cloudbreak_gpa_cache_evicted_bytes_total`           | Counter           | `used`                 | Total bytes evicted from the GPA cache by cleanup, with the same `used` labelling as `cloudbreak_gpa_cache_evictions_total`. |
 | `cloudbreak_api_processed_requests_total`            | Counter           | `method`, `route`, `reason` | Processed commitment requests for the methods `[processed-accounts]` serves. `route` is `view` when the processed blocks answer, `degraded` when the request reads as confirmed. `reason` is `none`, `no_blocks`, `unhealthy`, `head_behind` or `finalized_above_anchor`. Registered only when `[processed-accounts]` is enabled. |
 | `cloudbreak_api_processed_confirm_latency_ms`         | Histogram         | —                      | Time from receiving a processed block to the Postgres confirmed slot reaching it, in milliseconds. Registered only when `[processed-accounts]` is enabled. |
+| `cloudbreak_api_slot_sync_updates_total`              | Counter           | `commitment`, `source` | Slot advances the slot syncronizer applied. `source` is `notify` (Postgres notification), `poll` (safety read) or `resync` (read after the listener connects). Registered only when `[slot-syncronizer]` is enabled. |
+| `cloudbreak_api_slot_sync_missed_notifications_total` | Counter           | `commitment`           | Slots the safety read found whose notification did not arrive within 2 s. Registered only when `[slot-syncronizer]` is enabled. |
+| `cloudbreak_api_slot_sync_listener_reconnects_total`  | Counter           | —                      | Reconnects of the slot notification listener: lost connection, error, or 30 s without a notification. Registered only when `[slot-syncronizer]` is enabled. |
+| `cloudbreak_slot_lag_ms`                              | Histogram         | `commitment`, `first`  | Time between the gRPC feed and the Postgres notification announcing the same slot at the same commitment, in milliseconds. `first` is the side that announced it first (`grpc` or `postgres`). Registered only when `[grpc]` and `[slot-syncronizer]` are enabled. |
+| `cloudbreak_slot_lag_unmatched_total`                 | Counter           | `commitment`, `seen_by`| Slots only one side announced within 60 s, by the side that saw them. Postgres only notifies when its slot rises, and downtime on either side leaves slots on the other. Same registration as `cloudbreak_slot_lag_ms`. |
+| `cloudbreak_slot_lag_last_slot`                       | IntGauge          | `commitment`, `source` | Highest slot announced per commitment and source. Same registration as `cloudbreak_slot_lag_ms`. |
+| `cloudbreak_slot_lag_slots`                           | IntGauge          | `commitment`           | Highest gRPC slot minus highest Postgres slot. Same registration as `cloudbreak_slot_lag_ms`. |
 
 ### Indexer (`cloudbreak-index`)
 

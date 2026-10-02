@@ -759,17 +759,20 @@ pub struct ApiConfig {
     /// `[token-largest-accounts]` state.
     #[serde(rename = "token-largest-accounts", default)]
     pub token_largest_accounts: Option<MethodSection>,
+    /// The API gRPC feed: blocks with accounts and slot statuses at processed commitment.
+    /// Required by `[processed-accounts]`.
+    #[serde(default)]
+    pub grpc: Option<ApiGrpcConfig>,
     /// Serves processed commitment for getAccountInfo, getMultipleAccounts, getBalance,
-    /// getTokenAccountBalance, getTokenSupply and getSlot. Requires `[slot-syncronizer]`.
+    /// getTokenAccountBalance, getTokenSupply and getSlot. Requires `[grpc]` and `[slot-syncronizer]`.
     #[serde(rename = "processed-accounts", default)]
     pub processed_accounts: Option<ProcessedAccountsConfig>,
 }
 
-/// The in-memory processed blocks around the Postgres confirmed slot, fed by a
-/// Yellowstone block subscription. See `modules::processed`.
+/// The Yellowstone gRPC endpoint of the API feed. See `modules::processed`.
 #[derive(Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
-pub struct ProcessedAccountsConfig {
+pub struct ApiGrpcConfig {
     #[serde(default)]
     pub enabled: bool,
     /// Yellowstone gRPC endpoint that allows processed commitment and interslot updates.
@@ -778,6 +781,15 @@ pub struct ProcessedAccountsConfig {
     /// Sent as the `x-token` header.
     #[serde(rename = "x-token", default)]
     pub x_token: Option<String>,
+}
+
+/// The in-memory processed blocks around the Postgres confirmed slot, fed by the
+/// `[grpc]` feed. See `modules::processed`.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessedAccountsConfig {
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// Config section for an optional API method; the method is served only when
@@ -1446,10 +1458,27 @@ impl ApiConfig {
             .is_some_and(|processed| processed.enabled)
     }
 
-    /// Checks the `[slot-syncronizer]` requirement of an enabled `[processed-accounts]`.
+    /// The `[grpc]` section when it is present with `enabled = true`.
+    pub fn grpc(&self) -> Option<&ApiGrpcConfig> {
+        self.grpc.as_ref().filter(|grpc| grpc.enabled)
+    }
+
+    /// The slot lag tracker compares the `[grpc]` feed with the `[slot-syncronizer]` notifications.
+    pub fn slot_lag_enabled(&self) -> bool {
+        self.grpc().is_some() && self.slot_syncronizer.enabled
+    }
+
+    /// Checks the `[grpc]` and `[slot-syncronizer]` requirements of an enabled `[processed-accounts]`.
     pub fn validate_processed_accounts(&self) -> Result<()> {
+        if !self.processed_accounts_enabled() {
+            return Ok(());
+        }
         anyhow::ensure!(
-            !self.processed_accounts_enabled() || self.slot_syncronizer.enabled,
+            self.grpc().is_some(),
+            "processed-accounts requires [grpc] enabled = true"
+        );
+        anyhow::ensure!(
+            self.slot_syncronizer.enabled,
             "processed-accounts requires [slot-syncronizer] enabled = true"
         );
         Ok(())
@@ -1748,7 +1777,7 @@ url = "postgres://localhost/cloudbreak"
     #[test]
     fn processed_accounts_requires_slot_syncronizer() {
         let config = api_config(
-            "[slot-syncronizer]\nenabled = false\ninterval_ms = 200\n\n[processed-accounts]\nenabled = true\nendpoint = \"http://grpc\"\n",
+            "[slot-syncronizer]\nenabled = false\ninterval_ms = 200\n\n[grpc]\nenabled = true\nendpoint = \"http://grpc\"\n\n[processed-accounts]\nenabled = true\n",
         )
         .unwrap();
         let err = config
@@ -1756,5 +1785,43 @@ url = "postgres://localhost/cloudbreak"
             .unwrap_err()
             .to_string();
         assert!(err.contains("slot-syncronizer"), "{err}");
+    }
+
+    #[test]
+    fn processed_accounts_requires_grpc() {
+        for extra in ["", "[grpc]\nenabled = false\nendpoint = \"http://grpc\"\n"] {
+            let config =
+                api_config(&format!("{extra}\n[processed-accounts]\nenabled = true\n")).unwrap();
+            let err = config
+                .validate_processed_accounts()
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("[grpc]"), "{err}");
+        }
+    }
+
+    #[test]
+    fn grpc_section_is_read_and_gated_on_enabled() {
+        let config =
+            api_config("[grpc]\nenabled = true\nendpoint = \"http://grpc\"\nx-token = \"t\"\n")
+                .unwrap();
+        let grpc = config.grpc().unwrap();
+        assert_eq!(grpc.endpoint, "http://grpc");
+        assert_eq!(grpc.x_token.as_deref(), Some("t"));
+        assert!(
+            api_config("[grpc]\nendpoint = \"http://grpc\"\n")
+                .unwrap()
+                .grpc()
+                .is_none()
+        );
+        assert!(api_config("").unwrap().grpc().is_none());
+    }
+
+    #[test]
+    fn processed_accounts_no_longer_takes_an_endpoint() {
+        let err = api_config("[processed-accounts]\nenabled = true\nendpoint = \"http://grpc\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown field"), "{err}");
     }
 }

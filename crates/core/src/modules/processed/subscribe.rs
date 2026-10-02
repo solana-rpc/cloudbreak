@@ -3,16 +3,16 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-//! The feed thread and the single writer.
+//! The API gRPC feed thread and the single writer.
 //!
 //! The writer runs the shared gRPC client on its own OS thread with a
 //! current-thread runtime. One session subscribes to processed blocks with
-//! accounts and to slot statuses with interslot updates. Every block,
-//! `SLOT_CREATED_BANK`, `SLOT_DEAD` and anchor change is applied to the store,
-//! followed by a prune, a selection of the latest chained blocks and a
-//! publish. A stream end,
-//! error or stall ends the session, and the client reconnects with no
-//! `from_slot`. The client never gives up.
+//! accounts and to slot statuses with interslot updates. With processed accounts
+//! enabled, every block, `SLOT_CREATED_BANK`, `SLOT_DEAD` and anchor change is
+//! applied to the store, followed by a prune, a selection of the latest chained
+//! blocks and a publish. `SLOT_CONFIRMED` and `SLOT_FINALIZED` go to the slot lag
+//! tracker. A stream end, error or stall ends the session, and the client
+//! reconnects with no `from_slot`. The client never gives up.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -30,16 +30,23 @@ use super::store::BlockStore;
 use super::{
     Anchor, CONNECT_TIMEOUT, MAX_DECODING_MESSAGE_SIZE, RECONNECT_BACKOFF, STALL_TIMEOUT, Shared,
 };
+use crate::config::ApiGrpcConfig;
 use crate::grpc::{
     GrpcClientOptions, SessionEnd, Subscriber, blocks_with_accounts_request,
     subscribe_with_reconnection,
 };
+use crate::modules::slot_lag::{SlotCommitment, SlotLag, SlotSource};
 
-/// Starts `processed-feed`. Logs and returns when the thread cannot start.
-pub(super) fn spawn_feed(shared: Arc<Shared>, anchor_rx: watch::Receiver<Option<Anchor>>) {
+/// Starts `grpc-feed`. Logs and returns when the thread cannot start.
+pub(super) fn spawn_feed(
+    grpc: &ApiGrpcConfig,
+    shared: Option<Arc<Shared>>,
+    anchor_rx: watch::Receiver<Option<Anchor>>,
+    slot_lag: SlotLag,
+) {
     let options = GrpcClientOptions {
-        endpoint: shared.config.endpoint.clone(),
-        x_token: shared.config.x_token.clone(),
+        endpoint: grpc.endpoint.clone(),
+        x_token: grpc.x_token.clone(),
         timeout: CONNECT_TIMEOUT,
         max_decoding_message_size: MAX_DECODING_MESSAGE_SIZE,
         reconnect_backoff: RECONNECT_BACKOFF,
@@ -47,12 +54,15 @@ pub(super) fn spawn_feed(shared: Arc<Shared>, anchor_rx: watch::Receiver<Option<
         reconnect_from_slot_retain: Duration::ZERO,
     };
     let writer = FeedWriter {
-        shared,
-        store: BlockStore::new(),
+        processed: shared.map(|shared| ProcessedWriter {
+            shared,
+            store: BlockStore::new(),
+        }),
         anchor_rx,
+        slot_lag,
     };
     let spawned = std::thread::Builder::new()
-        .name("processed-feed".to_string())
+        .name("grpc-feed".to_string())
         .spawn(move || {
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -60,21 +70,27 @@ pub(super) fn spawn_feed(shared: Arc<Shared>, anchor_rx: watch::Receiver<Option<
             {
                 Ok(runtime) => runtime,
                 Err(e) => {
-                    tracing::error!("Failed to build processed-feed runtime: {e}");
+                    tracing::error!("Failed to build grpc-feed runtime: {e}");
                     return;
                 }
             };
             runtime.block_on(subscribe_with_reconnection(options, writer));
         });
     if let Err(e) = spawned {
-        tracing::error!("Failed to start processed-feed thread: {e}");
+        tracing::error!("Failed to start grpc-feed thread: {e}");
     }
 }
 
 struct FeedWriter {
+    /// `None` when processed accounts are disabled: blocks are received and dropped.
+    processed: Option<ProcessedWriter>,
+    anchor_rx: watch::Receiver<Option<Anchor>>,
+    slot_lag: SlotLag,
+}
+
+struct ProcessedWriter {
     shared: Arc<Shared>,
     store: BlockStore,
-    anchor_rx: watch::Receiver<Option<Anchor>>,
 }
 
 impl Subscriber for FeedWriter {
@@ -94,8 +110,10 @@ impl Subscriber for FeedWriter {
         &mut self,
         stream: impl Stream<Item = Result<SubscribeUpdate, Status>> + Send,
     ) -> SessionEnd {
-        tracing::info!("processed feed subscribed");
-        self.store.new_session();
+        tracing::info!("grpc feed subscribed");
+        if let Some(processed) = &mut self.processed {
+            processed.store.new_session();
+        }
         self.apply_anchor();
         let mut stream = std::pin::pin!(stream);
         let stall = tokio::time::sleep(STALL_TIMEOUT);
@@ -109,7 +127,7 @@ impl Subscriber for FeedWriter {
                         received_block |= self.apply_update(update);
                     }
                     Some(Err(status)) => {
-                        tracing::warn!("processed feed stream error: {status}");
+                        tracing::warn!("grpc feed stream error: {status}");
                         break if received_block {
                             SessionEnd::Healthy
                         } else {
@@ -117,7 +135,7 @@ impl Subscriber for FeedWriter {
                         };
                     }
                     None => {
-                        tracing::warn!("processed feed stream ended");
+                        tracing::warn!("grpc feed stream ended");
                         break SessionEnd::Healthy;
                     }
                 },
@@ -127,7 +145,7 @@ impl Subscriber for FeedWriter {
                     }
                 }
                 () = &mut stall => {
-                    tracing::warn!("processed feed stalled for {STALL_TIMEOUT:?}");
+                    tracing::warn!("grpc feed stalled for {STALL_TIMEOUT:?}");
                     break SessionEnd::Healthy;
                 }
             }
@@ -140,36 +158,57 @@ impl FeedWriter {
     fn apply_update(&mut self, update: SubscribeUpdate) -> bool {
         match update.update_oneof {
             Some(UpdateOneof::Block(block)) => {
-                let received_at = Instant::now();
-                let block = SlotBlock::from_update(block, &self.shared.program_filter, received_at);
-                self.store.on_block(block);
-                self.publish_latest();
+                if let Some(processed) = &mut self.processed {
+                    let received_at = Instant::now();
+                    let block = SlotBlock::from_update(
+                        block,
+                        &processed.shared.program_filter,
+                        received_at,
+                    );
+                    processed.store.on_block(block);
+                    processed.publish_latest();
+                }
                 true
             }
             Some(UpdateOneof::Slot(slot)) => {
-                match SlotStatus::try_from(slot.status) {
+                let status = SlotStatus::try_from(slot.status);
+                let commitment = match status {
+                    Ok(SlotStatus::SlotConfirmed) => Some(SlotCommitment::Confirmed),
+                    Ok(SlotStatus::SlotFinalized) => Some(SlotCommitment::Finalized),
+                    _ => None,
+                };
+                if let Some(commitment) = commitment {
+                    self.slot_lag
+                        .record(SlotSource::Grpc, commitment, slot.slot, Instant::now());
+                }
+                let Some(processed) = &mut self.processed else {
+                    return false;
+                };
+                match status {
                     Ok(SlotStatus::SlotCreatedBank) => {
-                        self.store.on_created_bank(slot.slot, slot.parent)
+                        processed.store.on_created_bank(slot.slot, slot.parent)
                     }
-                    Ok(SlotStatus::SlotDead) => self.store.on_dead(slot.slot),
+                    Ok(SlotStatus::SlotDead) => processed.store.on_dead(slot.slot),
                     _ => return false,
                 }
-                self.publish_latest();
+                processed.publish_latest();
                 false
             }
             _ => false,
         }
     }
 
-    /// Applies the current anchor when there is one.
+    /// Applies the current anchor when there is one and processed accounts are enabled.
     fn apply_anchor(&mut self) {
         let anchor = self.anchor_rx.borrow_and_update().clone();
-        if let Some(anchor) = anchor {
-            self.store.set_anchor(anchor);
-            self.publish_latest();
+        if let (Some(processed), Some(anchor)) = (&mut self.processed, anchor) {
+            processed.store.set_anchor(anchor);
+            processed.publish_latest();
         }
     }
+}
 
+impl ProcessedWriter {
     /// Prunes, selects and publishes.
     fn publish_latest(&mut self) {
         self.store.prune();
@@ -180,16 +219,40 @@ impl FeedWriter {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{config, handle};
+    use super::super::tests::handle;
     use super::*;
+    use yellowstone_grpc_proto::geyser::SubscribeUpdateSlot;
 
     fn writer() -> FeedWriter {
-        let handle = handle(&config("http://grpc:10000")).unwrap();
         FeedWriter {
-            shared: handle.0.expect("enabled handle"),
-            store: BlockStore::new(),
+            processed: Some(ProcessedWriter {
+                shared: handle().0.expect("enabled handle"),
+                store: BlockStore::new(),
+            }),
             anchor_rx: watch::channel(None).1,
+            slot_lag: SlotLag::default(),
         }
+    }
+
+    fn slot_update(slot: u64, status: SlotStatus) -> SubscribeUpdate {
+        SubscribeUpdate {
+            update_oneof: Some(UpdateOneof::Slot(SubscribeUpdateSlot {
+                slot,
+                parent: slot.checked_sub(1),
+                status: status as i32,
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn slot_statuses_without_processed_accounts_are_not_blocks() {
+        let mut writer = writer();
+        writer.processed = None;
+        assert!(!writer.apply_update(slot_update(10, SlotStatus::SlotConfirmed)));
+        assert!(!writer.apply_update(slot_update(10, SlotStatus::SlotCreatedBank)));
+        writer.apply_anchor();
     }
 
     #[test]

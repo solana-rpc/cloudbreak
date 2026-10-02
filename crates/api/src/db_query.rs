@@ -6,7 +6,7 @@
 use crate::{
     error::RpcError,
     methods::CloudbreakDbResult,
-    slot_syncronizer::{SlotData, SlotSyncronizerData},
+    slot_syncronizer::{SlotData, SlotRow, SlotSyncronizerData},
 };
 use sea_orm::{ConnectionTrait, DatabaseConnection, EntityTrait, QueryOrder, Statement};
 use solana_pubkey::Pubkey;
@@ -87,6 +87,29 @@ pub async fn get_slot_data(db: &DatabaseConnection) -> Option<SlotSyncronizerDat
         },
         healthy,
     })
+}
+
+/// Reads every `slots` row. `blockhash` reads through `to_jsonb`, so it is `None` on a
+/// database the indexer has not migrated yet instead of an error.
+pub async fn get_slot_rows(db: &DatabaseConnection) -> Result<Vec<SlotRow>, sea_orm::sqlx::Error> {
+    use sea_orm::sqlx::Row;
+
+    let rows = sea_orm::sqlx::query(
+        "SELECT commitment, slot, block_time, health, to_jsonb(slots) ->> 'blockhash' AS blockhash FROM slots",
+    )
+    .fetch_all(db.get_postgres_connection_pool())
+    .await?;
+    rows.iter()
+        .map(|row| {
+            Ok(SlotRow {
+                commitment: row.try_get("commitment")?,
+                slot: row.try_get("slot")?,
+                block_time: row.try_get("block_time")?,
+                health: row.try_get("health")?,
+                blockhash: row.try_get("blockhash")?,
+            })
+        })
+        .collect()
 }
 
 /// Reads the blockhash that `recent_blockhashes` holds for `slot`.

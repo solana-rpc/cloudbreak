@@ -121,6 +121,39 @@ lazy_static::lazy_static! {
             ]),
     )
     .expect("Failed to create processed confirm latency histogram");
+
+    /// Time between the gRPC feed and the Postgres notification announcing the same slot at
+    /// the same commitment. `first` names the side that announced it first.
+    pub static ref SLOT_LAG_MS: HistogramVec = HistogramVec::new(
+        HistogramOpts::new("cloudbreak_slot_lag_ms", "Time between the gRPC and Postgres announcements of a slot, in milliseconds")
+            .buckets(vec![
+                0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 150.0, 200.0, 300.0, 400.0, 500.0,
+                750.0, 1_000.0, 2_000.0, 5_000.0, 10_000.0, 30_000.0,
+            ]),
+        &["commitment", "first"],
+    )
+    .expect("Failed to create slot lag histogram");
+
+    /// Slots announced by one side only before the match timeout, by the side that saw them.
+    pub static ref SLOT_LAG_UNMATCHED_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("cloudbreak_slot_lag_unmatched_total", "Slots announced by only one of gRPC and Postgres"),
+        &["commitment", "seen_by"],
+    )
+    .expect("Failed to create slot lag unmatched counter");
+
+    /// Highest slot announced per commitment and source.
+    pub static ref SLOT_LAG_LAST_SLOT: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("cloudbreak_slot_lag_last_slot", "Highest slot announced per commitment and source"),
+        &["commitment", "source"],
+    )
+    .expect("Failed to create slot lag last slot gauge");
+
+    /// Highest gRPC slot minus highest Postgres slot, per commitment.
+    pub static ref SLOT_LAG_SLOTS: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("cloudbreak_slot_lag_slots", "Highest gRPC slot minus highest Postgres slot"),
+        &["commitment"],
+    )
+    .expect("Failed to create slot lag slots gauge");
 }
 
 /// We use a guard to increment the current tokio tasks metric when a task is created and
