@@ -9,8 +9,8 @@ use serde::Deserialize;
 use solana_accounts_db::blockhash_queue::BlockhashQueue;
 use solana_program::clock::{Epoch, Slot, UnixTimestamp};
 use solana_pubkey::Pubkey;
-use solana_runtime::stake_history::StakeHistory;
 use solana_serde::default_on_eof;
+use solana_stake_interface::stake_history::StakeHistory;
 use solana_vote::vote_account::VoteAccounts;
 
 pub const MAX_STREAM_SIZE: u64 = 32 * 1024 * 1024 * 1024;
