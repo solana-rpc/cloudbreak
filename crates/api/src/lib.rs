@@ -221,6 +221,7 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
         }
         result = &mut slot_syncronizer_handle => {
             tracing::error!("Slot synchronizer stopped unexpectedly: {:?}", result);
+            panic!("Slot syncronizer stopped unexpectedly: {result:?}");
         }
     }
 

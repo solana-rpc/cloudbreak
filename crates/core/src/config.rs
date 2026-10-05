@@ -733,7 +733,7 @@ pub struct ApiConfig {
     pub query_tracker_client: Option<QueryTrackerClientConfig>,
     #[serde(
         rename = "slot-syncronizer",
-        default = "SlotSyncronizerConfig::default_interval"
+        default = "SlotSyncronizerConfig::default_enabled"
     )]
     pub slot_syncronizer: SlotSyncronizerConfig,
     #[serde(rename = "processed-commitment", default)]
@@ -853,18 +853,15 @@ impl TryFrom<GpaCacheConfigRaw> for GpaCacheConfig {
     }
 }
 
+/// Keeps the slots in memory from Postgres `LISTEN`/`NOTIFY`. A leftover `interval_ms` key is ignored.
 #[derive(Deserialize, Debug, Clone)]
 pub struct SlotSyncronizerConfig {
     pub enabled: bool,
-    pub interval_ms: u64,
 }
 
 impl SlotSyncronizerConfig {
-    pub fn default_interval() -> Self {
-        Self {
-            enabled: true,
-            interval_ms: 200,
-        }
+    pub fn default_enabled() -> Self {
+        Self { enabled: true }
     }
 }
 
@@ -1729,12 +1726,19 @@ url = "postgres://localhost/cloudbreak"
     fn processed_accounts_absent_or_disabled_skips_validation() {
         for extra in [
             "",
-            "[slot-syncronizer]\nenabled = false\ninterval_ms = 200\n\n[processed-accounts]\nenabled = false\n",
+            "[slot-syncronizer]\nenabled = false\n\n[processed-accounts]\nenabled = false\n",
         ] {
             let config = api_config(extra).unwrap();
             assert!(!config.processed_accounts_enabled());
             config.validate_processed_accounts().unwrap();
         }
+    }
+
+    #[test]
+    fn slot_syncronizer_ignores_a_leftover_interval() {
+        let config = api_config("[slot-syncronizer]\nenabled = true\ninterval_ms = 50\n").unwrap();
+        assert!(config.slot_syncronizer.enabled);
+        assert!(api_config("").unwrap().slot_syncronizer.enabled);
     }
 
     #[test]
@@ -1748,7 +1752,7 @@ url = "postgres://localhost/cloudbreak"
     #[test]
     fn processed_accounts_requires_slot_syncronizer() {
         let config = api_config(
-            "[slot-syncronizer]\nenabled = false\ninterval_ms = 200\n\n[processed-accounts]\nenabled = true\nendpoint = \"http://grpc\"\n",
+            "[slot-syncronizer]\nenabled = false\n\n[processed-accounts]\nenabled = true\nendpoint = \"http://grpc\"\n",
         )
         .unwrap();
         let err = config

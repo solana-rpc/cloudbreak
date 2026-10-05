@@ -492,12 +492,11 @@ Connects the API to the query tracker service for reporting GPA query patterns.
 
 #### `[slot-syncronizer]` (optional)
 
-Periodically syncs the latest slot from the database for consistency checks. Enabled by default; omit this section or set `enabled = false` to disable.
+Keeps the confirmed and finalized slots and the service health in memory. The indexer's `slots_notify` trigger sends every real change of a `slots` row on the Postgres channel `cloudbreak_slots`, and the API applies it as it arrives. A lost listener connection, a bad payload, or 60 s without a notification panics. Until the first notifications arrive after a start, the slots are 0 and the node reads as unhealthy. Enabled by default; omit this section or set `enabled = false` to disable.
 
-| Key           | Type   | Default | Description                          |
-| ------------- | ------ | ------- | ------------------------------------ |
-| `enabled`     | `bool` | `true`  | Enable/disable slot synchronization. |
-| `interval_ms` | `u64`  | `200`   | Sync interval in milliseconds.       |
+| Key       | Type   | Default | Description                          |
+| --------- | ------ | ------- | ------------------------------------ |
+| `enabled` | `bool` | `true`  | Enable/disable slot synchronization. |
 
 #### `processed-commitment` (top-level, optional)
 
@@ -794,7 +793,7 @@ The map also speeds up the finalize-slot cleanup. The `accounts` and `snapshot_a
 
 ### Slot Synchronizer
 
-The API server's `[slot-syncronizer]` section controls periodic slot fetching from the database. Enabled by default (200ms interval). Disable with `enabled = false` if not needed.
+The API server's `[slot-syncronizer]` section keeps the latest slots in memory from Postgres `LISTEN`/`NOTIFY` on `cloudbreak_slots`. Enabled by default. Disable with `enabled = false` if not needed.
 
 ### Query Tracker Integration
 

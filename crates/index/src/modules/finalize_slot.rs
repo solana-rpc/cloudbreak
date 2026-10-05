@@ -412,6 +412,7 @@ async fn finalize_slot(
     db_queries::insert_slot(
         slot,
         updated_accounts.block_time,
+        None,
         CommitmentLevel::Finalized,
         updated_accounts_during_startup.health.is_healthy(),
         &db,

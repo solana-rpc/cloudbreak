@@ -46,7 +46,7 @@
 //!
 //! The head is the highest stored slot. Its walk follows parent links, each
 //! checked by blockhash, down to the confirmed slot, whose blockhash comes from
-//! `recent_blockhashes`. The walk fails, and no blocks are served, when a link is
+//! the `slots` row. The walk fails, and no blocks are served, when a link is
 //! missing, a blockhash differs, the head has no `block_time`, or a slot above
 //! the confirmed slot is poisoned: dead, restarted by a second
 //! `SLOT_CREATED_BANK`, without a `SLOT_CREATED_BANK` in this session, or at or
@@ -128,7 +128,7 @@ pub(crate) const RETAINED_SLOTS_BELOW_CONFIRMED: u64 = 4;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Anchor {
     pub confirmed_slot: u64,
-    /// Base58, as in `recent_blockhashes.blockhash` and `SubscribeUpdateBlock.blockhash`.
+    /// Base58, as in `slots.blockhash` and `SubscribeUpdateBlock.blockhash`.
     pub confirmed_blockhash: String,
 }
 
