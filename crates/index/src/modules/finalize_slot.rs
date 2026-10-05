@@ -245,17 +245,6 @@ impl SlotFinalizer {
         self.health.remove_reason(HealthReason::GapFill).await;
     }
 
-    /// Read-only lookup of a recorded block's blockhash, used by self-healing to confirm gaps
-    /// from the parent chain without an RPC call.
-    pub fn block_hash(&self, slot: u64) -> Option<String> {
-        self.inner
-            .lock()
-            .expect("Failed to lock finalizer")
-            .blocks
-            .get(&slot)
-            .map(|e| e.blockhash.clone())
-    }
-
     fn set_pending_metric(&self, len: usize) {
         metrics::FINALIZE_SLOT_HANDLER_QUEUE_SIZE.set(len as i64);
     }

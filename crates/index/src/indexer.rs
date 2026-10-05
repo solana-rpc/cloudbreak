@@ -312,7 +312,12 @@ pub async fn process_update(
             // confirmed gap this pauses finalization and queues the range for repair.
             indexer_state
                 .self_healing_state
-                .check_slot_gap(block.slot, block.parent_slot, &block.parent_blockhash)
+                .check_slot_gap(
+                    block.slot,
+                    &block.blockhash,
+                    block.parent_slot,
+                    &block.parent_blockhash,
+                )
                 .await;
 
             modules::save_block::save_block(block, db, config.clone(), indexer_state.clone()).await;

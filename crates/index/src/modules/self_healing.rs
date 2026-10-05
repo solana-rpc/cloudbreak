@@ -32,6 +32,8 @@ use crate::{
 #[derive(Clone)]
 pub struct SelfHealingState {
     pub last_slot_received: Arc<Mutex<u64>>,
+    /// Blockhash of `last_slot_received`, compared against the next block's `parent_blockhash`.
+    last_blockhash_received: Arc<Mutex<String>>,
     /// Slots pending repair from a snapshot.
     pub gaps_list: Arc<Mutex<Vec<u64>>>,
     /// For each confirmed gap, the last live slot we received before it (`gap_start - 1`). After
@@ -51,6 +53,7 @@ impl SelfHealingState {
     ) -> Self {
         Self {
             last_slot_received: Arc::new(Mutex::new(0)),
+            last_blockhash_received: Arc::new(Mutex::new(String::new())),
             gaps_list: Arc::new(Mutex::new(Vec::new())),
             gap_boundaries: Arc::new(Mutex::new(BTreeSet::new())),
             finalizer,
@@ -72,7 +75,16 @@ impl SelfHealingState {
     ///   between were skipped/empty: nothing to do.
     /// - Otherwise at least one real block was missed: the whole range is queued for repair, the
     ///   service is marked unhealthy, and finalization is paused until the gap is filled.
-    pub async fn check_slot_gap(&self, slot: u64, parent_slot: u64, parent_blockhash: &str) {
+    ///
+    /// An out of order block (`slot <= last_slot_received`) does not move the last received slot
+    /// or blockhash, so the next block is still compared against the newest block we have.
+    pub async fn check_slot_gap(
+        &self,
+        slot: u64,
+        blockhash: &str,
+        parent_slot: u64,
+        parent_blockhash: &str,
+    ) {
         let last_slot_received = *self
             .last_slot_received
             .lock()
@@ -95,11 +107,11 @@ impl SelfHealingState {
             // The block builds directly on the last slot we have (and the hash matches) if all the
             // slots in between were empty/skipped. Anything else means a real block was missed.
             let builds_on_last = parent_slot == last_slot_received
-                && self
-                    .finalizer
-                    .block_hash(parent_slot)
-                    .map(|hash| hash == parent_blockhash)
-                    .unwrap_or(false);
+                && *self
+                    .last_blockhash_received
+                    .lock()
+                    .expect("Failed to lock last_blockhash_received")
+                    == parent_blockhash;
 
             if builds_on_last {
                 tracing::debug!(
@@ -148,6 +160,10 @@ impl SelfHealingState {
             .last_slot_received
             .lock()
             .expect("Failed to lock last_slot_received") = slot;
+        *self
+            .last_blockhash_received
+            .lock()
+            .expect("Failed to lock last_blockhash_received") = blockhash.to_owned();
     }
 
     /// Starts a separate task that periodically repairs confirmed slot gaps out of incremental snapshots.
