@@ -903,8 +903,10 @@ impl InvokeContextCallback for SimulationBank {
 }
 
 impl TransactionProcessingCallback for SimulationBank {
-    fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<(AccountSharedData, Slot)> {
-        self.accounts.get(pubkey).cloned()
+    fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
+        self.accounts
+            .get(pubkey)
+            .map(|(account, _slot)| account.clone())
     }
 }
 
@@ -1132,7 +1134,7 @@ fn execute(
     for builtin in solana_builtins::BUILTINS {
         processor.add_builtin(
             builtin.program_id,
-            ProgramCacheEntry::new_builtin(0, builtin.register_fn),
+            ProgramCacheEntry::new_builtin(builtin.register_fn),
         );
     }
 
@@ -1160,6 +1162,8 @@ fn execute(
         all_or_nothing: false,
         strict_nonce_size_check: true,
         drop_noop_transactions: true,
+        // Leader-side filtering. Off for simulation, which replays the transaction.
+        drop_bail_out_transactions: false,
     };
 
     Ok(processor.load_and_execute_sanitized_transactions(
