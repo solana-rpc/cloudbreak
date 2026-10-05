@@ -82,6 +82,7 @@ pub async fn drain_all<E: CleanupExecutor>(
             executor,
             taken,
             SNAPSHOT_ACCOUNTS_TABLE,
+            "cleanup_snapshot_accounts",
             "cleanup_snapshot_accounts_batch",
             query_timeout,
             batch_size,
@@ -93,6 +94,7 @@ pub async fn drain_all<E: CleanupExecutor>(
         executor,
         taken,
         ACCOUNTS_TABLE,
+        "cleanup_accounts",
         "cleanup_accounts_batch",
         query_timeout,
         batch_size,
@@ -111,17 +113,21 @@ async fn run_table<E: CleanupExecutor>(
     taken: &Taken,
     table: &str,
     origin: &str,
+    batch_origin: &str,
     query_timeout: Duration,
     batch_size: usize,
 ) -> Result<Vec<(usize, u64)>, DbErr> {
+    let start_time = Instant::now();
     let statements = forms(taken).into_iter().flat_map(|(form, items)| {
         items.chunks(batch_size).map(move |chunk| async move {
             let deleted =
-                run_statement(executor, table, origin, form, chunk, query_timeout).await?;
+                run_statement(executor, table, batch_origin, form, chunk, query_timeout).await?;
             Ok((chunk.len(), deleted))
         })
     });
-    join_all(statements).await.into_iter().collect()
+    let result = join_all(statements).await.into_iter().collect();
+    metrics::record_finalize_slot(start_time.elapsed().as_secs_f64(), origin);
+    result
 }
 
 fn forms(taken: &Taken) -> [(KeyForm, &[(CleanupKey, u64)]); 2] {
