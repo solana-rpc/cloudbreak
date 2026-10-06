@@ -25,13 +25,15 @@ use crate::{
 
 /// Tracks slot continuity on the gRPC block stream and repairs confirmed gaps out of snapshots.
 ///
-/// Gaps are confirmed purely from the block's `parent_slot` without any RPC call: if a newly
-/// received block does not build directly on the last block we have, then at least one real block
-/// was missed and the whole range is repaired (empty slots in the middle are
+/// Gaps are confirmed purely from the block chain (`parent_slot` / `parent_blockhash`) without any
+/// RPC call: if a newly received block does not build directly on the last block we have, then at
+/// least one real block was missed and the whole range is repaired (empty slots in the middle are
 /// resolved for free, since the snapshot only contains slots that actually had account data).
 #[derive(Clone)]
 pub struct SelfHealingState {
     pub last_slot_received: Arc<Mutex<u64>>,
+    /// Blockhash of `last_slot_received`, compared against the next block's `parent_blockhash`.
+    last_blockhash_received: Arc<Mutex<String>>,
     /// Slots pending repair from a snapshot.
     pub gaps_list: Arc<Mutex<Vec<u64>>>,
     /// For each confirmed gap, the last live slot we received before it (`gap_start - 1`). After
@@ -51,6 +53,7 @@ impl SelfHealingState {
     ) -> Self {
         Self {
             last_slot_received: Arc::new(Mutex::new(0)),
+            last_blockhash_received: Arc::new(Mutex::new(String::new())),
             gaps_list: Arc::new(Mutex::new(Vec::new())),
             gap_boundaries: Arc::new(Mutex::new(BTreeSet::new())),
             finalizer,
@@ -68,12 +71,20 @@ impl SelfHealingState {
     /// Checks whether `slot` continues the chain from the last block we received.
     ///
     /// Using the block's parent pointer:
-    /// - If the block builds directly on the last received slot, any slots in between were
-    ///   skipped/empty: nothing to do. A parent blockhash that differs or can not be looked up
-    ///   only logs a warning.
+    /// - If the block builds directly on the last received slot (matching hash), any slots in
+    ///   between were skipped/empty: nothing to do.
     /// - Otherwise at least one real block was missed: the whole range is queued for repair, the
     ///   service is marked unhealthy, and finalization is paused until the gap is filled.
-    pub async fn check_slot_gap(&self, slot: u64, parent_slot: u64, parent_blockhash: &str) {
+    ///
+    /// An out of order block (`slot <= last_slot_received`) does not move the last received slot
+    /// or blockhash, so the next block is still compared against the newest block we have.
+    pub async fn check_slot_gap(
+        &self,
+        slot: u64,
+        blockhash: &str,
+        parent_slot: u64,
+        parent_blockhash: &str,
+    ) {
         let last_slot_received = *self
             .last_slot_received
             .lock()
@@ -93,31 +104,16 @@ impl SelfHealingState {
         }
 
         if last_slot_received != 0 && slot > last_slot_received + 1 {
-            // The block builds directly on the last slot we have if all the slots in between were
-            // empty/skipped. Anything else means a real block was missed.
-            let builds_on_last = parent_slot == last_slot_received;
+            // The block builds directly on the last slot we have (and the hash matches) if all the
+            // slots in between were empty/skipped. Anything else means a real block was missed.
+            let builds_on_last = parent_slot == last_slot_received
+                && *self
+                    .last_blockhash_received
+                    .lock()
+                    .expect("Failed to lock last_blockhash_received")
+                    == parent_blockhash;
 
             if builds_on_last {
-                // The parent hash is only checked for a warning. The parent can be finalized and
-                // removed from the finalizer map before this block arrives.
-                match self.finalizer.block_hash(parent_slot) {
-                    Some(hash) if hash != parent_blockhash => tracing::warn!(
-                        target: "self_healing",
-                        "Parent blockhash mismatch: slot {} - parent slot {} - recorded hash {} - block parent_blockhash {}",
-                        slot,
-                        parent_slot,
-                        hash,
-                        parent_blockhash
-                    ),
-                    Some(_) => {}
-                    None => tracing::warn!(
-                        target: "self_healing",
-                        "Parent blockhash not verified: slot {} - parent slot {} not in the finalizer blocks map",
-                        slot,
-                        parent_slot
-                    ),
-                }
-
                 tracing::debug!(
                     target: "self_healing_empty_slots",
                     "Skipped empty slots between {} and {} (block builds directly on {})",
@@ -164,6 +160,10 @@ impl SelfHealingState {
             .last_slot_received
             .lock()
             .expect("Failed to lock last_slot_received") = slot;
+        *self
+            .last_blockhash_received
+            .lock()
+            .expect("Failed to lock last_blockhash_received") = blockhash.to_owned();
     }
 
     /// Starts a separate task that periodically repairs confirmed slot gaps out of incremental snapshots.

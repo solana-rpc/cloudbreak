@@ -5,7 +5,7 @@
 
 //! The pending map and the keys one finalized slot contributes to it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::indexer::AccountsReceivedPerBlock;
 
@@ -40,6 +40,8 @@ pub struct Taken {
     pub unrouted: Vec<(CleanupKey, u64)>,
     /// The frontier when the oldest of these keys was queued. Drives the lag gauge.
     pub oldest_stamp: u64,
+    /// Lowest slot in the drained window. A failed drain returns here.
+    pub oldest_slot: u64,
 }
 
 impl Taken {
@@ -133,17 +135,22 @@ fn to_key_bytes(bytes: &[u8]) -> Option<[u8; 32]> {
     bytes.try_into().ok()
 }
 
-/// Keys waiting to be cleaned, one exclusive cutoff each, merged by max.
-///
-/// One drainer takes the whole map at once, so a key is never in two statements and no in-flight
-/// bookkeeping per key is needed. A key touched again while a drain is running lands back in the
-/// map with its newer cutoff and drains on the next round.
-pub(crate) struct Pending {
+/// One finalized slot's keys, each with one exclusive cutoff, merged by max within the slot.
+struct Bucket {
     keys: HashMap<CleanupKey, u64>,
-    /// The frontier when the oldest key still queued was first inserted.
-    oldest_stamp: Option<u64>,
-    /// Same, for the batch a drain is running right now.
-    in_flight_oldest: Option<u64>,
+    /// The frontier when this slot was queued. Drives the lag gauge, not the drain order.
+    stamp: u64,
+}
+
+/// Keys waiting to be cleaned, held per finalized slot.
+///
+/// A drain takes the oldest `interval_slots` slots and nothing else, so one statement's size is
+/// bounded by the window, not by how long the last drain ran. A key touched in a slot outside
+/// the window keeps its own cutoff there and drains in a later round.
+pub(crate) struct Pending {
+    slots: BTreeMap<u64, Bucket>,
+    /// Stamp of the window a drain is running right now.
+    in_flight_stamp: Option<u64>,
     high_water: u64,
     enqueued_since_drain: u64,
     last_drain_slot: Option<u64>,
@@ -153,9 +160,8 @@ pub(crate) struct Pending {
 impl Pending {
     pub(crate) fn new(interval_slots: u64) -> Self {
         Self {
-            keys: HashMap::new(),
-            oldest_stamp: None,
-            in_flight_oldest: None,
+            slots: BTreeMap::new(),
+            in_flight_stamp: None,
             high_water: 0,
             enqueued_since_drain: 0,
             last_drain_slot: None,
@@ -163,74 +169,126 @@ impl Pending {
         }
     }
 
-    /// Merges one finalized slot's keys in and returns how many coalesced into a queued key.
+    /// Merges one finalized slot's keys in and returns how many coalesced within that slot.
     pub(crate) fn enqueue(&mut self, slot: u64, items: &[(CleanupKey, u64)]) -> usize {
         self.high_water = self.high_water.max(slot);
         self.enqueued_since_drain = self.enqueued_since_drain.saturating_add(1);
 
+        if items.is_empty() {
+            return 0;
+        }
+
         let stamp = self.high_water;
+        let bucket = self.slots.entry(slot).or_insert_with(|| Bucket {
+            keys: HashMap::new(),
+            stamp,
+        });
+        bucket.stamp = bucket.stamp.min(stamp);
+
         let mut coalesced = 0;
         for (key, cutoff) in items {
-            match self.keys.get_mut(key) {
+            match bucket.keys.get_mut(key) {
                 Some(existing) => {
                     *existing = (*existing).max(*cutoff);
                     coalesced += 1;
                 }
                 None => {
-                    self.keys.insert(*key, *cutoff);
-                    self.oldest_stamp = Some(self.oldest_stamp.unwrap_or(stamp).min(stamp));
+                    bucket.keys.insert(*key, *cutoff);
                 }
             }
         }
         coalesced
     }
 
-    /// Takes every queued key, split by SQL form.
-    pub(crate) fn take_all(&mut self) -> Taken {
-        let oldest_stamp = self.oldest_stamp.unwrap_or(self.high_water);
+    /// Takes the oldest `interval_slots` slots, merged and split by SQL form.
+    pub(crate) fn take_window(&mut self) -> Taken {
+        let window: Vec<u64> = self
+            .slots
+            .keys()
+            .copied()
+            .take(self.interval_slots as usize)
+            .collect();
+
+        let mut merged: HashMap<CleanupKey, u64> = HashMap::new();
+        let mut stamp: Option<u64> = None;
+        let mut oldest_slot: Option<u64> = None;
+
+        for slot in window {
+            let Some(bucket) = self.slots.remove(&slot) else {
+                continue;
+            };
+            oldest_slot.get_or_insert(slot);
+            stamp = Some(stamp.map_or(bucket.stamp, |held| held.min(bucket.stamp)));
+            for (key, cutoff) in bucket.keys {
+                let entry = merged.entry(key).or_insert(cutoff);
+                *entry = (*entry).max(cutoff);
+            }
+        }
+
+        let oldest_stamp = stamp.unwrap_or(self.high_water);
         let mut taken = Taken {
             oldest_stamp,
+            oldest_slot: oldest_slot.unwrap_or(self.high_water),
             ..Default::default()
         };
-        for (key, cutoff) in self.keys.drain() {
+        for (key, cutoff) in merged {
             if key.owner.is_some() {
                 taken.routed.push((key, cutoff));
             } else {
                 taken.unrouted.push((key, cutoff));
             }
         }
-        self.oldest_stamp = None;
-        self.in_flight_oldest = (!taken.is_empty()).then_some(oldest_stamp);
+        // Grouped by owner, a chunk prunes to few hash partitions instead of all of them.
+        taken
+            .routed
+            .sort_unstable_by_key(|(key, _)| (key.owner, key.pubkey));
+
+        self.in_flight_stamp = (!taken.is_empty()).then_some(oldest_stamp);
         taken
     }
 
     /// Releases a drain that succeeded.
     pub(crate) fn finish(&mut self) {
-        self.in_flight_oldest = None;
+        self.in_flight_stamp = None;
     }
 
-    /// Returns a failed drain's keys, keeping the older of the two cutoffs' stamps.
+    /// Returns a failed window to its own slot, so the next drain takes it first.
     pub(crate) fn reinsert(&mut self, taken: Taken) {
-        let stamp = taken.oldest_stamp;
-        for (key, cutoff) in taken.routed.into_iter().chain(taken.unrouted) {
-            let entry = self.keys.entry(key).or_insert(cutoff);
-            *entry = (*entry).max(cutoff);
+        if !taken.is_empty() {
+            let stamp = taken.oldest_stamp;
+            let bucket = self
+                .slots
+                .entry(taken.oldest_slot)
+                .or_insert_with(|| Bucket {
+                    keys: HashMap::new(),
+                    stamp,
+                });
+            bucket.stamp = bucket.stamp.min(stamp);
+            for (key, cutoff) in taken.routed.into_iter().chain(taken.unrouted) {
+                let entry = bucket.keys.entry(key).or_insert(cutoff);
+                *entry = (*entry).max(cutoff);
+            }
         }
-        if !self.keys.is_empty() {
-            self.oldest_stamp = Some(self.oldest_stamp.unwrap_or(stamp).min(stamp));
-        }
-        self.in_flight_oldest = None;
+        self.in_flight_stamp = None;
     }
 
     /// `true` when the drainer should wake.
     ///
-    /// The count term catches the ordinary case. The span term catches an ancestor walk
-    /// finalizing several slots in one call and a gap fill jumping the frontier.
+    /// The backlog term keeps it draining back to back while it is behind. The count term
+    /// catches the ordinary case. The span term catches an ancestor walk finalizing several
+    /// slots in one call and a gap fill jumping the frontier.
     pub(crate) fn should_drain(&self) -> bool {
         let span = self
             .high_water
             .saturating_sub(self.last_drain_slot.unwrap_or(self.high_water));
-        self.enqueued_since_drain >= self.interval_slots || span >= self.interval_slots
+        self.slots.len() as u64 >= self.interval_slots
+            || self.enqueued_since_drain >= self.interval_slots
+            || span >= self.interval_slots
+    }
+
+    /// `true` while at least one full window is still queued.
+    pub(crate) fn has_backlog(&self) -> bool {
+        self.slots.len() as u64 >= self.interval_slots
     }
 
     pub(crate) fn note_drain(&mut self) {
@@ -240,7 +298,8 @@ impl Pending {
 
     /// Finalized slots since the oldest key still waiting, counting a drain in flight.
     pub(crate) fn lag_slots(&self) -> u64 {
-        let oldest = match (self.oldest_stamp, self.in_flight_oldest) {
+        let queued = self.slots.values().map(|bucket| bucket.stamp).min();
+        let oldest = match (queued, self.in_flight_stamp) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (Some(a), None) => Some(a),
             (None, Some(b)) => Some(b),
@@ -250,7 +309,7 @@ impl Pending {
     }
 
     pub(crate) fn is_quiescent(&self) -> bool {
-        self.keys.is_empty() && self.in_flight_oldest.is_none()
+        self.slots.is_empty() && self.in_flight_stamp.is_none()
     }
 }
 
@@ -276,8 +335,13 @@ pub(crate) mod tests {
         }
     }
 
+    /// The highest cutoff owed for a key, across every slot still queued.
     fn cutoff_of(pending: &Pending, key: &CleanupKey) -> Option<u64> {
-        pending.keys.get(key).copied()
+        pending
+            .slots
+            .values()
+            .filter_map(|bucket| bucket.keys.get(key).copied())
+            .max()
     }
 
     fn block(
@@ -435,14 +499,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn take_all_splits_by_form_and_empties_the_map() {
+    fn take_window_splits_by_form_and_empties_the_map() {
         let mut pending = Pending::new(1);
         pending.enqueue(100, &[(routed(1, 1), 100), (unrouted(2), 100)]);
 
-        let taken = pending.take_all();
+        let taken = pending.take_window();
         assert_eq!(taken.routed.len(), 1);
         assert_eq!(taken.unrouted.len(), 1);
-        assert!(pending.keys.is_empty());
+        assert!(pending.slots.is_empty());
         assert!(!pending.is_quiescent(), "the drain is still in flight");
 
         pending.finish();
@@ -450,11 +514,115 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_drain_takes_only_the_configured_slot_window() {
+        let mut pending = Pending::new(2);
+        pending.enqueue(100, &[(routed(1, 1), 100)]);
+        pending.enqueue(101, &[(routed(1, 2), 101)]);
+        pending.enqueue(102, &[(routed(1, 3), 102)]);
+
+        let taken = pending.take_window();
+
+        assert_eq!(taken.routed.len(), 2, "slots 100 and 101, nothing else");
+        assert_eq!(taken.oldest_slot, 100);
+        assert!(cutoff_of(&pending, &routed(1, 1)).is_none());
+        assert_eq!(
+            cutoff_of(&pending, &routed(1, 3)),
+            Some(102),
+            "a slot outside the window stays queued"
+        );
+    }
+
+    #[test]
+    fn routed_keys_come_out_grouped_by_owner() {
+        let mut pending = Pending::new(1);
+        pending.enqueue(
+            100,
+            &[
+                (routed(3, 1), 100),
+                (routed(1, 9), 100),
+                (routed(2, 5), 100),
+                (routed(1, 2), 100),
+                (routed(3, 4), 100),
+            ],
+        );
+
+        let taken = pending.take_window();
+        let order: Vec<CleanupKey> = taken.routed.iter().map(|(key, _)| *key).collect();
+
+        assert_eq!(
+            order,
+            vec![
+                routed(1, 2),
+                routed(1, 9),
+                routed(2, 5),
+                routed(3, 1),
+                routed(3, 4)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_key_in_two_slots_of_one_window_merges_to_the_higher_cutoff() {
+        let mut pending = Pending::new(2);
+        let key = routed(1, 1);
+        pending.enqueue(100, &[(key, 100)]);
+        pending.enqueue(101, &[(key, 101)]);
+
+        let taken = pending.take_window();
+
+        assert_eq!(taken.routed.len(), 1);
+        assert_eq!(taken.routed[0].1, 101);
+    }
+
+    #[test]
+    fn a_key_outside_the_window_keeps_its_own_cutoff() {
+        let mut pending = Pending::new(1);
+        let key = routed(1, 1);
+        pending.enqueue(100, &[(key, 100)]);
+        pending.enqueue(101, &[(key, 101)]);
+
+        let first = pending.take_window();
+        assert_eq!(first.routed[0].1, 100, "the window covers slot 100 only");
+        pending.finish();
+
+        let second = pending.take_window();
+        assert_eq!(second.routed[0].1, 101);
+    }
+
+    #[test]
+    fn a_failed_window_returns_to_its_slot_and_drains_first() {
+        let mut pending = Pending::new(1);
+        pending.enqueue(100, &[(routed(1, 1), 100)]);
+        pending.enqueue(101, &[(routed(1, 2), 101)]);
+
+        let taken = pending.take_window();
+        pending.reinsert(taken);
+
+        let retry = pending.take_window();
+        assert_eq!(retry.oldest_slot, 100, "the failed window goes first");
+        assert_eq!(retry.routed.len(), 1);
+    }
+
+    #[test]
+    fn a_backlog_keeps_the_drainer_awake() {
+        let mut pending = Pending::new(10);
+        for slot in 100..140u64 {
+            pending.enqueue(slot, &[(routed(1, (slot % 250) as u8), slot)]);
+        }
+
+        let _taken = pending.take_window();
+        pending.note_drain();
+        pending.finish();
+
+        assert!(pending.should_drain(), "30 slots are still queued");
+    }
+
+    #[test]
     fn a_key_retouched_during_a_drain_stays_queued() {
         let mut pending = Pending::new(1);
         let key = routed(1, 1);
         pending.enqueue(100, &[(key, 100)]);
-        let taken = pending.take_all();
+        let taken = pending.take_window();
 
         pending.enqueue(101, &[(key, 101)]);
         pending.finish();
@@ -470,7 +638,7 @@ pub(crate) mod tests {
         let key = routed(1, 1);
         let other = routed(1, 2);
         pending.enqueue(100, &[(key, 100), (other, 100)]);
-        let taken = pending.take_all();
+        let taken = pending.take_window();
 
         pending.enqueue(101, &[(key, 101)]);
         pending.reinsert(taken);
@@ -493,7 +661,7 @@ pub(crate) mod tests {
         pending.enqueue(105, &[]);
         assert_eq!(pending.lag_slots(), 5);
 
-        let _taken = pending.take_all();
+        let _taken = pending.take_window();
         assert_eq!(pending.lag_slots(), 5, "a drain in flight still counts");
 
         pending.finish();

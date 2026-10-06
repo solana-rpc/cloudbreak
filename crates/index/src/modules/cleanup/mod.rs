@@ -18,16 +18,17 @@
 //!
 //! # The cutoff rule
 //!
-//! Each key carries one exclusive cutoff, merged by max, and the drain deletes its rows below
-//! that slot. An open key at finalized slot `s` takes `s`, so the row written at `s` survives. A
-//! closed or owner-moved key takes `s + 1`, so its mask at `s` goes with the rows it shadows.
+//! Each key carries one exclusive cutoff, merged by max within the drained window, and the drain
+//! deletes its rows below that slot. An open key at finalized slot `s` takes `s`, so the row
+//! written at `s` survives. A closed or owner-moved key takes `s + 1`, so its mask at `s` goes
+//! with the rows it shadows.
 //! Every cutoff comes from a slot at which the key was written or masked, which is why max is
 //! safe in any arrival order, including a repaired slot finalizing below the frontier.
 //!
 //! # Always on
 //!
 //! There is no enable flag. A node without cleanup fills its disk and slows every latest-version
-//! read. `cleanup-interval-slots` is the only knob. This deviates from
+//! read. `cleanup-interval-slots` and `cleanup-batch-size` are the only knobs. This deviates from
 //! `docs/feature-guideline.md` rules 2 and 5 deliberately.
 //!
 //! # Where this lives
@@ -95,8 +96,8 @@ impl CleanupHandle {
         self.shared.work_available.notified().await;
     }
 
-    pub fn take_all(&self) -> Taken {
-        self.lock().take_all()
+    pub fn take_window(&self) -> Taken {
+        self.lock().take_window()
     }
 
     pub fn finish(&self) {
@@ -106,6 +107,10 @@ impl CleanupHandle {
     /// Returns a failed drain's keys to the queue.
     pub fn reinsert(&self, taken: Taken) {
         self.lock().reinsert(taken);
+    }
+
+    pub fn has_backlog(&self) -> bool {
+        self.lock().has_backlog()
     }
 
     pub fn note_drain(&self) {

@@ -423,6 +423,12 @@ pub struct IndexConfig {
         default = "IndexConfig::default_cleanup_interval_slots"
     )]
     pub cleanup_interval_slots: u64,
+    /// Keys per cleanup statement. Bounds how long one DELETE holds its row locks.
+    #[serde(
+        rename = "cleanup-batch-size",
+        default = "IndexConfig::default_cleanup_batch_size"
+    )]
+    pub cleanup_batch_size: usize,
     /// The indexer maintains per-mint `getTokenLargestAccounts` tops when this
     /// section is present with `enabled = true`.
     #[serde(rename = "token-largest-accounts")]
@@ -532,6 +538,10 @@ impl IndexConfig {
 
     const fn default_cleanup_interval_slots() -> u64 {
         1
+    }
+
+    const fn default_cleanup_batch_size() -> usize {
+        500
     }
 
     /// Smallest configured prune interval among the enabled largest-accounts

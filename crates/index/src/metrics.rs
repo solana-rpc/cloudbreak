@@ -123,6 +123,7 @@ lazy_static::lazy_static! {
             0.5,
             1.0,
             10.0,
+            60.0,
         ]),
         &["origin"]
     ).unwrap();
