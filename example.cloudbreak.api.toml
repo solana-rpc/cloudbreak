@@ -89,9 +89,9 @@ span-filter = [
 # [supply]
 # enabled = false
 
+# Slots arrive by Postgres LISTEN/NOTIFY on `cloudbreak_slots`.
 [slot-syncronizer]
 enabled = false
-interval_ms = 200
 
 # Serves processed commitment for getAccountInfo, getMultipleAccounts, getBalance,
 # getTokenAccountBalance, getTokenSupply and getSlot from a Yellowstone block feed held in

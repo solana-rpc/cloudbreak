@@ -8,11 +8,8 @@ use std::time::Duration;
 use cloudbreak_core::{IndexConfig, modules::account_owner_map::AccountOwnerMap};
 use cloudbreak_entity::{accounts, slots};
 use sea_orm::{
-    ActiveValue::Set,
-    ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait,
-    QueryFilter, Statement, Value,
-    prelude::Expr,
-    sea_query::{Alias, OnConflict},
+    ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait, QueryFilter,
+    Statement, Value,
 };
 use tokio::{
     task::JoinHandle,
@@ -148,6 +145,7 @@ pub fn insert_closed_accounts(
 pub async fn insert_slot(
     slot: u64,
     block_time: Option<UnixTimestamp>,
+    blockhash: Option<&str>,
     commitment: CommitmentLevel,
     healthy: bool,
     db: &DatabaseConnection,
@@ -157,28 +155,23 @@ pub async fn insert_slot(
 
     let block_time = block_time.unwrap_or_default().timestamp;
 
-    let query = slots::Entity::insert(slots::ActiveModel {
-        slot: Set(slot as i64),
-        commitment: Set(commitment as i32),
-        block_time: Set(block_time),
-        // Stamp the current health so a freshly inserted row is consistent with the
-        // live health state even if it is created after the last health transition.
-        // `update_service_health` remains the sole authority for transitions on
-        // existing rows, so we never clobber `health` on conflict.
-        health: Set(healthy),
-    })
-    .on_conflict(
-        OnConflict::columns([slots::Column::Commitment])
-            .update_columns([slots::Column::Slot, slots::Column::BlockTime])
-            .action_cond_where(
-                Condition::all().add(
-                    Expr::col((Alias::new("excluded"), slots::Column::Slot))
-                        .gt(Expr::col((slots::Entity, slots::Column::Slot))),
-                ),
-            )
-            .to_owned(),
-    )
-    .exec_without_returning(db);
+    // `health` is stamped only on insert. `update_service_health` owns it on existing rows.
+    // The `slots_notify` trigger sends this row to the API slot syncronizer on every real change.
+    let query = db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"INSERT INTO slots (slot, commitment, block_time, health, blockhash)
+           VALUES ($1, $2, $3, $4, $5)
+           ON CONFLICT (commitment) DO UPDATE
+           SET slot = excluded.slot, block_time = excluded.block_time, blockhash = excluded.blockhash
+           WHERE excluded.slot > slots.slot"#,
+        [
+            Value::from(slot as i64),
+            Value::from(commitment as i32),
+            Value::from(block_time),
+            Value::from(healthy),
+            Value::from(blockhash.map(str::to_string)),
+        ],
+    ));
 
     let result = timeout(query_timeout, query)
         .await
@@ -189,7 +182,11 @@ pub async fn insert_slot(
         });
 
     match result {
-        Ok(res) => tracing::debug!("insert_slot: inserted slot {}", res),
+        Ok(res) => tracing::debug!(
+            "insert_slot: slot {}, rows affected {}",
+            slot,
+            res.rows_affected()
+        ),
         Err(e) => {
             tracing::error!("insert_slot: failed to insert slot {}: {}", slot, e);
             metrics::increment_db_errors();

@@ -288,6 +288,7 @@ pub async fn save_block(
     db_queries::insert_slot(
         slot,
         block.block_time,
+        Some(&block.blockhash),
         CommitmentLevel::Confirmed,
         updated_accounts_during_startup.health.is_healthy(),
         db,

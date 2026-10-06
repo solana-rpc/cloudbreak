@@ -3,16 +3,29 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-use crate::db_query;
+//! Keeps the confirmed and finalized slots and the service health in memory. The `slots_notify`
+//! trigger sends every real change of a `slots` row on [`SLOTS_CHANNEL`]; this task applies it.
+//! A lost connection, a bad payload or [`IDLE_TIMEOUT`] without a notification panics.
+//! With `[processed-accounts]` enabled it also publishes the processed [`Anchor`].
+
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
 use cloudbreak_core::ApiConfig;
 use cloudbreak_core::modules::processed::Anchor;
 use sea_orm::DatabaseConnection;
+use sea_orm::sqlx::postgres::PgListener;
+use serde::Deserialize;
 use solana_commitment_config::CommitmentLevel;
-use std::{
-    sync::{Arc, RwLock},
-    time::Duration,
-};
-use tokio::{sync::watch, task::JoinHandle, time::Instant};
+use tokio::{sync::watch, task::JoinHandle};
+
+/// The channel the `slots_notify` trigger sends on.
+pub const SLOTS_CHANNEL: &str = "cloudbreak_slots";
+/// `slots.commitment` values, as the indexer writes them.
+const COMMITMENT_CONFIRMED: i32 = 1;
+const COMMITMENT_FINALIZED: i32 = 2;
+/// Slots move every ~200 ms, so this much silence means the listener or the indexer is stuck.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Data structure to store the confirmed and finalized slots from the slot data
 ///  syncronizer background task
@@ -53,11 +66,19 @@ pub struct SlotData {
     pub block_time: i64,
 }
 
-/// Floor for the blockhash read timeout when the poll interval is very short.
-const MIN_BLOCKHASH_READ_TIMEOUT: Duration = Duration::from_millis(100);
+/// One `slots` row, from a notification payload.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SlotRow {
+    pub commitment: i32,
+    pub slot: i64,
+    pub block_time: i64,
+    pub health: bool,
+    /// Set on the confirmed row only.
+    pub blockhash: Option<String>,
+}
 
-/// With `[processed-accounts]` enabled, every successful poll also publishes the
-/// confirmed slot and its blockhash as the processed [`Anchor`] on `anchor_tx`.
+/// Starts the slot syncronizer, or returns `None` when `[slot-syncronizer]` is disabled.
+/// The task only ends by panicking; the caller must treat that as fatal.
 pub fn start_slot_syncronizer(
     db: DatabaseConnection,
     config: &ApiConfig,
@@ -67,130 +88,161 @@ pub fn start_slot_syncronizer(
         return None;
     }
 
-    let slot_syncronizer_data = Arc::new(RwLock::new(SlotSyncronizerData::default()));
-    let delay = Duration::from_millis(config.slot_syncronizer.interval_ms);
+    let data = Arc::new(RwLock::new(SlotSyncronizerData::default()));
     let anchor_tx = config.processed_accounts_enabled().then_some(anchor_tx);
+    let handle = tokio::spawn(run(db, data.clone(), anchor_tx));
 
-    let slot_data_clone = slot_syncronizer_data.clone();
-    let join_handle = tokio::spawn(async move {
-        let mut last_time_sync = Instant::now();
-        loop {
-            tokio::time::sleep(delay).await;
-            tracing::debug!(target: "slot_syncronizer", "Slot syncronizer: last time sync: {:?}", last_time_sync.elapsed().as_secs_f32());
-            let query_start_time = Instant::now();
-            let mut confirmed = None;
-
-            if let Some(db_slot_data) = db_query::get_slot_data(&db).await {
-                let mut cached_slot_data =
-                    slot_data_clone.write().expect("Failed to lock slot data");
-
-                if db_slot_data.confirmed_slot.slot - cached_slot_data.confirmed_slot.slot > 1
-                    || db_slot_data.finalized_slot.slot - cached_slot_data.finalized_slot.slot > 1
-                {
-                    tracing::warn!(
-                      target: "slot_syncronizer",
-                        "Slot syncronizer slot mismatch: finalized (cached: {} - db: {}) - confirmed (cached: {} - db: {}) (last sync {:?} secs ago)",
-                        cached_slot_data.finalized_slot.slot,
-                        db_slot_data.finalized_slot.slot,
-                        cached_slot_data.confirmed_slot.slot,
-                        db_slot_data.confirmed_slot.slot,
-                        last_time_sync.elapsed().as_secs_f32()
-                    );
-                }
-
-                *cached_slot_data = db_slot_data;
-
-                tracing::debug!(
-                  target: "slot_syncronizer",
-                    "Slot syncronizer: confirmed slot: {}, finalized slot: {} - query took {:?}",
-                    cached_slot_data.confirmed_slot.slot,
-                    cached_slot_data.finalized_slot.slot,
-                    query_start_time.elapsed().as_secs_f32()
-                );
-
-                last_time_sync = Instant::now();
-                confirmed = Some(cached_slot_data.confirmed_slot.slot);
-            }
-
-            // Published after the block so the slot cache lock is released first.
-            if let (Some(anchor_tx), Some(confirmed_slot)) = (&anchor_tx, confirmed)
-                && let Some(confirmed_blockhash) = read_blockhash(&db, confirmed_slot, delay).await
-            {
-                publish_anchor(
-                    anchor_tx,
-                    Anchor {
-                        confirmed_slot,
-                        confirmed_blockhash,
-                    },
-                );
-            }
-        }
-    });
-
-    Some((join_handle, slot_syncronizer_data))
+    Some((handle, data))
 }
 
-/// Reads the blockhash of `slot`, bounded by the poll interval so a slow read
-/// delays the next poll by at most one interval.
-async fn read_blockhash(db: &DatabaseConnection, slot: u64, delay: Duration) -> Option<String> {
-    let read_timeout = delay.max(MIN_BLOCKHASH_READ_TIMEOUT);
-    match tokio::time::timeout(read_timeout, db_query::get_blockhash_at_slot(db, slot)).await {
-        Ok(Ok(blockhash)) => blockhash,
-        Ok(Err(e)) => {
-            tracing::warn!(target: "slot_syncronizer", "Confirmed blockhash read failed for slot {slot}: {e}");
-            None
-        }
-        Err(_elapsed) => {
-            tracing::warn!(target: "slot_syncronizer", "Confirmed blockhash read for slot {slot} timed out after {read_timeout:?}");
-            None
-        }
+/// Listens on [`SLOTS_CHANNEL`] and applies each notification. Until the first one arrives the
+/// slots are 0 and the node reads as unhealthy.
+async fn run(
+    db: DatabaseConnection,
+    data: Arc<RwLock<SlotSyncronizerData>>,
+    anchor_tx: Option<watch::Sender<Option<Anchor>>>,
+) {
+    let mut listener = PgListener::connect_with(db.get_postgres_connection_pool())
+        .await
+        .expect("slot syncronizer: failed to connect the listener");
+    listener
+        .listen(SLOTS_CHANNEL)
+        .await
+        .expect("slot syncronizer: LISTEN failed");
+    tracing::info!(target: "slot_syncronizer", "Listening on {SLOTS_CHANNEL}");
+
+    loop {
+        // `Ok(None)` means the connection dropped and notifications were lost.
+        let notification = tokio::time::timeout(IDLE_TIMEOUT, listener.try_recv())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("slot syncronizer: no slot notification for {IDLE_TIMEOUT:?}")
+            })
+            .expect("slot syncronizer: listener error")
+            .expect("slot syncronizer: listener connection lost");
+        let row: SlotRow = serde_json::from_str(notification.payload()).unwrap_or_else(|e| {
+            panic!(
+                "slot syncronizer: bad {SLOTS_CHANNEL} payload {:?}: {e}",
+                notification.payload()
+            )
+        });
+        apply(&data, anchor_tx.as_ref(), &row);
     }
 }
 
-/// Publishes the anchor when it differs from the last one published.
-fn publish_anchor(anchor_tx: &watch::Sender<Option<Anchor>>, anchor: Anchor) {
-    anchor_tx.send_if_modified(|current| {
-        if current.as_ref() == Some(&anchor) {
-            return false;
+/// Applies one row. Slots never move backwards. A confirmed advance publishes the anchor.
+fn apply(
+    data: &RwLock<SlotSyncronizerData>,
+    anchor_tx: Option<&watch::Sender<Option<Anchor>>>,
+    row: &SlotRow,
+) {
+    let slot = row.slot as u64;
+    let advanced = {
+        let mut data = data.write().expect("Failed to lock slot data");
+        data.healthy = row.health;
+        let current = match row.commitment {
+            COMMITMENT_CONFIRMED => &mut data.confirmed_slot,
+            COMMITMENT_FINALIZED => &mut data.finalized_slot,
+            other => panic!("slot syncronizer: unknown commitment {other}"),
+        };
+        let advanced = slot > current.slot;
+        if advanced {
+            *current = SlotData {
+                slot,
+                block_time: row.block_time,
+            };
         }
-        *current = Some(anchor);
-        true
-    });
+        advanced
+    };
+
+    if advanced
+        && row.commitment == COMMITMENT_CONFIRMED
+        && let Some(anchor_tx) = anchor_tx
+    {
+        let confirmed_blockhash = row
+            .blockhash
+            .clone()
+            .unwrap_or_else(|| panic!("slot syncronizer: confirmed slot {slot} has no blockhash"));
+        anchor_tx.send_replace(Some(Anchor {
+            confirmed_slot: slot,
+            confirmed_blockhash,
+        }));
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn row(commitment: i32, slot: i64, health: bool, blockhash: Option<&str>) -> SlotRow {
+        SlotRow {
+            commitment,
+            slot,
+            block_time: slot * 10,
+            health,
+            blockhash: blockhash.map(str::to_string),
+        }
+    }
+
+    fn data() -> RwLock<SlotSyncronizerData> {
+        RwLock::new(SlotSyncronizerData::default())
+    }
+
     #[test]
-    fn anchor_is_published_once_per_change() {
+    fn payload_parses_with_and_without_blockhash() {
+        let row: SlotRow = serde_json::from_str(
+            r#"{"commitment":1,"slot":100,"block_time":1000,"health":true,"blockhash":"abc"}"#,
+        )
+        .unwrap();
+        assert_eq!(row, self::row(1, 100, true, Some("abc")));
+        let row: SlotRow = serde_json::from_str(
+            r#"{"commitment":2,"slot":90,"block_time":900,"health":false,"blockhash":null}"#,
+        )
+        .unwrap();
+        assert_eq!(row, self::row(2, 90, false, None));
+    }
+
+    #[test]
+    fn slots_only_move_forward_and_health_follows_the_latest_row() {
+        let data = data();
+        apply(&data, None, &row(1, 100, true, Some("h100")));
+        apply(&data, None, &row(1, 99, false, Some("h99")));
+        apply(&data, None, &row(2, 80, false, None));
+        let data = data.read().unwrap().clone();
+        assert_eq!(data.confirmed_slot.slot, 100);
+        assert_eq!(data.confirmed_slot.block_time, 1000);
+        assert_eq!(data.finalized_slot.slot, 80);
+        assert!(!data.healthy);
+    }
+
+    #[test]
+    fn a_confirmed_advance_publishes_the_anchor() {
+        let data = data();
         let (anchor_tx, mut anchor_rx) = watch::channel(None);
-        let anchor = Anchor {
-            confirmed_slot: 100,
-            confirmed_blockhash: "h100".to_string(),
-        };
-        publish_anchor(&anchor_tx, anchor.clone());
-        assert!(anchor_rx.has_changed().unwrap());
-        assert_eq!(anchor_rx.borrow_and_update().as_ref(), Some(&anchor));
-
-        publish_anchor(&anchor_tx, anchor.clone());
-        assert!(!anchor_rx.has_changed().unwrap());
-
-        publish_anchor(
-            &anchor_tx,
-            Anchor {
-                confirmed_slot: 101,
-                ..anchor
-            },
-        );
-        assert!(anchor_rx.has_changed().unwrap());
+        apply(&data, Some(&anchor_tx), &row(1, 100, true, Some("h100")));
         assert_eq!(
-            anchor_rx
-                .borrow_and_update()
-                .as_ref()
-                .unwrap()
-                .confirmed_slot,
-            101
+            anchor_rx.borrow_and_update().clone(),
+            Some(Anchor {
+                confirmed_slot: 100,
+                confirmed_blockhash: "h100".to_string()
+            })
         );
+
+        apply(&data, Some(&anchor_tx), &row(1, 99, true, Some("h99")));
+        apply(&data, Some(&anchor_tx), &row(2, 101, true, None));
+        assert!(!anchor_rx.has_changed().unwrap());
+    }
+
+    #[test]
+    #[should_panic(expected = "has no blockhash")]
+    fn a_confirmed_advance_without_blockhash_panics_when_the_anchor_is_needed() {
+        let (anchor_tx, _anchor_rx) = watch::channel(None);
+        apply(&data(), Some(&anchor_tx), &row(1, 100, true, None));
+    }
+
+    #[test]
+    #[should_panic(expected = "unknown commitment")]
+    fn an_unknown_commitment_panics() {
+        apply(&data(), None, &row(0, 100, true, None));
     }
 }
