@@ -92,7 +92,9 @@ pub struct DeserializableVersionedBank {
     pub slots_per_year: f64,
     pub accounts_data_len: u64,
     pub slot: Slot,
-    pub epoch: Epoch,
+    // Agave serializes this as a placeholder and always writes 0. Derive the epoch from
+    // `epoch_schedule` and `slot` instead.
+    pub unused_epoch: Epoch,
     pub block_height: u64,
     pub collector_id: Pubkey,
     pub collector_fees: u64,

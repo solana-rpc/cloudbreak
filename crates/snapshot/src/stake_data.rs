@@ -29,7 +29,9 @@ pub fn extract_stake_data(
     bank: &DeserializableVersionedBank,
     versioned_epoch_stakes: &HashMap<u64, DeserializableVersionedEpochStakes>,
 ) -> SnapshotStakeData {
-    let epoch = bank.epoch;
+    // Mirrors Agave's `Bank::get_epoch_and_slot_index`. The schedule's warmup epochs make
+    // this differ from `slot / slots_per_epoch` on some clusters.
+    let epoch = bank.epoch_schedule.get_epoch(bank.slot);
 
     let epoch_set: std::collections::HashSet<Pubkey> = versioned_epoch_stakes
         .get(&epoch)
