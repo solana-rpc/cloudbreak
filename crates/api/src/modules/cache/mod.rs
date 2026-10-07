@@ -24,9 +24,10 @@ use std::sync::RwLock;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::error::RpcError;
-use crate::methods::program;
-use crate::methods::program::GpaDbQueryInput;
+use crate::methods::get_program_accounts;
+use crate::methods::get_program_accounts::GpaDbQueryInput;
 use crate::metrics;
+use crate::modules::mint_resolver::MintResolver;
 
 /// A query that has been accepted for caching, carrying everything needed to
 /// install it. Built on the request path, executed on the blocking pool by
@@ -243,6 +244,9 @@ pub enum GpaProcessor {
         cache_hits: u64,
         /// Slot for which the new query was served
         new_slot: u64,
+        /// Reports whether the `jsonParsed` token accounts can change without changing themselves.
+        /// Only queries containing inmmutable mints are cached.
+        mint_resolver: MintResolver,
     },
 }
 
@@ -258,6 +262,7 @@ impl GpaProcessor {
                 new_accounts_for_query: Arc::new(Mutex::new(Vec::new())),
                 cache_hits: 0,
                 new_slot: 0,
+                mint_resolver: MintResolver::default(),
             }
         } else {
             Self::Standard
@@ -275,7 +280,7 @@ impl GpaProcessor {
     ///
     /// Caching is **bypassed** (a `Standard` processor is returned) whenever the
     /// request carries a `ValueCmp` filter, even if the cache is configured.
-    pub fn for_request(&self, filters: &[RpcFilterType]) -> Self {
+    pub fn for_request(&self, filters: &[RpcFilterType], mint_resolver: &MintResolver) -> Self {
         match self {
             Self::Standard => Self::Standard,
             // ValueCmp queries are not cacheable.
@@ -287,13 +292,14 @@ impl GpaProcessor {
                 new_accounts_for_query: Arc::new(Mutex::new(Vec::new())),
                 cache_hits: 0,
                 new_slot: 0,
+                mint_resolver: mint_resolver.clone(),
             },
         }
     }
 
     pub fn load_sql(&mut self, input: &GpaDbQueryInput) -> String {
         match self {
-            Self::Standard => program::load_sql(input),
+            Self::Standard => get_program_accounts::load_sql(input),
             Self::Cached {
                 cache,
                 cached_query,
@@ -333,7 +339,7 @@ impl GpaProcessor {
     ) -> Result<MaybeJsonAccount, RpcError> {
         match self {
             Self::Standard => {
-                let keyed = program::process_row(
+                let keyed = get_program_accounts::process_row(
                     row,
                     encoding,
                     data_slice,
@@ -363,7 +369,7 @@ impl GpaProcessor {
                 ),
                 // If the query is not cached, also process it normally
                 None => {
-                    let encoded_account = program::process_row(
+                    let encoded_account = get_program_accounts::process_row(
                         row,
                         encoding,
                         data_slice,
@@ -414,7 +420,11 @@ impl GpaProcessor {
     /// map, taking the cache write lock, cleaning up old queries to stay within
     /// `config.max_total_bytes`, and freeing the replaced version — happens on
     /// the blocking pool, off the request path. See [`FinalizeJob::run`].
-    pub fn finalize_query(&mut self) {
+    ///
+    /// A volatile response (see [`MintResolver::volatility`]) is not cached: a cache entry is
+    /// only refreshed when its accounts change. When its size qualifies, it counts in
+    /// `cloudbreak_gpa_cache_skipped_total` under `method`.
+    pub fn finalize_query(&mut self, method: &str) {
         let Self::Cached {
             cache,
             cached_query,
@@ -422,6 +432,7 @@ impl GpaProcessor {
             new_accounts_for_query,
             new_slot,
             cache_hits,
+            mint_resolver,
         } = self
         else {
             return;
@@ -451,6 +462,13 @@ impl GpaProcessor {
 
         if query_bytes < min_bytes_per_query {
             return;
+        }
+
+        if let Some(reason) = mint_resolver.volatility() {
+            metrics::CLOUDBREAK_GPA_CACHE_SKIPPED_TOTAL
+                .with_label_values(&[method, metrics::bytes_bucket(query_bytes), reason.label()])
+                .inc();
+            return; // early return and skip caching for volatile responses
         }
 
         FinalizeJob {
@@ -620,7 +638,7 @@ impl GpaCache {
             match owner_bytes {
                 Some(_) => {
                     // Response not in cache, process it normally
-                    let keyed = program::process_row(
+                    let keyed = get_program_accounts::process_row(
                         row,
                         encoding,
                         data_slice,
