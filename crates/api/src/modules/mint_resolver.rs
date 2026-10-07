@@ -170,20 +170,22 @@ impl MintResolver {
 
         let mut mints = inner.mints.lock().expect("mint resolver mutex poisoned");
         for row in rows {
+            // `raw_sql` returns text-format columns, which sqlx cannot decode into `&[u8]`.
             let (Ok(pubkey), Ok(owner), Ok(data)) = (
-                row.try_get::<&[u8], _>("pubkey"),
-                row.try_get::<&[u8], _>("owner"),
+                row.try_get::<[u8; 32], _>("pubkey"),
+                row.try_get::<[u8; 32], _>("owner"),
                 row.try_get::<Vec<u8>, _>("data"),
             ) else {
                 tracing::error!("Mint lookup returned a row without pubkey, owner or data");
                 return Err(RpcError::InternalError);
             };
-            let (Ok(pubkey), Ok(owner)) = (Pubkey::try_from(pubkey), Pubkey::try_from(owner))
-            else {
-                tracing::error!("Mint lookup returned an invalid pubkey or owner");
-                return Err(RpcError::InternalError);
-            };
-            mints.insert(pubkey, StoredMint { owner, data });
+            mints.insert(
+                Pubkey::new_from_array(pubkey),
+                StoredMint {
+                    owner: Pubkey::new_from_array(owner),
+                    data,
+                },
+            );
         }
         Ok(())
     }
@@ -264,8 +266,8 @@ impl Inner {
 
 /// It parses the Token account data, returning the mint `Pubkey` if available.
 fn get_mint_from_token_account(row: &PgRow) -> Option<Pubkey> {
-    let data: Option<&[u8]> = row.try_get(DATA_COLUMN).ok().flatten();
-    get_token_account_mint(data?)
+    let data: Option<Vec<u8>> = row.try_get(DATA_COLUMN).ok().flatten();
+    get_token_account_mint(&data?)
 }
 
 /// True when nothing `jsonParsed` reads from the mint can change: a Tokenkeg mint, or a
