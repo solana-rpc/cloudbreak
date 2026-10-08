@@ -13,9 +13,10 @@ use solana_rpc_client_api::response::{Response as RpcResponse, RpcResponseContex
 
 use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
-use crate::methods::token::{check_account_data_len_for_encoding, parse_additional_mint_data};
-use crate::methods::{is_token_program, processed};
+use crate::methods::processed;
 use crate::metrics;
+use crate::utils::encoding::check_account_data_len_for_encoding;
+use crate::utils::token::{is_token_program, parse_additional_mint_data};
 
 #[tracing::instrument(name = "gma_rpc", skip_all, fields(num_pubkeys = pubkeys.len()))]
 pub async fn get_multiple_accounts(

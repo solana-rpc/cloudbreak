@@ -25,10 +25,12 @@ use crate::http::{
     JsonRpcRequest, JsonRpcResponse, RequestContext, RpcRequestPayload, extract_optional_param,
     extract_param, http_status_for_error, make_error_response, make_rpc_error_response,
 };
+use crate::methods::get_token_accounts_by_owner::TokenAccountsFilter;
 use crate::methods::slot::RpcGetSlotConfig;
-use crate::methods::token::{
-    TokenAccountsFilter, TokenQueryType, get_token_accounts_by_owner_or_delegate,
+use crate::methods::{
+    get_token_accounts_by_delegate, get_token_accounts_by_mint, get_token_accounts_by_owner,
 };
+use crate::modules::mint_resolver::MintResolver;
 use crate::{db_query, methods, metrics};
 
 pub async fn handle_rpc_request(
@@ -282,9 +284,20 @@ async fn process_single_request(
             };
             let config: Option<RpcProgramAccountsConfig> =
                 extract_param(&rpc_request.params, 1).ok().flatten();
+            let mint_resolver = MintResolver::new(
+                state,
+                &program,
+                config.as_ref().and_then(|c| c.account_config.encoding),
+            );
 
-            let gpa_response = match methods::program::get_program_accounts(state, program, config)
-                .await
+            let gpa_response = match methods::get_program_accounts::get_program_accounts(
+                state,
+                program,
+                config,
+                "gpa",
+                mint_resolver,
+            )
+            .await
             {
                 Ok(s) => s,
                 Err(e) => {
@@ -331,10 +344,10 @@ async fn process_single_request(
                 Ok(m) => m,
                 Err(e) => return make_error_response(id, -32602, e),
             };
-            let config: Option<methods::mint_accounts::GetTokenAccountsByMintConfig> =
+            let config: Option<get_token_accounts_by_mint::GetTokenAccountsByMintConfig> =
                 extract_param(&rpc_request.params, 1).ok().flatten();
 
-            let gpa_response = match methods::mint_accounts::get_token_accounts_by_mint(
+            let gpa_response = match get_token_accounts_by_mint::get_token_accounts_by_mint(
                 state, mint, config,
             )
             .await
@@ -544,6 +557,8 @@ async fn process_single_request(
             json_response
         }
         "getTokenAccountsByOwner" => {
+            let gpa_global_start_time = Instant::now();
+
             let owner: String = match extract_param(&rpc_request.params, 0) {
                 Ok(o) => o,
                 Err(e) => return make_error_response(id, -32602, e),
@@ -555,42 +570,51 @@ async fn process_single_request(
             let config: Option<RpcAccountInfoConfig> =
                 extract_param(&rpc_request.params, 2).ok().flatten();
 
-            let start_time = Instant::now();
-            let query_type = TokenQueryType::GetTokenAccountsByOwner;
-
-            let result = get_token_accounts_by_owner_or_delegate(
-                state, owner, filter, config, query_type, None,
+            let gpa_response = match get_token_accounts_by_owner::get_token_accounts_by_owner(
+                state, owner, filter, config,
             )
-            .await;
-            let (response, metrics_data) = match result {
-                Ok(result) => (Ok(result.response), result.metrics_data),
-                Err(e) => (Err(e), None),
+            .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(target: "api_request_errors_count", "getTokenAccountsByOwner error: {:?}", e);
+                    metrics::CLOUDBREAK_API_REQUESTS_TOTAL
+                        .with_label_values(&["gTABO", "error"])
+                        .inc();
+                    return make_rpc_error_response(id, &e);
+                }
             };
 
-            let json_start_time = Instant::now();
+            let body = match gpa_streaming_response_body(
+                id.clone(),
+                gpa_response,
+                gpa_global_start_time,
+                ctx.clone(),
+            )
+            .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(target: "api_request_errors_count", "getTokenAccountsByOwner error: {:?}", e);
+                    metrics::CLOUDBREAK_API_REQUESTS_TOTAL
+                        .with_label_values(&["gTABO", "error"])
+                        .inc();
+                    return make_rpc_error_response(id, &e);
+                }
+            };
 
-            let json_response = json_serialize_response(id, response, ctx).await;
-            let response_size = json_response.0.len() as u64;
-
-            if let Some(metrics_data) = metrics_data {
-                metrics_data.record_metrics(
-                    json_start_time.elapsed().as_millis() as f64,
-                    start_time.elapsed(),
-                    response_size,
-                    0,
-                    0.0,
-                    &ctx.subscription_id,
-                );
+            if in_batch {
+                (gpa_streamed_to_buffered(body, id).await, StatusCode::OK)
             } else {
-                tracing::error!(target: "api_request_errors_count", "getTokenAccountsByOwner error: no metrics data");
-                metrics::CLOUDBREAK_API_REQUESTS_TOTAL
-                    .with_label_values(&["gTABO", "error"])
-                    .inc();
+                return HttpHandlerResponse {
+                    status: StatusCode::OK,
+                    body: ResponseBody::Streaming(body),
+                };
             }
-
-            json_response
         }
         "getTokenAccountsByDelegate" => {
+            let gpa_global_start_time = Instant::now();
+
             let delegate: String = match extract_param(&rpc_request.params, 0) {
                 Ok(d) => d,
                 Err(e) => return make_error_response(id, -32602, e),
@@ -602,39 +626,47 @@ async fn process_single_request(
             let config: Option<RpcAccountInfoConfig> =
                 extract_param(&rpc_request.params, 2).ok().flatten();
 
-            let start_time = Instant::now();
-            let query_type = TokenQueryType::GetTokenAccountsByDelegate;
-
-            let result = get_token_accounts_by_owner_or_delegate(
-                state, delegate, filter, config, query_type, None,
+            let gpa_response = match get_token_accounts_by_delegate::get_token_accounts_by_delegate(
+                state, delegate, filter, config,
             )
-            .await;
-            let (response, metrics_data) = match result {
-                Ok(result) => (Ok(result.response), result.metrics_data),
-                Err(e) => (Err(e), None),
+            .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(target: "api_request_errors_count", "getTokenAccountsByDelegate error: {:?}", e);
+                    metrics::CLOUDBREAK_API_REQUESTS_TOTAL
+                        .with_label_values(&["gTABD", "error"])
+                        .inc();
+                    return make_rpc_error_response(id, &e);
+                }
             };
-            let json_start_time = Instant::now();
 
-            let json_response = json_serialize_response(id, response, ctx).await;
-            let response_size = json_response.0.len() as u64;
+            let body = match gpa_streaming_response_body(
+                id.clone(),
+                gpa_response,
+                gpa_global_start_time,
+                ctx.clone(),
+            )
+            .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(target: "api_request_errors_count", "getTokenAccountsByDelegate error: {:?}", e);
+                    metrics::CLOUDBREAK_API_REQUESTS_TOTAL
+                        .with_label_values(&["gTABD", "error"])
+                        .inc();
+                    return make_rpc_error_response(id, &e);
+                }
+            };
 
-            if let Some(metrics_data) = metrics_data {
-                metrics_data.record_metrics(
-                    json_start_time.elapsed().as_millis() as f64,
-                    start_time.elapsed(),
-                    response_size,
-                    0,
-                    0.0,
-                    &ctx.subscription_id,
-                );
+            if in_batch {
+                (gpa_streamed_to_buffered(body, id).await, StatusCode::OK)
             } else {
-                tracing::error!(target: "api_request_errors_count", "getTokenAccountsByDelegate error: no metrics data");
-                metrics::CLOUDBREAK_API_REQUESTS_TOTAL
-                    .with_label_values(&["gTABD", "error"])
-                    .inc();
+                return HttpHandlerResponse {
+                    status: StatusCode::OK,
+                    body: ResponseBody::Streaming(body),
+                };
             }
-
-            json_response
         }
         _ => {
             let reason = if matches!(method, "getVoteAccounts" | "simulateTransaction" | "getSupply") {

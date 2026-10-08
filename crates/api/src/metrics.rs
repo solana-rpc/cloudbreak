@@ -191,6 +191,15 @@ lazy_static::lazy_static! {
     /// the time the job ran) or `cleanup_failed` (could not free enough space).
     /// A non-trivial `stale_slot` rate means finalize is running too far behind
     /// the requests that produced it.
+    /// Responses big enough to cache that were not cached on purpose, by method, size bucket and reason.
+    pub static ref CLOUDBREAK_GPA_CACHE_SKIPPED_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new(
+            "cloudbreak_gpa_cache_skipped_total",
+            "GPA responses large enough to cache that were not cached, labelled by method, bytes and reason"
+        ),
+        &["method", "bytes", "reason"],
+    ).unwrap();
+
     pub static ref CLOUDBREAK_GPA_CACHE_FINALIZE_SKIPPED_TOTAL: IntCounterVec = IntCounterVec::new(
         Opts::new(
             "cloudbreak_gpa_cache_finalize_skipped_total",
@@ -306,6 +315,7 @@ pub fn setup_metrics(config: &ApiConfig) -> anyhow::Result<()> {
         register!(CLOUDBREAK_GPA_CACHE_FINALIZE_INFLIGHT_JOBS);
         register!(CLOUDBREAK_GPA_CACHE_FINALIZE_INFLIGHT_BYTES);
         register!(CLOUDBREAK_GPA_CACHE_FINALIZE_SKIPPED_TOTAL);
+        register!(CLOUDBREAK_GPA_CACHE_SKIPPED_TOTAL);
 
         // Per-client-IP egress bandwidth (peak gauge + throughput histogram).
         // Optional, off by default: registers its collectors and starts the 1s

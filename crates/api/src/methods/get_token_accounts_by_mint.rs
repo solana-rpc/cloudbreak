@@ -3,10 +3,12 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+use crate::modules::mint_resolver::MintResolver;
 use crate::{
     error::RpcError,
     http::CloudbreakRpcState,
-    methods::{LEGACY_TOKEN_PROGRAM_ID, is_token_program, program::GpaStreamingResponse},
+    methods::get_program_accounts::GpaStreamingResponse,
+    utils::token::{LEGACY_TOKEN_PROGRAM_ID, is_token_program},
 };
 use cloudbreak_core::modules::rpc_filter_type::{Memcmp, RpcFilterType, RpcProgramAccountsConfig};
 use serde::{Deserialize, Serialize};
@@ -56,5 +58,13 @@ pub async fn get_token_accounts_by_mint(
         sort_results: None,
     };
 
-    super::program::get_program_accounts(state, program, Some(gpa_config)).await
+    let mint_resolver = MintResolver::new(state, &program, gpa_config.account_config.encoding);
+    super::get_program_accounts::get_program_accounts(
+        state,
+        program,
+        Some(gpa_config),
+        "gtabm",
+        mint_resolver,
+    )
+    .await
 }
