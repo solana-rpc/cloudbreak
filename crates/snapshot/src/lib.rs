@@ -630,6 +630,8 @@ pub async fn process_downloaded_snapshot_with_gap_filling(
                     updated_account_count: accounts_for_slot_len as u64,
                     entries_count: 0,
                     entries: Vec::new(),
+                    // Repaired blocks carry no bank. The finalizer's ancestor walk stops here.
+                    bank_id: 0,
                 })
                 .await?;
 
