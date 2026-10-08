@@ -41,6 +41,9 @@ const STARTUP_BATCH_SIZE: usize = 500;
 /// Startup one-shot statements in flight at once.
 const STARTUP_CONCURRENCY: usize = 10;
 
+/// Serializes cleanup statements: the drainer and the startup one-shot delete the same rows.
+static CLEANUP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Runs one cleanup statement. Implemented for [`DatabaseConnection`], and for a recording fake
 /// in the tests so the ordering rule can be pinned without a database.
 pub trait CleanupExecutor: Send + Sync + 'static {
@@ -76,6 +79,7 @@ pub async fn drain_all<E: CleanupExecutor>(
     batch_size: usize,
 ) -> Result<usize, DbErr> {
     let batch_size = batch_size.max(1);
+    let _cleanup_lock = CLEANUP_LOCK.lock().await;
 
     if !skip_snapshot {
         run_table(
@@ -171,6 +175,7 @@ pub async fn delete_below_uniform_cutoff<E: CleanupExecutor>(
         })
         .collect();
 
+    let _cleanup_lock = CLEANUP_LOCK.lock().await;
     let statements: Vec<_> = chunks
         .iter()
         .map(|items| run_startup_statement(executor, items, query_timeout))
