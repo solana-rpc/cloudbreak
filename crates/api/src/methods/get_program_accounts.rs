@@ -8,15 +8,14 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::db_query::bytea_literal;
 use crate::error::RpcError;
-use crate::http::{CloudbreakApiResponse, CloudbreakRpcState};
-use crate::methods::token::{
-    self, check_account_data_len_for_encoding, get_token_accounts_by_owner_or_delegate,
-    try_parse_gpa_into_gtabo,
-};
-use crate::methods::{SqlDataSliceFilter, is_token_program, mint};
+use crate::http::CloudbreakRpcState;
 use crate::metrics::GpaMetricsData;
 use crate::modules::cache::{GpaProcessor, KeyedRpcAccount, MaybeJsonAccount};
+use crate::modules::mint_resolver::MintResolver;
+use crate::utils::encoding::check_account_data_len_for_encoding;
+use crate::utils::sql_filters::SqlFilters;
 use crate::{db_query, metrics};
 use async_stream::try_stream;
 use cloudbreak_core::modules::rpc_filter_type::{
@@ -38,11 +37,6 @@ use tracing::Instrument;
 
 pub const MAX_BASE58_BYTES: usize = 128;
 
-pub struct GpaResponse {
-    pub response: CloudbreakApiResponse<Vec<RpcKeyedAccount>>,
-    pub metrics_data: Option<GpaMetricsData>,
-}
-
 pub struct GpaStreamingResponse {
     pub accounts_stream: EncodedAccountBatchStream,
     pub metrics_data: Option<GpaMetricsData>,
@@ -53,11 +47,15 @@ pub struct GpaStreamingResponse {
     pub encoding: UiAccountEncoding,
 }
 
+/// `label` is the metric label: `gpa`, or the method served as a gPA (`gtabo`, `gtabd`,
+/// `gtabm`). `mint_resolver` encodes token-program `jsonParsed` accounts with their mints.
 #[tracing::instrument(name = "gpa_rpc", skip_all, fields(program = %program))]
 pub async fn get_program_accounts(
     state: &CloudbreakRpcState,
     program: String,
     config: Option<RpcProgramAccountsConfig>,
+    label: &str,
+    mint_resolver: MintResolver,
 ) -> Result<GpaStreamingResponse, RpcError> {
     let _guard = metrics::InFlightRequestGuard::new("gpa");
 
@@ -78,10 +76,6 @@ pub async fn get_program_accounts(
         });
     }
 
-    let is_token_program = is_token_program(&program);
-    let mut mint_filter_label = "";
-    let mut additional_mint_data = None;
-
     let commitment = config
         .account_config
         .commitment
@@ -95,6 +89,7 @@ pub async fn get_program_accounts(
         .unwrap_or(CommitmentLevel::Finalized);
 
     let (latest_slot, block_time) = state.latest_slot_and_block_time(commitment).await?;
+    mint_resolver.set_slot(latest_slot, block_time);
 
     if let Some(min_context_slot) = config.account_config.min_context_slot
         && latest_slot < min_context_slot
@@ -107,120 +102,12 @@ pub async fn get_program_accounts(
         .unwrap_or(false)
         .then_some(latest_slot);
 
-    if is_token_program {
-        // There is only support gPA token programs queries that can be parsed into a gTABO or gTABD
-        match try_parse_gpa_into_gtabo(program, config.clone()) {
-            Ok(gtabo_query_result) => {
-                let response = get_token_accounts_by_owner_or_delegate(
-                    state,
-                    gtabo_query_result.owner_or_delegate,
-                    gtabo_query_result.filter,
-                    gtabo_query_result.config,
-                    gtabo_query_result.query_type,
-                    gtabo_query_result.additional_filters,
-                )
-                .await?;
-
-                // Extract accounts from gTABO and only add context slot if needed
-                let encoded_accounts = match response.response {
-                    CloudbreakApiResponse::ResponseWithContext(rpc_response) => rpc_response.value,
-                    CloudbreakApiResponse::Response(accounts) => accounts,
-                };
-
-                // Token-program path stays buffered; we wrap the resulting Vec in a
-                // `stream::iter` so the caller doesn't need to special-case it.
-                return Ok(GpaStreamingResponse {
-                    context_slot,
-                    accounts_stream: Box::pin(futures::stream::once(async move {
-                        Ok(encoded_accounts
-                            .into_iter()
-                            .map(|account| {
-                                MaybeJsonAccount::Fresh(KeyedRpcAccount {
-                                    // Pubkey is unused in Standard mode
-                                    pubkey: Pubkey::default(),
-                                    account,
-                                })
-                            })
-                            .collect())
-                    })),
-                    metrics_data: response.metrics_data,
-                    gpa_processor: GpaProcessor::Standard,
-                    program,
-                    encoding,
-                });
-            }
-            Err(_) => {
-                // If there is a valid tokenmint filter, get the mint data from the database if jsonParsed encoding is used
-                if let Some(mint_pubkey) =
-                    mint::check_filters_are_valid_for_token_query(program, config.clone())?
-                {
-                    mint_filter_label = "_mint";
-                    let mint_pubkey_key = Pubkey::try_from(mint_pubkey.as_slice())
-                        .map_err(|_| RpcError::InvalidParams)?;
-
-                    if config.account_config.encoding == Some(UiAccountEncoding::JsonParsed) {
-                        additional_mint_data = mint::get_mint(
-                            program,
-                            mint_pubkey,
-                            latest_slot,
-                            &state.database,
-                            state.queries_timeout,
-                        )
-                        .await
-                        .and_then(|mint_data| {
-                            token::parse_additional_mint_data(
-                                &mint_pubkey_key,
-                                &mint_data,
-                                block_time,
-                            )
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    if let Some(ref filters) = config.filters {
-        for filter in filters {
-            filter.verify().map_err(|e| {
-                RpcError::InvalidParamsWithMessage(format!(
-                    "Invalid param: {}",
-                    e.invalid_param_text()
-                ))
-            })?;
-        }
-    }
-
-    // Build filter clauses for both tables
-    let accounts_filters = if let Some(ref filters) = config.filters {
-        filters
-            .iter()
-            .filter_map(|f| SqlDataSliceFilter::new(f, "accounts", is_token_program).to_string())
-            .map(|filter| format!("AND {}", filter))
-            .collect::<Vec<_>>()
-            .join("\n                    ")
-    } else {
-        String::new()
-    };
-
-    let snapshot_filters = if let Some(ref filters) = config.filters {
-        filters
-            .iter()
-            .filter_map(|f| {
-                SqlDataSliceFilter::new(f, "snapshot_accounts", is_token_program).to_string()
-            })
-            .map(|filter| format!("AND {}", filter))
-            .collect::<Vec<_>>()
-            .join("\n                    ")
-    } else {
-        String::new()
-    };
-
-    let metrics_data = GpaMetricsData::new(format!("gpa{mint_filter_label}"));
+    let sql_filters = SqlFilters::build(&program, config.filters.as_deref().unwrap_or(&[]), label)?;
+    let metrics_data = GpaMetricsData::new(sql_filters.label);
 
     let mut request_processor = state
         .gpa_processor
-        .for_request(config.filters.as_deref().unwrap_or(&[]));
+        .for_request(config.filters.as_deref().unwrap_or(&[]), &mint_resolver);
 
     // Database query
     let rx = gpa_db_query(
@@ -229,8 +116,8 @@ pub async fn get_program_accounts(
             config: config.clone(),
             state: state.clone(),
             latest_slot,
-            accounts_filters,
-            snapshot_filters,
+            accounts_filters: sql_filters.accounts,
+            snapshot_filters: sql_filters.snapshot,
             metrics_data: metrics_data.clone(),
         },
         &mut request_processor,
@@ -239,7 +126,7 @@ pub async fn get_program_accounts(
     // Encoding phase
     let encoded_accounts_stream = gpa_encoding_stream(GpaEncodingInput {
         config,
-        additional_mint_data,
+        mint_resolver,
         metrics_data: metrics_data.clone(),
         gpa_processor: request_processor.clone(),
         rx,
@@ -272,11 +159,7 @@ fn gpa_db_query(
     // `load_sql` mutates the caller-owned processor
     let sql = gpa_processor.load_sql(&input);
 
-    let program_bytes = input.program.as_ref().to_vec();
-    let sql = sql.replace(
-        "$1",
-        &format!("'\\x{}'::bytea", hex::encode(&program_bytes)),
-    );
+    let sql = sql.replace("$1", &bytea_literal(input.program));
 
     tracing::debug!(target: "gpa_sql", "## sql: {}", sql);
 
@@ -411,7 +294,7 @@ fn gpa_db_query(
 
 pub struct GpaEncodingInput {
     pub config: RpcProgramAccountsConfig,
-    pub additional_mint_data: Option<AccountAdditionalDataV3>,
+    pub mint_resolver: MintResolver,
     pub metrics_data: GpaMetricsData,
     pub gpa_processor: GpaProcessor,
     pub rx: UnboundedReceiver<Result<Vec<PgRow>, RpcError>>,
@@ -426,7 +309,7 @@ pub type EncodedAccountBatchStream =
 pub fn gpa_encoding_stream(input: GpaEncodingInput) -> EncodedAccountBatchStream {
     let GpaEncodingInput {
         config,
-        additional_mint_data,
+        mint_resolver,
         metrics_data,
         gpa_processor,
         mut rx,
@@ -472,24 +355,29 @@ pub fn gpa_encoding_stream(input: GpaEncodingInput) -> EncodedAccountBatchStream
                 batch
             };
 
+            mint_resolver.resolve_mints(&batch).await?;
+
             let encode_span_clone = encode_span.clone();
             let gpa_processor = gpa_processor.clone();
+            let mint_resolver = mint_resolver.clone();
             let (encoded_batch, local_bytes) = tokio::task::spawn_blocking(move || {
                 let mut local_bytes = 0u64;
-                batch
-                    .into_iter()
-                    .map(|row| {
-                        gpa_processor.process_row(
-                            row,
-                            encoding,
-                            data_slice,
-                            &mut local_bytes,
-                            &encode_span_clone,
-                            additional_mint_data,
-                        )
-                    })
-                    .collect::<Result<Vec<MaybeJsonAccount>, RpcError>>()
-                    .map(|accounts| (accounts, local_bytes))
+                let mut encoded = Vec::with_capacity(batch.len());
+                for row in batch {
+                    let additional_mint_data = mint_resolver.get_mint_data(&row);
+                    let account = gpa_processor.process_row(
+                        row,
+                        encoding,
+                        data_slice,
+                        &mut local_bytes,
+                        &encode_span_clone,
+                        additional_mint_data,
+                    )?;
+                    if !mint_resolver.should_drop(&account) {
+                        encoded.push(account);
+                    }
+                }
+                Ok::<_, RpcError>((encoded, local_bytes))
             })
             .await
             .map_err(|e| {

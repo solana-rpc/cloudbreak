@@ -34,7 +34,7 @@ use tokio::time::Instant;
 
 use crate::error::RpcError;
 use crate::http::RequestContext;
-use crate::methods::program::{GpaStreamingResponse, encoding_to_string};
+use crate::methods::get_program_accounts::{GpaStreamingResponse, encoding_to_string};
 use crate::metrics;
 use crate::modules::cache::MaybeJsonAccount;
 
@@ -59,6 +59,9 @@ pub async fn gpa_streaming_response_body(
     let _guard = metrics::InFlightRequestGuard::new("gpa_streaming");
     let mut accounts_stream = gpa_response.accounts_stream;
     let metrics_data = gpa_response.metrics_data;
+    let method_label = metrics_data
+        .as_ref()
+        .map_or_else(|| "gpa".to_string(), |m| m.label.clone());
     let mut gpa_processor = gpa_response.gpa_processor;
     let program = gpa_response.program;
     let encoding = gpa_response.encoding;
@@ -230,7 +233,7 @@ pub async fn gpa_streaming_response_body(
         json_span.record("total_wall_time", gpa_global_start_time.elapsed().as_millis() as i64);
 
         // Hand the accumulated `(pubkey, bytes)` pairs to the background finalize thread
-        json_span.in_scope(|| gpa_processor.finalize_query());
+        json_span.in_scope(|| gpa_processor.finalize_query(&method_label));
 
         // Close the JSON array
         yield Ok(Frame::data(Bytes::from(streaming_response_body_wrapper.end)));

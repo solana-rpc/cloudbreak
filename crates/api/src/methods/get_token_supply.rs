@@ -13,9 +13,9 @@ use spl_token_2022::state::Mint;
 
 use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
-use crate::methods::token::parse_additional_mint_data;
-use crate::methods::{is_token_program, processed};
+use crate::methods::processed;
 use crate::metrics;
+use crate::utils::token::{is_token_program, parse_additional_mint_data};
 
 #[tracing::instrument(name = "get_token_supply_rpc", skip_all, fields(pubkey = %mint))]
 pub async fn get_token_supply(
