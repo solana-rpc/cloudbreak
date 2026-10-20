@@ -16,7 +16,7 @@ use crate::http::CloudbreakRpcState;
 use crate::methods::processed;
 use crate::metrics;
 use crate::utils::encoding::check_account_data_len_for_encoding;
-use crate::utils::token::{is_token_program, parse_additional_mint_data};
+use cloudbreak_core::utils::token::{MintState, is_token_program};
 
 #[tracing::instrument(name = "gma_rpc", skip_all, fields(num_pubkeys = pubkeys.len()))]
 pub async fn get_multiple_accounts(
@@ -115,7 +115,8 @@ pub async fn get_multiple_accounts(
                 if account.data.len() >= 32 {
                     let mint_pubkey = Pubkey::try_from(&account.data[..32])
                         .map_err(|_| RpcError::InternalError)?;
-                    parse_additional_mint_data(&mint_pubkey, account.mint_data(), block_time)
+                    MintState::from_mint(&mint_pubkey, account.mint_data())
+                        .map(|mint| mint.additional_data(block_time))
                 } else {
                     None
                 }

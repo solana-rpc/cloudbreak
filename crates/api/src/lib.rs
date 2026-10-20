@@ -7,6 +7,7 @@ use futures::future;
 use sea_orm::{ConnectOptions, Database};
 use std::sync::Arc;
 use std::time::Duration;
+use cloudbreak_core::modules::mint_cache::MintCache;
 use cloudbreak_core::modules::processed::ProcessedAccounts;
 use cloudbreak_core::{ApiConfig, EnvironmentInfo, TryLoadConfig};
 
@@ -26,14 +27,20 @@ pub mod methods;
 pub mod metrics;
 mod modules;
 pub mod query_tracker_client;
+mod grpc_feed;
 mod slot_syncronizer;
 mod utils;
 
 pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
     let config = ApiConfig::try_load(config)?;
-    config.validate_processed_accounts()?;
+    if let Some(processed) = &config.processed_accounts {
+        processed.check_required_modules(&config)?;
+    }
+    if let Some(mint_cache) = &config.mint_cache {
+        mint_cache.check_required_api_modules(&config)?;
+    }
 
-    if config.processed_accounts_enabled() {
+    if config.processed_accounts_enabled() || config.mint_cache_enabled() {
         rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
             .expect("Failed to install rustls crypto provider");
@@ -80,9 +87,15 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
         client_ip: config.metrics.client_ip_key.clone(),
     };
 
+    let mint_cache = MintCache::from_api_config(config.mint_cache.as_ref());
     let (anchor_tx, anchor_rx) = tokio::sync::watch::channel(None);
     let (mut slot_syncronizer_handle, slot_syncronizer_data) =
-        match slot_syncronizer::start_slot_syncronizer(database.clone(), &config, anchor_tx) {
+        match slot_syncronizer::start_slot_syncronizer(
+            database.clone(),
+            &config,
+            anchor_tx,
+            mint_cache.clone(),
+        ) {
             Some((handle, data)) => (future::Either::Left(handle), Some(data)),
             None => (future::Either::Right(future::pending()), None),
         };
@@ -177,9 +190,15 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
     }
 
     let processed =
-        ProcessedAccounts::from_config(config.processed_accounts.as_ref(), indexer_filter.clone())?;
-    processed.spawn(anchor_rx);
+        ProcessedAccounts::from_config(config.processed_accounts.as_ref(), indexer_filter.clone());
+    let mut grpc_feed_handle =
+        match grpc_feed::spawn(config.grpc.as_ref(), &processed, &mint_cache, anchor_rx) {
+            Some(handle) => future::Either::Left(handle),
+            None => future::Either::Right(future::pending()),
+        };
     info!("processed accounts: enabled: {}", processed.is_enabled());
+    mint_cache.api().spawn_loader(database.clone());
+    info!("mint cache: enabled: {}", mint_cache.is_enabled());
 
     let state = CloudbreakRpcState::new(
         database,
@@ -203,6 +222,7 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
         largest_accounts,
         token_largest_accounts,
         processed,
+        mint_cache,
     );
 
     info!("Server is starting...");
@@ -224,6 +244,10 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
         result = &mut slot_syncronizer_handle => {
             tracing::error!("Slot synchronizer stopped unexpectedly: {:?}", result);
             panic!("Slot syncronizer stopped unexpectedly: {result:?}");
+        }
+        result = &mut grpc_feed_handle => {
+            tracing::error!("gRPC feed stopped unexpectedly: {:?}", result);
+            panic!("gRPC feed stopped unexpectedly: {result:?}");
         }
     }
 

@@ -13,7 +13,7 @@ use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
 use crate::methods::processed;
 use crate::metrics;
-use crate::utils::token::{is_token_program, parse_additional_mint_data};
+use cloudbreak_core::utils::token::{MintState, is_token_program};
 
 #[tracing::instrument(name = "get_token_account_balance_rpc", skip_all, fields(pubkey = %pubkey))]
 pub async fn get_token_account_balance(
@@ -89,14 +89,15 @@ pub async fn get_token_account_balance(
     })?;
 
     // Empty mint data means the mint row is missing or closed. WSOL needs none:
-    // parse_additional_mint_data hardcodes its decimals.
+    // `MintState::from_mint` hardcodes its decimals.
     let mint_data = account.mint_data();
     if mint_data.is_empty() && mint_pubkey != spl_token_interface::native_mint::id() {
         return Err(RpcError::MintDataNotFound {
             mint: mint_pubkey.to_string(),
         });
     }
-    let additional_mint_data = parse_additional_mint_data(&mint_pubkey, mint_data, block_time);
+    let additional_mint_data =
+        MintState::from_mint(&mint_pubkey, mint_data).map(|mint| mint.additional_data(block_time));
 
     let additional_data = additional_mint_data
         .as_ref()

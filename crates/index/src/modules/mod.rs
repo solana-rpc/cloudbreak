@@ -6,7 +6,6 @@
 pub mod cleanup;
 pub mod epoch_stakes;
 pub mod finalize_slot;
-pub mod grpc;
 pub mod hash_checker;
 pub mod health;
 pub mod lt_hash;

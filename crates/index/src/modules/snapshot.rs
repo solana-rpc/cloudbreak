@@ -7,7 +7,7 @@ use cloudbreak_core::{
     IndexConfig, SnapshotConfig,
     modules::{
         account_owner_map::AccountOwnerMap, largest_accounts::LargestAccountsTracker,
-        non_circulating::NonCirculatingTracker, supply::SupplyTracker,
+        mint_cache::MintCache, non_circulating::NonCirculatingTracker, supply::SupplyTracker,
     },
 };
 use std::sync::{Arc, Mutex};
@@ -33,6 +33,7 @@ pub enum SnapshotProcessingState {
 /// already effectively finished: we clear the `Startup` unhealthy reason once (via
 /// [`UpdatedAccountsDuringStartup::finish_startup_without_snapshot`]) so a no-snapshot node
 /// reports healthy and its slot-dependent reads are not gated forever.
+#[allow(clippy::too_many_arguments)]
 pub async fn process_snapshot_if_needed(
     config: IndexConfig,
     slot: u64,
@@ -42,6 +43,7 @@ pub async fn process_snapshot_if_needed(
     largest_accounts: LargestAccountsTracker,
     non_circulating: NonCirculatingTracker,
     supply_tracker: SupplyTracker,
+    mint_cache: MintCache,
 ) {
     let snapshot_config = match config.snapshot {
         Some(snapshot_config) => snapshot_config,
@@ -91,6 +93,7 @@ pub async fn process_snapshot_if_needed(
             largest_accounts,
             non_circulating,
             supply_tracker,
+            mint_cache,
         )
         .await;
 

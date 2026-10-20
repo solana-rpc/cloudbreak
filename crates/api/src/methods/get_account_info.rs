@@ -16,7 +16,7 @@ use crate::http::CloudbreakRpcState;
 use crate::methods::processed;
 use crate::metrics;
 use crate::utils::encoding::check_account_data_len_for_encoding;
-use crate::utils::token::{is_token_program, parse_additional_mint_data};
+use cloudbreak_core::utils::token::{MintState, is_token_program};
 
 #[tracing::instrument(name = "gai_rpc", skip_all, fields(pubkey = %pubkey))]
 pub async fn get_account_info(
@@ -87,13 +87,14 @@ pub async fn get_account_info(
 
     // For jsonParsed encoding the mint's data came with the account read.
     //
-    // We pass the mint pubkey to parse_additional_mint_data unconditionally (with empty
-    // mint_data if the mint was not found): that way the function's native_mint
+    // We pass the mint pubkey to `MintState::from_mint` unconditionally (with empty
+    // mint_data if the mint was not found): that way its native_mint
     // short-circuit can still hardcode decimals for WSOL.
     let additional_mint_data: Option<AccountAdditionalDataV3> =
         if with_mint && is_token_program(&owner) {
             if let Some(mint_pubkey) = get_token_mint_from_data(&account.data) {
-                parse_additional_mint_data(&mint_pubkey, account.mint_data(), block_time)
+                MintState::from_mint(&mint_pubkey, account.mint_data())
+                    .map(|mint| mint.additional_data(block_time))
             } else {
                 None
             }

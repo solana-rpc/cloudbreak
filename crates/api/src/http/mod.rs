@@ -13,6 +13,7 @@ use crate::modules::vote_accounts_cache::SharedStakesSnapshot;
 use crate::query_tracker_client::QueryTrackerClient;
 use crate::slot_syncronizer::SlotSyncronizerData;
 use agave_feature_set::FeatureSet;
+use cloudbreak_core::modules::mint_cache::MintCache;
 use cloudbreak_core::modules::processed::ProcessedAccounts;
 use cloudbreak_core::{
     AccountSelectorConfig, MethodSection, ProcessedCommitmentBehavior, UnhealthyResponseBehavior,
@@ -125,6 +126,8 @@ pub struct CloudbreakRpcState {
     /// The `[processed-accounts]` handle. The disabled handle routes every
     /// request through `resolve_commitment`.
     pub processed: ProcessedAccounts,
+    /// The `[mint-cache]` handle. The disabled handle sends every mint lookup to Postgres.
+    pub mint_cache: MintCache,
 }
 
 impl CloudbreakRpcState {
@@ -151,6 +154,7 @@ impl CloudbreakRpcState {
         largest_accounts: MethodSection,
         token_largest_accounts: MethodSection,
         processed: ProcessedAccounts,
+        mint_cache: MintCache,
     ) -> Self {
         Self {
             database,
@@ -175,6 +179,7 @@ impl CloudbreakRpcState {
             largest_accounts,
             token_largest_accounts,
             processed,
+            mint_cache,
         }
     }
 

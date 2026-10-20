@@ -112,3 +112,10 @@ include = ["Stake11111111111111111111111111111111111111"]
 # [hash-checker]
 # time-limit = "4h"
 # slot-limit = 416520592
+
+# Fills and maintains the mints table for the API [mint-cache] (~4.6 GB in memory).
+# Requires the [snapshot] section and both token programs in [programs].
+# [mint-cache]
+# enabled = true
+# Slots between two writes of the changed mints to the mints table.
+# db-write-interval-slots = 1000

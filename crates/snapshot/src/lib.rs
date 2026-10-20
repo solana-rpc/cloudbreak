@@ -20,6 +20,7 @@ use cloudbreak_core::{
     modules::{
         account_owner_map::AccountOwnerMap,
         largest_accounts::LargestAccountsTracker,
+        mint_cache::MintCache,
         non_circulating::NonCirculatingTracker,
         supply::{self, SupplyTracker},
     },
@@ -56,6 +57,7 @@ pub async fn run(
     largest_accounts: LargestAccountsTracker,
     non_circulating: NonCirculatingTracker,
     supply_tracker: SupplyTracker,
+    mint_cache: MintCache,
 ) -> Result<()> {
     let start_time = Instant::now();
 
@@ -86,6 +88,7 @@ pub async fn run(
         largest_accounts.clone(),
         non_circulating.clone(),
         supply_tracker.clone(),
+        mint_cache.clone(),
     );
 
     // Process incremental snapshot only if needed
@@ -100,6 +103,7 @@ pub async fn run(
             largest_accounts.clone(),
             non_circulating.clone(),
             supply_tracker.clone(),
+            mint_cache.clone(),
         )
         .await??;
 
@@ -130,6 +134,8 @@ pub async fn run(
         .finish_bootstrap_and_persist(&database, &non_circulating)
         .await;
     supply::bootstrap::finish_bootstrap(&database, &supply_tracker).await;
+    // Writes the mints not written yet and sets `last_db_slot`; the API loads `mints` after it.
+    mint_cache.indexer().finish_bootstrap(&database).await?;
 
     tracing::info!(
         "Total snapshot processing time after cleanup: {} secs",
@@ -150,6 +156,7 @@ fn download_and_process_snapshot(
     largest_accounts: LargestAccountsTracker,
     non_circulating: NonCirculatingTracker,
     supply_tracker: SupplyTracker,
+    mint_cache: MintCache,
 ) -> JoinHandle<Result<()>> {
     let db_clone = database.clone();
 
@@ -175,6 +182,7 @@ fn download_and_process_snapshot(
             largest_accounts,
             non_circulating,
             supply_tracker,
+            mint_cache,
         )
         .await?;
 
@@ -193,6 +201,7 @@ async fn process_downloaded_snapshot(
     largest_accounts: LargestAccountsTracker,
     non_circulating: NonCirculatingTracker,
     supply_tracker: SupplyTracker,
+    mint_cache: MintCache,
 ) -> Result<()> {
     let start_time = Instant::now();
     let total_accounts_files_opening_time_micros = Arc::new(Mutex::new(0));
@@ -285,6 +294,7 @@ async fn process_downloaded_snapshot(
         let accounts_owner_map = accounts_owner_map.clone();
         let largest_accounts = largest_accounts.clone();
         let non_circulating = non_circulating.clone();
+        let mint_cache = mint_cache.clone();
 
         account_file_workers.spawn(async move {
             let start_time = Instant::now();
@@ -336,6 +346,15 @@ async fn process_downloaded_snapshot(
                         account.lamports,
                         account.data,
                         account_file_slot,
+                    );
+
+                    mint_cache.indexer().on_snapshot_account(
+                        &database,
+                        account_file_slot,
+                        account.pubkey(),
+                        account.owner,
+                        account.lamports,
+                        account.data,
                     );
 
                     if !programs_include.is_empty() {

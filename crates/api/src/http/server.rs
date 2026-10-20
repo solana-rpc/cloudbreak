@@ -134,6 +134,9 @@ async fn handle_request(
         (&Method::GET, "/debug/modules/gpa_cache") => {
             operational_endpoints::gpa_cache_handler(&req, &state)?
         }
+        (&Method::GET, "/debug/modules/mint_cache") => {
+            operational_endpoints::mint_cache_handler(&req, &state)?
+        }
         _ => HttpHandlerResponse {
             status: StatusCode::NOT_FOUND,
             body: ResponseBody::Buffered(b"Not Found".to_vec()),

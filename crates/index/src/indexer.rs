@@ -7,7 +7,9 @@ use cloudbreak_core::{
     EnvironmentInfo, IndexConfig, Result as CloudbreakResult, TryLoadConfig,
     modules::{
         account_owner_map::AccountOwnerMap,
+        grpc::subscribe_grpc_with_reconnection,
         largest_accounts::{self, LargestAccountsTracker},
+        mint_cache::MintCache,
         non_circulating::NonCirculatingTracker,
         supply::{self, SupplyTracker},
     },
@@ -19,7 +21,7 @@ use std::{
 };
 use tokio::sync::mpsc::Receiver;
 use yellowstone_grpc_proto::{
-    geyser::{SlotStatus, SubscribeUpdate, subscribe_update::UpdateOneof},
+    geyser::{CommitmentLevel, SlotStatus, SubscribeUpdate, subscribe_update::UpdateOneof},
     prelude::UnixTimestamp,
 };
 
@@ -57,6 +59,8 @@ pub struct IndexerState {
     pub largest_accounts: LargestAccountsTracker,
     pub non_circulating: NonCirculatingTracker,
     pub supply_tracker: SupplyTracker,
+    /// Keeps the `mints` table for the API mint cache. No-op without `[mint-cache]`.
+    pub mint_cache: MintCache,
 }
 
 pub async fn run(config: &str) -> CloudbreakResult<()> {
@@ -112,6 +116,12 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
     // and the snapshot anchor. `from_config` validates all of it.
     let supply_tracker = supply::persist::from_config(&db, &config, non_circulating.clone()).await;
 
+    // Fills `mints` after the snapshot load, then writes only real mint changes per block.
+    if let Some(mint_cache) = &config.mint_cache {
+        mint_cache.check_required_indexer_modules(&config)?;
+    }
+    let mint_cache = MintCache::from_indexer_config(config.mint_cache.as_ref());
+
     // Service health is tracked as a set of reasons (Startup is set until the startup snapshot is
     // processed; GapFill is set while a gap fill is in progress).
     let health = ServiceHealth::new(db.clone());
@@ -165,6 +175,7 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
         largest_accounts,
         non_circulating,
         supply_tracker,
+        mint_cache,
     };
 
     // Used for the hash-checker to signal the main loop to stop
@@ -186,13 +197,14 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
         hc.spawn_orchestrator();
     }
 
-    let grpc_handle = modules::grpc::subscribe_grpc_with_reconnection(
-        config.clone(),
+    let grpc_handle = subscribe_grpc_with_reconnection(
+        config.grpc.clone(),
+        CommitmentLevel::Confirmed,
         buffer_channel_tx,
         indexer_state.buffer_channel_rx_len.clone(),
         indexer_state.self_healing_state.last_slot_received.clone(),
         grpc_cancel.clone(),
-        db.clone(),
+        Some(db.clone()),
     );
 
     let self_healing_fill_gaps_handle = indexer_state
@@ -216,6 +228,10 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
         .set(indexer_state.supply_tracker.clone())
         .ok()
         .expect("Failed to set supply tracker for debug endpoint");
+    operational_endpoints::mint_cache::MINT_CACHE
+        .set(indexer_state.mint_cache.clone())
+        .ok()
+        .expect("Failed to set mint cache for debug endpoint");
     operational_endpoints::non_circulating::NON_CIRCULATING
         .set(indexer_state.non_circulating.clone())
         .ok()

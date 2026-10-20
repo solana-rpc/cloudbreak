@@ -97,15 +97,30 @@ enabled = false
 # Serves processed commitment for getAccountInfo, getMultipleAccounts, getBalance,
 # getTokenAccountBalance, getTokenSupply and getSlot from a Yellowstone block feed held in
 # memory around the Postgres confirmed slot. Other methods keep following
-# processed-commitment. Requires [slot-syncronizer] enabled = true. Startup fails
-# without it. For these methods it overrides processed-commitment = "reject":
+# processed-commitment. Requires [grpc] and [slot-syncronizer] enabled = true. Startup
+# fails without them. For these methods it overrides processed-commitment = "reject":
 # when no processed blocks can be proven, a processed request
 # answers exactly as a confirmed request would. Each API instance carries its own
 # full block feed.
 # [processed-accounts]
 # enabled = false
+
+# Keeps the mint data jsonParsed needs in memory (~4.6 GB). Requires [grpc],
+# [slot-syncronizer] enabled = true and the indexer's [mint-cache].
+# [mint-cache]
+# enabled = false
+
+# The API gRPC feed used by [processed-accounts] and [mint-cache]. The connection
+# fields default to the indexer values; the API panics after reconnect-give-up.
+# [grpc]
+# enabled = false
 # endpoint = "https://grpc.example:443"
 # x-token = "..."
+# timeout = 60
+# max-grpc-errors = 1
+# reconnect-give-up = "600s"
+# reconnect-backoff = "5s"
+# reconnect-from-slot-retain = "300s"
 
 # Optional module: cache configuration for the GPA queries.
 [gpa-cache]

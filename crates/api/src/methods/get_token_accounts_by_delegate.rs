@@ -16,7 +16,7 @@ use crate::methods::get_program_accounts::{GpaStreamingResponse, get_program_acc
 use crate::methods::get_token_accounts_by_owner::{TokenAccountsFilter, read_mint};
 use crate::metrics;
 use crate::modules::mint_resolver::MintResolver;
-use crate::utils::token::{
+use cloudbreak_core::utils::token::{
     TOKEN_ACCOUNT_DELEGATE_OFFSET, TOKEN_ACCOUNT_DELEGATE_TAG_OFFSET, TOKEN_ACCOUNT_MINT_OFFSET,
     is_token_program,
 };

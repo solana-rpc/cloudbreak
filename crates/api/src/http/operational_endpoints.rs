@@ -68,6 +68,97 @@ pub fn log_filter_handler(req: &Request<Incoming>) -> Result<HttpHandlerResponse
 }
 
 // ============================================================================
+// Mint cache debug endpoint
+// ============================================================================
+
+/// HTTP debug endpoint for the API half of the mint cache
+/// (`cloudbreak_core::modules::mint_cache::MintCacheApi`).
+/// Read-only: it copies the counters, or looks up one mint, under the cache read lock.
+///
+/// # Route
+///
+/// `GET /debug/modules/mint_cache`
+///
+/// # Query parameters
+///
+/// | Name     | Type   | Default | Description |
+/// |----------|--------|---------|-------------|
+/// | `pubkey` | base58 | unset   | One mint to look up in the cache. |
+///
+/// # Response
+///
+/// `Content-Type: application/json`. `200 OK`, or `400 Bad Request` on an invalid `pubkey`.
+/// Without `[mint-cache]`: `{"enabled": false}`.
+///
+/// ```json
+/// {
+///   "enabled": true,
+///   "status": "live",
+///   "applied_through": { "slot": 454306183, "blockhash": "…" },
+///   "unhealthy_since": null,
+///   "pending_reload": null,
+///   "immutable": 88213004,
+///   "mutable": 1398112,
+///   "tombstones": 2210,
+///   "buffer_blocks": 3,
+///   "buffer_min_slot": 454306184,
+///   "buffer_max_slot": 454306186,
+///   "entry": { "pubkey": "…", "map": "tombstone", "slot": 454301002, "closed": true, "decimals": null, "has_config": false }
+/// }
+/// ```
+///
+/// `pending_reload` is `{ "after", "target", "reason" }` while a reload waits for `last_db_slot`
+/// to reach `target`; `reason` is `block_missing` or `health_restored`.
+/// `entry` is present only with `pubkey`. `map` is `immutable`, `mutable`, `tombstone` or
+/// `missing`; `slot` is `null` for an immutable entry, which stores none.
+///
+/// # Examples
+///
+/// ```text
+/// curl http://localhost:8899/debug/modules/mint_cache
+/// curl 'http://localhost:8899/debug/modules/mint_cache?pubkey=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
+/// ```
+pub fn mint_cache_handler(
+    req: &Request<Incoming>,
+    state: &CloudbreakRpcState,
+) -> Result<HttpHandlerResponse, Infallible> {
+    let mut pubkey = None;
+    for pair in req.uri().query().unwrap_or_default().split('&') {
+        if let Some(value) = pair.strip_prefix("pubkey=") {
+            match Pubkey::from_str(value) {
+                Ok(key) => pubkey = Some(key),
+                Err(e) => {
+                    return Ok(json_error(
+                        StatusCode::BAD_REQUEST,
+                        &format!("invalid `pubkey`: {e}"),
+                    ));
+                }
+            }
+        }
+    }
+
+    let body = match state.mint_cache.api().summary() {
+        None => serde_json::json!({ "enabled": false }),
+        Some(summary) => {
+            let mut body = serde_json::json!({ "enabled": true });
+            if let (Some(object), Ok(serde_json::Value::Object(summary))) =
+                (body.as_object_mut(), serde_json::to_value(summary))
+            {
+                object.extend(summary);
+                if let Some(entry) = pubkey.and_then(|key| state.mint_cache.api().entry(&key)) {
+                    object.insert("entry".to_string(), serde_json::json!(entry));
+                }
+            }
+            body
+        }
+    };
+    Ok(HttpHandlerResponse {
+        status: StatusCode::OK,
+        body: ResponseBody::Buffered(serde_json::to_vec(&body).unwrap_or_default()),
+    })
+}
+
+// ============================================================================
 // GPA cache debug endpoint
 // ============================================================================
 
