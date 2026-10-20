@@ -10,7 +10,7 @@ use solana_pubkey::Pubkey;
 
 use crate::db_query::bytea_literal;
 use crate::error::RpcError;
-use crate::utils::token::{
+use cloudbreak_core::utils::token::{
     TOKEN_ACCOUNT_DELEGATE_OFFSET, TOKEN_ACCOUNT_DELEGATE_TAG_OFFSET, TOKEN_ACCOUNT_MINT_OFFSET,
     TOKEN_ACCOUNT_OWNER_OFFSET, is_token_program,
 };
@@ -165,7 +165,7 @@ fn filter_sql(filter: &RpcFilterType, table: &str, token_program: bool) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::token::LEGACY_TOKEN_PROGRAM_ID;
+    use cloudbreak_core::utils::token::LEGACY_TOKEN_PROGRAM_ID;
 
     fn sql(filter: RpcFilterType, token_program: bool) -> String {
         filter_sql(&filter, "accounts", token_program).unwrap()

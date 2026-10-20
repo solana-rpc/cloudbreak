@@ -7,7 +7,7 @@
 //! one block per slot, prunes, and selects the latest chained blocks.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -18,13 +18,8 @@ use crate::metrics;
 
 pub(crate) struct BlockStore {
     pub(super) blocks: BTreeMap<u64, Arc<SlotBlock>>,
-    pub(super) dead: BTreeSet<u64>,
-    /// Slots with a `SLOT_CREATED_BANK` in this session.
-    pub(super) created: HashSet<u64>,
     /// No blocks are served until the confirmed slot passes this slot.
     pub(super) conflict_until: Option<u64>,
-    pub(super) session_floor: u64,
-    pub(super) max_slot_seen: u64,
     pub(super) anchor: Option<Anchor>,
 }
 
@@ -32,11 +27,7 @@ impl BlockStore {
     pub(crate) fn new() -> Self {
         Self {
             blocks: BTreeMap::new(),
-            dead: BTreeSet::new(),
-            created: HashSet::new(),
             conflict_until: None,
-            session_floor: 0,
-            max_slot_seen: 0,
             anchor: None,
         }
     }
@@ -58,31 +49,11 @@ impl BlockStore {
         self.find(block.parent_slot, &block.parent_blockhash)
     }
 
-    /// Starts a subscription session. Slots seen before it are ineligible until
-    /// the confirmed slot passes them, and births are forgotten.
-    pub(crate) fn new_session(&mut self) {
-        self.session_floor = self.max_slot_seen;
-        self.created.clear();
-    }
-
-    pub(crate) fn on_created_bank(&mut self, slot: u64, parent: Option<u64>) {
-        self.max_slot_seen = self.max_slot_seen.max(slot);
-        if !self.created.insert(slot) && self.dead.insert(slot) {
-            tracing::info!(slot, ?parent, "processed slot restarted, marked dead");
-        }
-    }
-
-    pub(crate) fn on_dead(&mut self, slot: u64) {
-        self.max_slot_seen = self.max_slot_seen.max(slot);
-        self.dead.insert(slot);
-    }
-
     /// Stores a block. A replay of a stored block is ignored. A second
     /// blockhash for a stored slot, or a parent blockhash that does not match
     /// the stored parent, is a conflict above the confirmed slot. At or below
     /// it the stored block is the confirmed one and the newcomer is dropped.
     pub(crate) fn on_block(&mut self, block: SlotBlock) {
-        self.max_slot_seen = self.max_slot_seen.max(block.slot);
         let confirmed = |slot: u64| self.anchor_slot().is_some_and(|a| slot <= a);
         if let Some(stored) = self.blocks.get(&block.slot) {
             if stored.blockhash != block.blockhash && !confirmed(block.slot) {
@@ -139,9 +110,8 @@ impl BlockStore {
         self.anchor = Some(anchor);
     }
 
-    /// Drops slots below the retained window under the confirmed slot, poison
-    /// entries at or below it, and the lowest slots over the cap above it.
-    /// Before the first anchor the cap below the highest slot seen is the floor.
+    /// Drops slots below the retained window under the confirmed slot, and the
+    /// lowest slots over the cap above it.
     pub(crate) fn prune(&mut self) {
         if let Some(a) = self.anchor_slot() {
             let floor = a.saturating_sub(RETAINED_SLOTS_BELOW_CONFIRMED);
@@ -153,12 +123,6 @@ impl BlockStore {
                 self.blocks.pop_first();
             }
         }
-        let poison_floor = self.anchor_slot().unwrap_or_else(|| {
-            self.max_slot_seen
-                .saturating_sub(MAX_SLOTS_ABOVE_CONFIRMED as u64)
-        });
-        self.dead.retain(|slot| *slot > poison_floor);
-        self.created.retain(|slot| *slot > poison_floor);
         let above = self.anchor_slot().map_or(0, |a| a + 1);
         while self.blocks.range(above..).count() > MAX_SLOTS_ABOVE_CONFIRMED {
             let lowest = *self.blocks.range(above..).next().map(|(s, _)| s).unwrap();
@@ -166,14 +130,8 @@ impl BlockStore {
         }
     }
 
-    /// A slot above the confirmed slot that must not be served: dead,
-    /// restarted, without a birth in this session, or seen before this session.
-    fn poisoned(&self, slot: u64) -> bool {
-        self.dead.contains(&slot) || !self.created.contains(&slot) || slot <= self.session_floor
-    }
-
     /// The blocks from the highest stored slot, when its walk reaches the
-    /// confirmed slot and blockhash with no poisoned slot on the way.
+    /// confirmed slot and blockhash.
     pub(crate) fn latest_chained_blocks(&self) -> Option<ProcessedBlocks> {
         let anchor = self.anchor.as_ref()?;
         let a = anchor.confirmed_slot;
@@ -186,9 +144,6 @@ impl BlockStore {
         let mut blocks = Vec::new();
         let mut block = head;
         while block.slot > a {
-            if self.poisoned(block.slot) {
-                return None;
-            }
             blocks.push(block.clone());
             if block.parent_slot == a {
                 if block.parent_blockhash != anchor.confirmed_blockhash {
@@ -248,22 +203,14 @@ pub(crate) mod tests {
 
     impl TestChain {
         pub fn new() -> Self {
-            let mut store = BlockStore::new();
-            store.new_session();
             Self {
-                store,
+                store: BlockStore::new(),
                 filter: AccountSelectorConfig::default(),
                 owner: Pubkey::new_unique(),
             }
         }
 
-        fn birth(&mut self, slot: u64, parent: u64) {
-            if !self.store.created.contains(&slot) {
-                self.store.on_created_bank(slot, Some(parent));
-            }
-        }
-
-        /// Birth plus block, every account owned by the chain's owner.
+        /// A block where every account is owned by the chain's owner.
         pub fn block_with(&mut self, slot: u64, parent: u64, accounts: Vec<(Pubkey, u64)>) {
             let owner = self.owner;
             let accounts = accounts.into_iter().map(|(k, l)| (k, owner, l)).collect();
@@ -276,7 +223,6 @@ pub(crate) mod tests {
             parent: u64,
             accounts: Vec<(Pubkey, Pubkey, u64)>,
         ) {
-            self.birth(slot, parent);
             let infos = accounts
                 .into_iter()
                 .map(|(key, owner, lamports)| account_info(key, owner, lamports, vec![0; 8]))
@@ -285,7 +231,6 @@ pub(crate) mod tests {
         }
 
         pub fn block_without_time(&mut self, slot: u64, parent: u64) {
-            self.birth(slot, parent);
             let mut block = update(slot, &hash(slot), parent, &hash(parent), vec![]);
             block.block_time = None;
             self.raw(block);
@@ -296,16 +241,15 @@ pub(crate) mod tests {
             self.store.on_block(built);
         }
 
-        /// Birth plus an empty block for every slot in `from..=to`, each on the previous slot.
+        /// An empty block for every slot in `from..=to`, each on the previous slot.
         pub fn linear(&mut self, from: u64, to: u64) {
             for slot in from..=to {
                 self.block_with(slot, slot - 1, vec![]);
             }
         }
 
-        /// Birth plus an empty block with explicit hashes.
-        pub fn fork(&mut self, slot: u64, hash: &str, parent: u64, parent_hash: &str) {
-            self.birth(slot, parent);
+        /// An empty block with explicit hashes.
+        pub fn block_hashed(&mut self, slot: u64, hash: &str, parent: u64, parent_hash: &str) {
             self.raw(update(slot, hash, parent, parent_hash, vec![]));
         }
 
@@ -365,10 +309,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn highest_slot_on_a_losing_fork_serves_nothing() {
+    fn highest_slot_on_a_skipped_branch_serves_nothing() {
         let mut chain = TestChain::new();
         chain.linear(101, 102);
-        chain.fork(103, "x103", 100, "other100");
+        chain.block_hashed(103, "x103", 100, "other100");
         chain.store.set_anchor(anchor_at(100));
         assert_eq!(chain.head(), None);
         // Once a higher block on the confirmed chain arrives it is the head again.
@@ -401,11 +345,11 @@ pub(crate) mod tests {
     fn second_blockhash_deletes_the_slot_and_descendants_until_confirmed_passes_it() {
         let mut chain = TestChain::new();
         chain.linear(101, 104);
-        chain.fork(105, "y105", 103, "h103");
+        chain.block_hashed(105, "y105", 103, "h103");
         chain.store.set_anchor(anchor_at(100));
         assert_eq!(chain.head(), Some(105));
 
-        chain.fork(102, "other102", 101, "h101");
+        chain.block_hashed(102, "other102", 101, "h101");
         assert_eq!(chain.store.conflict_until, Some(102));
         // 102 and its descendants 103, 104 and 105 are gone. 101 stays.
         assert_eq!(chain.slots(), vec![101]);
@@ -427,7 +371,7 @@ pub(crate) mod tests {
         chain.store.set_anchor(anchor_at(100));
         assert_eq!(chain.head(), Some(104));
 
-        chain.fork(105, "h105", 103, "r103");
+        chain.block_hashed(105, "h105", 103, "r103");
         assert_eq!(chain.store.conflict_until, Some(103));
         assert_eq!(chain.slots(), vec![101, 102]);
         assert_eq!(chain.head(), None);
@@ -444,9 +388,9 @@ pub(crate) mod tests {
         chain.store.set_anchor(anchor_at(100));
         assert_eq!(chain.head(), Some(103));
 
-        chain.fork(100, "other100", 99, "h99");
-        chain.fork(99, "other99", 98, "h98");
-        chain.fork(104, "x104", 100, "other100");
+        chain.block_hashed(100, "other100", 99, "h99");
+        chain.block_hashed(99, "other99", 98, "h98");
+        chain.block_hashed(104, "x104", 100, "other100");
         assert_eq!(chain.store.conflict_until, None);
         assert_eq!(chain.slots(), vec![99, 100, 101, 102, 103]);
         assert_eq!(chain.head(), Some(103));
@@ -466,13 +410,10 @@ pub(crate) mod tests {
     fn retention_keeps_a_window_below_the_confirmed_slot() {
         let mut chain = TestChain::new();
         chain.linear(90, 105);
-        chain.store.on_dead(93);
         chain.store.set_anchor(anchor_at(100));
         chain.store.prune();
         let floor = 100 - RETAINED_SLOTS_BELOW_CONFIRMED;
         assert_eq!(chain.slots(), (floor..=105).collect::<Vec<_>>());
-        assert!(chain.store.dead.is_empty());
-        assert!(chain.store.created.iter().all(|s| *s > 100));
         let latest = chain.event().unwrap();
         assert_eq!(latest.blocks.last().unwrap().slot, floor);
     }
@@ -488,14 +429,11 @@ pub(crate) mod tests {
         chain.store.set_anchor(anchor_at(102));
         assert_eq!(chain.head(), Some(100 + cap + 2));
 
-        // Before the first anchor the cap bounds the whole store and the poison sets.
+        // Before the first anchor the cap bounds the whole store.
         let mut chain = TestChain::new();
         chain.linear(101, 100 + cap + 1);
-        chain.store.on_dead(101);
         chain.store.prune();
         assert_eq!(chain.slots().len(), MAX_SLOTS_ABOVE_CONFIRMED);
-        assert!(chain.store.dead.is_empty());
-        assert!(chain.store.created.iter().all(|s| *s > 101));
     }
 
     #[test]
@@ -507,47 +445,5 @@ pub(crate) mod tests {
         assert_eq!(chain.head(), None);
         chain.linear(104, 104);
         assert_eq!(chain.head(), Some(104));
-    }
-
-    #[test]
-    fn dead_slot_on_the_walk_serves_nothing_until_confirmed_passes_it() {
-        let mut chain = TestChain::new();
-        chain.linear(101, 104);
-        chain.store.set_anchor(anchor_at(100));
-        chain.store.on_dead(102);
-        assert_eq!(chain.head(), None);
-        chain.store.set_anchor(anchor_at(102));
-        assert_eq!(chain.head(), Some(104));
-    }
-
-    #[test]
-    fn repeated_bank_creation_marks_the_slot_dead() {
-        let mut chain = TestChain::new();
-        chain.linear(101, 103);
-        chain.store.set_anchor(anchor_at(100));
-        assert_eq!(chain.head(), Some(103));
-        chain.store.on_created_bank(103, Some(102));
-        assert!(chain.store.dead.contains(&103));
-        assert_eq!(chain.head(), None);
-    }
-
-    #[test]
-    fn missing_birth_and_session_floor_are_ineligible() {
-        let mut chain = TestChain::new();
-        chain.linear(101, 101);
-        chain.raw(update(102, "h102", 101, "h101", vec![]));
-        chain.store.set_anchor(anchor_at(100));
-        assert_eq!(chain.head(), None);
-        chain.store.on_created_bank(102, Some(101));
-        assert_eq!(chain.head(), Some(102));
-
-        chain.store.new_session();
-        assert_eq!(chain.store.session_floor, 102);
-        chain.block_with(103, 102, vec![]);
-        chain.store.on_created_bank(101, Some(100));
-        chain.store.on_created_bank(102, Some(101));
-        assert_eq!(chain.head(), None);
-        chain.store.set_anchor(anchor_at(102));
-        assert_eq!(chain.head(), Some(103));
     }
 }

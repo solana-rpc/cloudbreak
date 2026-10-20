@@ -4,7 +4,12 @@
  */
 
 use cloudbreak_core::ApiConfig;
-use cloudbreak_core::metrics::PROCESSED_CONFIRM_LATENCY_MS;
+use cloudbreak_core::metrics::{
+    GRPC_BUFFER_CHANNEL_SIZE_SENDER, GRPC_ERRORS, GRPC_TIMEOUT_ERRORS, GRPC_TOTAL_UPDATES_RECEIVED,
+    MINT_CACHE_APPLIED_THROUGH, MINT_CACHE_BLOCK_MICROSECONDS, MINT_CACHE_BUFFER_BLOCKS,
+    MINT_CACHE_CHANGES_PER_BLOCK, MINT_CACHE_ENTRIES, MINT_CACHE_LOOKUPS_TOTAL,
+    MINT_CACHE_RELOADS_TOTAL, MINT_CACHE_STARTUP_SECONDS, PROCESSED_CONFIRM_LATENCY_MS,
+};
 use hyper::StatusCode;
 use prometheus::{
     HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
@@ -325,9 +330,27 @@ pub fn setup_metrics(config: &ApiConfig) -> anyhow::Result<()> {
             config.metrics.client_ip_bandwidth_enabled,
         );
 
+        if config.grpc_enabled() {
+            register!(GRPC_ERRORS);
+            register!(GRPC_TIMEOUT_ERRORS);
+            register!(GRPC_TOTAL_UPDATES_RECEIVED);
+            register!(GRPC_BUFFER_CHANNEL_SIZE_SENDER);
+        }
+
         if config.processed_accounts_enabled() {
             register!(CLOUDBREAK_API_PROCESSED_REQUESTS_TOTAL);
             register!(PROCESSED_CONFIRM_LATENCY_MS);
+        }
+
+        if config.mint_cache_enabled() {
+            register!(MINT_CACHE_ENTRIES);
+            register!(MINT_CACHE_CHANGES_PER_BLOCK);
+            register!(MINT_CACHE_BLOCK_MICROSECONDS);
+            register!(MINT_CACHE_STARTUP_SECONDS);
+            register!(MINT_CACHE_LOOKUPS_TOTAL);
+            register!(MINT_CACHE_RELOADS_TOTAL);
+            register!(MINT_CACHE_BUFFER_BLOCKS);
+            register!(MINT_CACHE_APPLIED_THROUGH);
         }
     });
 

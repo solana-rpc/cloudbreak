@@ -9,7 +9,7 @@ use cloudbreak_core::{
     Result, SnapshotConfig, TryLoadConfig,
     modules::{
         account_owner_map::AccountOwnerMap, largest_accounts::LargestAccountsTracker,
-        non_circulating::NonCirculatingTracker, supply::SupplyTracker,
+        mint_cache::MintCache, non_circulating::NonCirculatingTracker, supply::SupplyTracker,
     },
 };
 use cloudbreak_index::indexer::run as run_index;
@@ -70,6 +70,7 @@ async fn main() -> Result<()> {
                 LargestAccountsTracker::default(),
                 NonCirculatingTracker::default(),
                 SupplyTracker::default(),
+                MintCache::default(),
             )
             .await
         }

@@ -27,7 +27,7 @@ use crate::methods::get_program_accounts::{GpaStreamingResponse, get_program_acc
 use crate::methods::resolve_commitment;
 use crate::metrics;
 use crate::modules::mint_resolver::MintResolver;
-use crate::utils::token::{
+use cloudbreak_core::utils::token::{
     LEGACY_TOKEN_PROGRAM_ID, TOKEN_ACCOUNT_MINT_OFFSET, TOKEN_ACCOUNT_OWNER_OFFSET,
     is_token_program,
 };

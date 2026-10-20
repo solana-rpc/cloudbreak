@@ -8,9 +8,9 @@ use std::sync::OnceLock;
 use anyhow::Result as AnyhowResult;
 
 mod config;
-pub mod grpc;
 pub mod metrics;
 pub mod modules;
+pub mod utils;
 
 pub use config::*;
 use tracing_subscriber::{EnvFilter, Registry};

@@ -20,7 +20,9 @@ impl MigrationTrait for Migration {
                     id INTEGER PRIMARY KEY,
                     mode TEXT NOT NULL DEFAULT 'exclude' CHECK (mode IN ('include', 'exclude')),
                     programs TEXT NOT NULL DEFAULT '',
-                    solana_version TEXT
+                    solana_version TEXT,
+                    -- Mint cache: the slot the `mints` table is complete through.
+                    mints_saved_slot BIGINT
                 );
                 "#,
             )
