@@ -15,6 +15,15 @@ use serde_json::Value as JsonValue;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// User-Agent on every request the integration tests send.
+/// The VictoriaLogs source excludes it, so a run never replays its own requests.
+pub const USER_AGENT: &str = "cloudbreak-integration-tests";
+
+/// HTTP client builder with the integration-tests User-Agent.
+pub fn http_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().user_agent(USER_AGENT)
+}
+
 pub async fn send_rpc_request(
     client: &reqwest::Client,
     endpoint: &RpcEndpoint,
