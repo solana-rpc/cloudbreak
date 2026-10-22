@@ -36,6 +36,7 @@ pub struct CachedFeatureSet {
 
 pub mod operational_endpoints;
 pub mod rpc;
+pub mod rx_timestamp;
 pub mod server;
 pub mod streaming;
 

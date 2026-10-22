@@ -32,6 +32,7 @@ use tracing::{error, info};
 
 use crate::http::operational_endpoints;
 use crate::http::rpc;
+use crate::http::rx_timestamp::{LastRx, TimestampedStream};
 use crate::http::{CloudbreakRpcState, HeaderKeys, RequestContext};
 use crate::metrics;
 use crate::modules::bandwidth;
@@ -59,6 +60,7 @@ impl HttpServer {
         loop {
             let (stream, _remote_addr) = listener.accept().await?;
 
+            let (stream, last_rx) = TimestampedStream::new(stream);
             let io = TokioIo::new(stream);
             let state = state.clone();
             let header_keys = header_keys.clone();
@@ -72,10 +74,11 @@ impl HttpServer {
                 let service = service_fn(move |req: Request<Incoming>| {
                     let state = state.clone();
                     let header_keys = header_keys.clone();
+                    let last_rx = last_rx.clone();
 
                     *requests_in_connection.lock().unwrap() += 1;
 
-                    async move { handle_request(req, state, header_keys).await }
+                    async move { handle_request(req, state, header_keys, last_rx).await }
                 });
 
                 let connection_span = tracing::info_span!(
@@ -106,12 +109,17 @@ impl HttpServer {
     }
 }
 
-#[tracing::instrument(name = "http_request", parent = None, skip_all, fields(json_bytes = tracing::field::Empty))]
+#[tracing::instrument(name = "http_request", parent = None, skip_all, fields(json_bytes = tracing::field::Empty, pre_handler_us = tracing::field::Empty))]
 async fn handle_request(
     req: Request<Incoming>,
     state: Arc<CloudbreakRpcState>,
     header_keys: Arc<HeaderKeys>,
+    last_rx: LastRx,
 ) -> Result<Response<UnsyncBoxBody<Bytes, io::Error>>, Infallible> {
+    // Time the request's last received packet waited in the kernel and the runtime before this handler ran.
+    if let Some(pre_handler_us) = last_rx.elapsed_us() {
+        tracing::Span::current().record("pre_handler_us", pre_handler_us);
+    }
     let request_start = Instant::now();
     let inflight_guard = metrics::InFlightRequestGuard::new("http");
     let request_timeout = state.request_timeout;

@@ -1569,6 +1569,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "lazy_static",
+ "libc",
  "opentelemetry",
  "pin-project",
  "prometheus",
