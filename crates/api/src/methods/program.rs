@@ -292,7 +292,8 @@ fn gpa_db_query(
 
     let metrics_data_clone = input.metrics_data.clone();
     let parent_span = tracing::Span::current();
-    tokio::spawn(async move {
+    let fetch_on_blocking_thread = input.state.gpa_db_blocking_thread;
+    let fetch = async move {
         let db_query = async {
             let mut db_query_total_time = Duration::from_millis(0);
             let mut db_first_row_time = Duration::from_millis(0);
@@ -404,7 +405,15 @@ fn gpa_db_query(
             }
             let _ = tx.send(Err(RpcError::InternalError));
         }
-    });
+    };
+
+    if fetch_on_blocking_thread {
+        // The row loop does not yield while rows keep arriving; on a blocking thread it cannot hold an async worker.
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || runtime.block_on(fetch));
+    } else {
+        tokio::spawn(fetch);
+    }
 
     rx
 }

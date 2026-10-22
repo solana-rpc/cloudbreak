@@ -6,6 +6,9 @@ max-connections = 100
 # Set to opt in to streaming (lower memory and time to first byte); a mid-stream
 # failure then aborts the connection. See "Streamed Responses" in the README.
 # gpa-stream-batch-size = 1000
+# Read getProgramAccounts rows on a blocking thread instead of an async worker,
+# so a large result set cannot stall other requests. Off by default.
+# gpa-db-blocking-thread = false
 request-timeout = "60s"
 max-multiple-accounts = 100
 

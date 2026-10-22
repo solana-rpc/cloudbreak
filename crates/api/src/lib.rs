@@ -190,6 +190,10 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
         ProcessedAccounts::from_config(config.processed_accounts.as_ref(), indexer_filter.clone())?;
     processed.spawn(anchor_rx);
     info!("processed accounts: enabled: {}", processed.is_enabled());
+    info!(
+        "getProgramAccounts rows on a blocking thread: {}",
+        config.server.gpa_db_blocking_thread
+    );
 
     let state = CloudbreakRpcState::new(
         database,
@@ -199,6 +203,7 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
         indexer_filter,
         batch_handling_max_concurrency,
         gpa_stream_batch_size,
+        config.server.gpa_db_blocking_thread,
         request_timeout,
         config.processed_commitment,
         config.unhealthy_response,

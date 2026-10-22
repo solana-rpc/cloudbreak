@@ -630,6 +630,10 @@ pub struct ServerConfig {
     /// streams in batches of this size; see "Streamed Responses" in the README.
     #[serde(rename = "gpa-stream-batch-size", default)]
     pub gpa_stream_batch_size: Option<NonZeroUsize>,
+    /// Read `getProgramAccounts` rows on a Tokio blocking thread instead of an async worker,
+    /// so a large result set cannot stall other requests. Off by default.
+    #[serde(rename = "gpa-db-blocking-thread", default)]
+    pub gpa_db_blocking_thread: bool,
     #[serde(
         rename = "request-timeout",
         default = "ServerConfig::default_request_timeout",
