@@ -196,6 +196,8 @@ pub fn blocks_with_accounts_request(
         )]),
         blocks_meta: HashMap::new(),
         entry: HashMap::new(),
+        // The Alpenglow footer arrives out of band from its block. Nothing here reads it.
+        block_footer: HashMap::new(),
         commitment: Some(commitment as i32),
         accounts_data_slice: Vec::new(),
         ping: None,

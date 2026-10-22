@@ -476,10 +476,12 @@ pub fn unpack_compressed_snapshot<P: Into<PathBuf>>(
         let slot = slot_str.parse::<u64>()?;
         let id = id_str.parse::<u64>()?;
 
+        // Agave 4.4 always writes this map empty, 4.3 and older populate it, and `size`
+        // is discarded downstream, so a miss is expected rather than an error.
         let accounts_metadata = match accounts_metadata.get(&slot) {
             Some(accounts_metadata) => accounts_metadata,
             None => {
-                tracing::error!(
+                tracing::debug!(
                     "accounts_metadata not found for slot: {} - file_size: {} - write_version: {}",
                     slot,
                     file_size,
@@ -500,7 +502,7 @@ pub fn unpack_compressed_snapshot<P: Into<PathBuf>>(
         let size = match size {
             Some(size) => size,
             None => {
-                tracing::error!(
+                tracing::debug!(
                     "size not found for write version: {} and slot: {} - file_size: {} - accounts_metadata: {:?}",
                     id,
                     slot,

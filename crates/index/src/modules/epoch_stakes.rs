@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use cloudbreak_core::modules::non_circulating::CLOCK_SYSVAR_ID;
 use cloudbreak_core::modules::service_health::is_healthy;
 use cloudbreak_core::{IndexConfig, STAKE_PROGRAM_ID, VOTE_PROGRAM_ID};
 use cloudbreak_snapshot::persist_epoch_stakes;
 use cloudbreak_snapshot::stake_data::{SnapshotStakeData, VoterStakeRow};
 use futures::TryStreamExt;
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement, StreamTrait};
+use solana_program::clock::Clock;
 use solana_pubkey::Pubkey;
 use solana_stake_interface::{stake_history::StakeHistory, state::StakeStateV2};
 use solana_vote_interface::state::VoteStateV4;
@@ -15,8 +17,6 @@ use tokio::time::Instant;
 use yellowstone_grpc_proto::geyser::CommitmentLevel;
 
 use crate::metrics;
-
-const SLOTS_PER_EPOCH: u64 = 432_000;
 
 /// Latest live state per account for a given owner, across the live and snapshot tables.
 const LATEST_BY_OWNER_SQL: &str = r#"
@@ -48,13 +48,15 @@ const STABLE_POLLS_REQUIRED: u32 = 3;
 /// alone after this many fast polls (~30 min) and fall back to the slow heartbeat.
 const MAX_RECOMPUTES_PER_EPOCH: u32 = 30;
 
-/// The EpochRewards sysvar and its owning program. We read the sysvar from our *own* indexed
-/// accounts so its `active` flag is ordered, in the same gRPC stream, after every reward-
-/// distribution write
+/// The sysvars the recomputer reads, and their owning program. We read them from our *own*
+/// indexed accounts so they are ordered, in the same gRPC stream, against the account writes
+/// they describe
 const SYSVAR_OWNER_ID: Pubkey =
     Pubkey::from_str_const("Sysvar1111111111111111111111111111111111111");
 const EPOCH_REWARDS_SYSVAR_ID: Pubkey =
     Pubkey::from_str_const("SysvarEpochRewards1111111111111111111111111");
+const STAKE_HISTORY_SYSVAR_ID: Pubkey =
+    Pubkey::from_str_const("SysvarStakeHistory1111111111111111111111111");
 
 /// Recomputes `epoch_stakes` from the indexed Stake accounts so `getVoteAccounts` reflects
 /// the current epoch's effective stake
@@ -82,10 +84,17 @@ pub fn spawn_epoch_stakes_recomputer(
             if !is_healthy(&db).await {
                 continue;
             }
-            let Some(finalized_slot) = finalized_slot(&db).await else {
+            // Nothing finalized yet means there is no settled stake set to read.
+            if finalized_slot(&db).await.is_none() {
+                continue;
+            }
+            // Both sysvars come from our own index. Without them we leave the rows the
+            // snapshot wrote rather than replace them with a miscomputed set.
+            let (Some(epoch), Some(stake_history)) =
+                (read_clock_epoch(&db).await, read_stake_history(&db).await)
+            else {
                 continue;
             };
-            let epoch = finalized_slot / SLOTS_PER_EPOCH;
 
             if working_epoch != Some(epoch) {
                 working_epoch = Some(epoch);
@@ -102,7 +111,7 @@ pub fn spawn_epoch_stakes_recomputer(
                 continue;
             }
 
-            let (voters, total) = match recompute(&db, epoch).await {
+            let (voters, total) = match recompute(&db, epoch, &stake_history).await {
                 Ok(result) => result,
                 Err(e) => {
                     tracing::error!(
@@ -193,8 +202,8 @@ struct EpochRewardsState {
     active: bool,
 }
 
-/// Reads the latest indexed EpochRewards sysvar from our own accounts
-async fn read_epoch_rewards(db: &DatabaseConnection) -> Option<EpochRewardsState> {
+/// Reads one sysvar's latest indexed account data from our own accounts
+async fn read_sysvar(db: &DatabaseConnection, sysvar_id: &Pubkey) -> Option<Vec<u8>> {
     let row = db
         .query_one(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
@@ -212,15 +221,32 @@ async fn read_epoch_rewards(db: &DatabaseConnection) -> Option<EpochRewardsState
             "#,
             [
                 SYSVAR_OWNER_ID.to_bytes().to_vec().into(),
-                EPOCH_REWARDS_SYSVAR_ID.to_bytes().to_vec().into(),
+                sysvar_id.to_bytes().to_vec().into(),
             ],
         ))
         .await
         .ok()
         .flatten()?;
 
-    let data: Vec<u8> = row.try_get("", "data").ok()?;
+    row.try_get::<Vec<u8>>("", "data").ok()
+}
+
+/// Reads the latest indexed EpochRewards sysvar from our own accounts
+async fn read_epoch_rewards(db: &DatabaseConnection) -> Option<EpochRewardsState> {
+    let data = read_sysvar(db, &EPOCH_REWARDS_SYSVAR_ID).await?;
     parse_epoch_rewards(&data)
+}
+
+/// The cluster's current epoch, as the Clock sysvar reports it.
+async fn read_clock_epoch(db: &DatabaseConnection) -> Option<u64> {
+    let data = read_sysvar(db, &CLOCK_SYSVAR_ID).await?;
+    bincode::deserialize::<Clock>(&data).ok().map(|c| c.epoch)
+}
+
+/// Per-epoch cluster stake totals, which `Delegation::stake` needs to apply warmup and cooldown.
+async fn read_stake_history(db: &DatabaseConnection) -> Option<StakeHistory> {
+    let data = read_sysvar(db, &STAKE_HISTORY_SYSVAR_ID).await?;
+    bincode::deserialize::<StakeHistory>(&data).ok()
 }
 
 /// Parses the `active` flag from the EpochRewards sysvar
@@ -236,12 +262,15 @@ fn parse_epoch_rewards(data: &[u8]) -> Option<EpochRewardsState> {
 
 /// Returns `(voter_count, total_activated_stake)`. The total is used to detect when the
 /// epoch's stakes have stabilized (see `spawn_epoch_stakes_recomputer`).
-async fn recompute(db: &DatabaseConnection, epoch: u64) -> Result<(usize, u128), anyhow::Error> {
+async fn recompute(
+    db: &DatabaseConnection,
+    epoch: u64,
+    history: &StakeHistory,
+) -> Result<(usize, u128), anyhow::Error> {
     let start_time = Instant::now();
 
     let node_pubkeys = load_node_pubkeys(db).await?;
 
-    let history = StakeHistory::default();
     let mut by_voter: HashMap<Pubkey, u64> = HashMap::new();
     let mut stream = db
         .stream(Statement::from_sql_and_values(
@@ -261,7 +290,7 @@ async fn recompute(db: &DatabaseConnection, epoch: u64) -> Result<(usize, u128),
         // stake_v2() is gated on upgrade_bpf_stake_program_to_v5_1, which is not active on
         // mainnet; agave still takes this path, so match it.
         #[allow(deprecated)]
-        let effective = delegation.stake(epoch, &history, NEW_RATE_ACTIVATION_EPOCH);
+        let effective = delegation.stake(epoch, history, NEW_RATE_ACTIVATION_EPOCH);
         if effective > 0 {
             *by_voter.entry(delegation.voter_pubkey).or_default() += effective;
         }

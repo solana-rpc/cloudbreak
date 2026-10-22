@@ -272,7 +272,8 @@ impl Comparator {
 mod tests {
     use super::*;
 
-    // Strings captured from Agave 4.2.2 (nyc205) and 4.3.0-rc.0 (fra286).
+    // Strings captured from Agave 4.2.2 (nyc205), 4.3.0-rc.0 (fra286) and 4.4.0-beta.0.
+    // The base64 text changed in 4.4: base64 0.23 prints DecodeError via Display, 0.22 derived it.
     #[test]
     fn test_invalid_param_text_matches_agave() {
         let oversized = RpcFilterType::Memcmp(Memcmp::new(
@@ -293,7 +294,7 @@ mod tests {
             RpcFilterType::Memcmp(Memcmp::new(0, MemcmpEncodedBytes::Base64("!!!!".into())));
         assert_eq!(
             bad_base64.verify().unwrap_err().invalid_param_text(),
-            "Base64DecodeError(InvalidByte(0, 33))"
+            "Base64DecodeError(Invalid symbol 33, offset 0.)"
         );
 
         // No Agave counterpart, so this one keeps its own Display text.
