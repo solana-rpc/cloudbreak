@@ -321,6 +321,9 @@ pub fn setup_metrics(config: &ApiConfig) -> anyhow::Result<()> {
             config.metrics.runtime_lag_probe_enabled,
         );
 
+        // Long-poll detector status (the hooks are installed when the runtime is built).
+        crate::modules::long_poll::log_status(config.metrics.long_poll_threshold_ms);
+
         if config.processed_accounts_enabled() {
             register!(CLOUDBREAK_API_PROCESSED_REQUESTS_TOTAL);
             register!(PROCESSED_CONFIRM_LATENCY_MS);

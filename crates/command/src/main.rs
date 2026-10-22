@@ -51,10 +51,22 @@ pub enum Commands {
     SnapshotDiff(hash_check::DiffArgs),
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let args = Cli::parse();
 
+    // Same runtime as `#[tokio::main]`; the API config can add task hooks before it is built.
+    let mut runtime = tokio::runtime::Builder::new_multi_thread();
+    runtime.enable_all();
+    if let Commands::Api = args.command {
+        cloudbreak_api::configure_runtime(&mut runtime, &args.config);
+    }
+    runtime
+        .build()
+        .expect("Failed building the Runtime")
+        .block_on(run(args))
+}
+
+async fn run(args: Cli) -> Result<()> {
     opentelemetry::init_tracer(&args.config);
 
     match args.command {

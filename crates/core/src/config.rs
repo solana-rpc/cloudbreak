@@ -694,6 +694,11 @@ pub struct MetricsConfig {
     /// threads that are too busy to poll ready tasks. Off by default.
     #[serde(rename = "runtime-lag-probe-enabled", default)]
     pub runtime_lag_probe_enabled: bool,
+
+    /// Log every Tokio task poll at or above this many milliseconds, with its spawn location.
+    /// Off when unset. Needs a build with `--cfg tokio_unstable`.
+    #[serde(rename = "long-poll-threshold-ms", default)]
+    pub long_poll_threshold_ms: Option<u64>,
 }
 
 impl MetricsConfig {

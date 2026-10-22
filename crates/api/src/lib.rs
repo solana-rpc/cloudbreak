@@ -28,6 +28,17 @@ mod modules;
 pub mod query_tracker_client;
 mod slot_syncronizer;
 
+/// Applies the API config's runtime options to the Tokio runtime `builder`, before it is built.
+/// A config that does not load changes nothing; `run` reports the error.
+pub fn configure_runtime(builder: &mut tokio::runtime::Builder, config: &str) {
+    let Ok(config) = ApiConfig::try_load(config) else {
+        return;
+    };
+    if let Some(threshold_ms) = config.metrics.long_poll_threshold_ms {
+        modules::long_poll::install(builder, Duration::from_millis(threshold_ms));
+    }
+}
+
 pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
     let config = ApiConfig::try_load(config)?;
     config.validate_processed_accounts()?;

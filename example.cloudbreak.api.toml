@@ -35,6 +35,10 @@ port = 8875
 # Optional runtime lag probe (`cloudbreak_api_runtime_lag_us`): shows Tokio worker
 # threads too busy to poll ready tasks. Off by default.
 # runtime-lag-probe-enabled = false
+# Optional long-poll detector: logs every Tokio task poll at or above this many
+# milliseconds, with the task's spawn location. Needs a build with
+# `--cfg tokio_unstable` (see .cargo/config.toml). Off when unset.
+# long-poll-threshold-ms = 50
 
 [query-tracker-client]
 endpoint = "http://localhost:4001"
