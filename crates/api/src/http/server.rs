@@ -118,7 +118,8 @@ async fn handle_request(
 ) -> Result<Response<UnsyncBoxBody<Bytes, io::Error>>, Infallible> {
     // Time the request's last received packet waited in the kernel and the runtime before this handler ran.
     if let Some(pre_handler_us) = last_rx.elapsed_us() {
-        tracing::Span::current().record("pre_handler_us", pre_handler_us);
+        // i64 so the OpenTelemetry exporter sends an integer attribute; a u64 arrives as a string.
+        tracing::Span::current().record("pre_handler_us", pre_handler_us as i64);
     }
     let request_start = Instant::now();
     let inflight_guard = metrics::InFlightRequestGuard::new("http");
