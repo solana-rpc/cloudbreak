@@ -315,6 +315,12 @@ pub fn setup_metrics(config: &ApiConfig) -> anyhow::Result<()> {
             config.metrics.client_ip_bandwidth_enabled,
         );
 
+        // Runtime lag probe. Optional, off by default.
+        crate::modules::runtime_lag::register(
+            &METRICS_REGISTRY,
+            config.metrics.runtime_lag_probe_enabled,
+        );
+
         if config.processed_accounts_enabled() {
             register!(CLOUDBREAK_API_PROCESSED_REQUESTS_TOTAL);
             register!(PROCESSED_CONFIRM_LATENCY_MS);

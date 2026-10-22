@@ -32,6 +32,9 @@ port = 8875
 # label and the span field reports "unconfigured" — no request header is read.
 # Set it to a trusted ingress header (e.g. "x-forwarded-for") to group by client IP.
 # client-ip-key = "x-forwarded-for"
+# Optional runtime lag probe (`cloudbreak_api_runtime_lag_us`): shows Tokio worker
+# threads too busy to poll ready tasks. Off by default.
+# runtime-lag-probe-enabled = false
 
 [query-tracker-client]
 endpoint = "http://localhost:4001"

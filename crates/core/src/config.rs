@@ -689,6 +689,11 @@ pub struct MetricsConfig {
     /// single placeholder label and the span field reports that placeholder.
     #[serde(rename = "client-ip-key", default)]
     pub client_ip_key: Option<String>,
+
+    /// Run the runtime lag probe (`cloudbreak_api_runtime_lag_us`), which shows Tokio worker
+    /// threads that are too busy to poll ready tasks. Off by default.
+    #[serde(rename = "runtime-lag-probe-enabled", default)]
+    pub runtime_lag_probe_enabled: bool,
 }
 
 impl MetricsConfig {
