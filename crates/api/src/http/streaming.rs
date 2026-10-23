@@ -59,7 +59,7 @@ pub async fn gpa_streaming_response_body(
     let _guard = metrics::InFlightRequestGuard::new("gpa_streaming");
     let mut accounts_stream = gpa_response.accounts_stream;
     let metrics_data = gpa_response.metrics_data;
-    let mut gpa_processor = gpa_response.gpa_processor;
+    let gpa_processor = gpa_response.gpa_processor;
     let program = gpa_response.program;
     let encoding = gpa_response.encoding;
 
@@ -72,12 +72,20 @@ pub async fn gpa_streaming_response_body(
     // Serialize the first batch before any byte is sent, so a failure here is still a
     // JSON-RPC error response.
     let first_batch_accounts = first_batch.len() as u64;
-    let mut first_batch_encode_ms = Duration::from_millis(0);
-    let processed_first_batch = process_first_gpa_batch(first_batch, &mut first_batch_encode_ms)
-        .map_err(|e| {
-            tracing::error!("Failed to serialize first batch: {e}");
-            RpcError::InternalError
-        })?;
+    let (processed_first_batch, first_batch_encode_ms) = tokio::task::spawn_blocking(move || {
+        let mut first_batch_encode_ms = Duration::from_millis(0);
+        process_first_gpa_batch(first_batch, &mut first_batch_encode_ms)
+            .map(|processed| (processed, first_batch_encode_ms))
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!("spawn_blocking join error: {e}");
+        RpcError::InternalError
+    })?
+    .map_err(|e| {
+        tracing::error!("Failed to serialize first batch: {e}");
+        RpcError::InternalError
+    })?;
 
     let streaming_response_body_wrapper =
         StreamingResponseBodyWrapper::new(gpa_response.context_slot, id);
@@ -99,10 +107,7 @@ pub async fn gpa_streaming_response_body(
             total_wall_time = tracing::field::Empty,
         );
 
-        let mut json_encode_ms = first_batch_encode_ms;
         let mut json_bytes = 0u64;
-        let mut total_cache_hits = 0u64;
-        let mut total_cache_bytes = 0u64;
         let mut accounts_count = first_batch_accounts;
         json_bytes += streaming_response_body_wrapper.start.len() as u64;
 
@@ -110,10 +115,20 @@ pub async fn gpa_streaming_response_body(
         yield Ok::<_, io::Error>(Frame::data(Bytes::from(streaming_response_body_wrapper.start)));
 
         let ProcessedFirstBatch {
-            mut buf,
-            mut pending_fresh,
-            mut pending_cached,
+            buf,
+            pending_fresh,
+            pending_cached,
         } = processed_first_batch;
+
+        let mut encoder = BatchEncoder {
+            buf,
+            pending_fresh,
+            pending_cached,
+            gpa_processor,
+            json_encode_ms: first_batch_encode_ms,
+            total_cache_hits: 0,
+            total_cache_bytes: 0,
+        };
 
         while let Some(item) = accounts_stream.next().await {
             let batch = match item {
@@ -133,72 +148,68 @@ pub async fn gpa_streaming_response_body(
 
             accounts_count += batch.len() as u64;
 
-            for acc in batch {
-                let account_start_time = Instant::now();
-                buf.put_u8(b',');
-
-                match acc {
-                    MaybeJsonAccount::Cached { pubkey, bytes } => {
-                        // Cache hit: append the pre-serialized bytes
-                        buf.extend_from_slice(&bytes);
-                        pending_cached.push((pubkey, bytes));
-                    }
-                    MaybeJsonAccount::Fresh(keyed) => {
-                        let start = buf.len();
-                        let write_result = {
-                            let mut w = (&mut buf).writer();
-                            serde_json::to_writer(&mut w, &keyed.account)
-                        };
-                        if let Err(e) = write_result {
-                            tracing::error!("Failed to serialize account in streaming body; aborting: {e}");
-                            metrics::CLOUDBREAK_API_REQUESTS_TOTAL
-                                .with_label_values(&["gPA", "error"])
-                                .inc();
-                            yield Err(io::Error::other(format!("account serialization failed: {e}")));
-                            return;
-                        }
-                        let end = buf.len();
-                        pending_fresh.push((keyed.pubkey, start..end));
-                    }
+            // Serialization does not yield, so each batch runs on the blocking pool.
+            let (returned, frames, write_error) = match tokio::task::spawn_blocking(move || {
+                let mut encoder = encoder;
+                let (frames, write_error) = encoder.encode_batch(batch);
+                (encoder, frames, write_error)
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    tracing::error!("spawn_blocking join error in streaming body; aborting: {e}");
+                    metrics::CLOUDBREAK_API_REQUESTS_TOTAL
+                        .with_label_values(&["gPA", "error"])
+                        .inc();
+                    yield Err(io::Error::other(format!("account serialization task failed: {e}")));
+                    return;
                 }
+            };
+            encoder = returned;
 
-                json_encode_ms += account_start_time.elapsed();
+            for frozen in frames {
+                json_bytes += frozen.len() as u64;
+                yield Ok(Frame::data(frozen));
+            }
 
-                if buf.len() >= STREAM_FLUSH_THRESHOLD {
-                    let frozen = buf.split().freeze();
-                    json_bytes += frozen.len() as u64;
-
-                    let drained = drain_pending_into_cache(
-                        &frozen,
-                        &mut pending_fresh,
-                        &mut pending_cached,
-                        &mut gpa_processor,
-                    );
-                    total_cache_hits += drained.cache_hits;
-                    total_cache_bytes += drained.cache_bytes;
-
-                    if buf.capacity() < STREAM_BUFFER_PREALLOC {
-                        buf.reserve(STREAM_BUFFER_PREALLOC - buf.capacity());
-                    }
-
-                    yield Ok(Frame::data(frozen));
-                }
+            if let Some(e) = write_error {
+                tracing::error!("Failed to serialize account in streaming body; aborting: {e}");
+                metrics::CLOUDBREAK_API_REQUESTS_TOTAL
+                    .with_label_values(&["gPA", "error"])
+                    .inc();
+                yield Err(io::Error::other(format!("account serialization failed: {e}")));
+                return;
             }
         }
 
-        if !buf.is_empty() {
-            let frozen = buf.split().freeze();
+        let (returned, last_frame) = match tokio::task::spawn_blocking(move || {
+            let mut encoder = encoder;
+            let last_frame = encoder.flush_remaining();
+            (encoder, last_frame)
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::error!("spawn_blocking join error in streaming body; aborting: {e}");
+                metrics::CLOUDBREAK_API_REQUESTS_TOTAL
+                    .with_label_values(&["gPA", "error"])
+                    .inc();
+                yield Err(io::Error::other(format!("account serialization task failed: {e}")));
+                return;
+            }
+        };
+        let BatchEncoder {
+            mut gpa_processor,
+            json_encode_ms,
+            total_cache_hits,
+            total_cache_bytes,
+            ..
+        } = returned;
+
+        if let Some(frozen) = last_frame {
             json_bytes += frozen.len() as u64;
-
-            let drained = drain_pending_into_cache(
-                &frozen,
-                &mut pending_fresh,
-                &mut pending_cached,
-                &mut gpa_processor,
-            );
-            total_cache_hits += drained.cache_hits;
-            total_cache_bytes += drained.cache_bytes;
-
             yield Ok(Frame::data(frozen));
         }
 
@@ -243,6 +254,92 @@ struct ProcessedFirstBatch {
     buf: BytesMut,
     pending_fresh: Vec<(Pubkey, Range<usize>)>,
     pending_cached: Vec<(Pubkey, Bytes)>,
+}
+
+/// Body serialization state after the first batch. The stream moves it into the
+/// blocking pool for each batch and takes it back with the frames.
+struct BatchEncoder {
+    buf: BytesMut,
+    pending_fresh: Vec<(Pubkey, Range<usize>)>,
+    pending_cached: Vec<(Pubkey, Bytes)>,
+    gpa_processor: crate::modules::cache::GpaProcessor,
+    json_encode_ms: Duration,
+    total_cache_hits: u64,
+    total_cache_bytes: u64,
+}
+
+impl BatchEncoder {
+    /// Appends `batch` to the buffer and returns every chunk that reached
+    /// `STREAM_FLUSH_THRESHOLD`, plus the write error that stopped it, if any.
+    fn encode_batch(
+        &mut self,
+        batch: Vec<MaybeJsonAccount>,
+    ) -> (Vec<Bytes>, Option<serde_json::Error>) {
+        let mut frames = Vec::new();
+
+        for acc in batch {
+            let account_start_time = Instant::now();
+            self.buf.put_u8(b',');
+
+            match acc {
+                MaybeJsonAccount::Cached { pubkey, bytes } => {
+                    // Cache hit: append the pre-serialized bytes
+                    self.buf.extend_from_slice(&bytes);
+                    self.pending_cached.push((pubkey, bytes));
+                }
+                MaybeJsonAccount::Fresh(keyed) => {
+                    let start = self.buf.len();
+                    let write_result = {
+                        let mut w = (&mut self.buf).writer();
+                        serde_json::to_writer(&mut w, &keyed.account)
+                    };
+                    if let Err(e) = write_result {
+                        return (frames, Some(e));
+                    }
+                    let end = self.buf.len();
+                    self.pending_fresh.push((keyed.pubkey, start..end));
+                }
+            }
+
+            self.json_encode_ms += account_start_time.elapsed();
+
+            if self.buf.len() >= STREAM_FLUSH_THRESHOLD {
+                let frozen = self.buf.split().freeze();
+                self.drain(&frozen);
+
+                if self.buf.capacity() < STREAM_BUFFER_PREALLOC {
+                    self.buf
+                        .reserve(STREAM_BUFFER_PREALLOC - self.buf.capacity());
+                }
+
+                frames.push(frozen);
+            }
+        }
+
+        (frames, None)
+    }
+
+    /// Returns what is left in the buffer as the last chunk of the array.
+    fn flush_remaining(&mut self) -> Option<Bytes> {
+        if self.buf.is_empty() {
+            return None;
+        }
+
+        let frozen = self.buf.split().freeze();
+        self.drain(&frozen);
+        Some(frozen)
+    }
+
+    fn drain(&mut self, frozen: &Bytes) {
+        let drained = drain_pending_into_cache(
+            frozen,
+            &mut self.pending_fresh,
+            &mut self.pending_cached,
+            &mut self.gpa_processor,
+        );
+        self.total_cache_hits += drained.cache_hits;
+        self.total_cache_bytes += drained.cache_bytes;
+    }
 }
 
 fn process_first_gpa_batch(
@@ -372,5 +469,84 @@ impl StreamingResponseBodyWrapper {
         };
 
         Self { start, end }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use http_body_util::BodyExt;
+    use solana_account_decoder_client_types::{UiAccount, UiAccountData, UiAccountEncoding};
+    use solana_rpc_client_api::response::RpcKeyedAccount;
+
+    use super::*;
+    use crate::modules::cache::{GpaProcessor, KeyedRpcAccount};
+
+    /// Builds `batches` of `per_batch` accounts (every third one pre-serialized as a
+    /// cache hit) and returns the body and the expected `value` array.
+    async fn render(batches: usize, per_batch: usize) -> (serde_json::Value, serde_json::Value) {
+        let mut expected = Vec::new();
+        let mut stream_items: Vec<Result<Vec<MaybeJsonAccount>, RpcError>> = Vec::new();
+        for b in 0..batches {
+            let mut batch = Vec::new();
+            for j in 0..per_batch {
+                let i = b * per_batch + j;
+                let pubkey = Pubkey::from([(i % 251) as u8; 32]);
+                let account = RpcKeyedAccount {
+                    pubkey: pubkey.to_string(),
+                    account: UiAccount {
+                        lamports: i as u64,
+                        data: UiAccountData::Binary("A".repeat(500), UiAccountEncoding::Base64),
+                        owner: Pubkey::default().to_string(),
+                        executable: false,
+                        rent_epoch: 0,
+                        space: Some(375),
+                    },
+                };
+                expected.push(serde_json::to_value(&account).unwrap());
+                batch.push(if i.is_multiple_of(3) {
+                    let bytes = Bytes::from(serde_json::to_vec(&account).unwrap());
+                    MaybeJsonAccount::Cached { pubkey, bytes }
+                } else {
+                    MaybeJsonAccount::Fresh(KeyedRpcAccount { pubkey, account })
+                });
+            }
+            stream_items.push(Ok(batch));
+        }
+
+        let response = GpaStreamingResponse {
+            accounts_stream: Box::pin(futures::stream::iter(stream_items)),
+            metrics_data: None,
+            context_slot: Some(7),
+            gpa_processor: GpaProcessor::Standard,
+            program: Pubkey::default(),
+            encoding: UiAccountEncoding::Base64,
+        };
+        let ctx = Arc::new(RequestContext {
+            subscription_id: "sub".into(),
+            request_id: "req".into(),
+            client_ip: "ip".into(),
+        });
+
+        let body = gpa_streaming_response_body(serde_json::json!(1), response, Instant::now(), ctx)
+            .await
+            .unwrap();
+        let bytes = body.collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        (json, serde_json::Value::Array(expected))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn body_keeps_every_account_in_order_across_batches_and_flushes() {
+        // ~650 bytes per account, so every batch of 100 crosses the 32 KB flush threshold.
+        for (batches, per_batch) in [(4, 100), (1, 300), (0, 0)] {
+            let (json, expected) = render(batches, per_batch).await;
+            assert_eq!(json["jsonrpc"], "2.0");
+            assert_eq!(json["id"], 1);
+            assert_eq!(json["result"]["context"]["slot"], 7);
+            assert_eq!(
+                json["result"]["value"], expected,
+                "batches={batches} per_batch={per_batch}"
+            );
+        }
     }
 }
