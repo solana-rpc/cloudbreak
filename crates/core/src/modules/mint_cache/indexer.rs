@@ -39,6 +39,9 @@ pub(super) struct Inner {
     pub(super) pending_to_db: HashMap<Pubkey, u64>,
     /// The highest slot applied.
     pub(super) last_slot: u64,
+    /// The lowest slot self-healing still has to repair, as of the last block. `last_db_slot`
+    /// stays below it: the API never reloads rows at or below `last_db_slot`.
+    pub(super) lowest_gap: Option<u64>,
     /// The slot `mints` is complete through. `None` until the bootstrap wrote the table.
     pub(super) last_db_slot: Option<u64>,
     /// True while a write to `mints` runs in the background. A new write waits until it ends:
@@ -79,6 +82,15 @@ impl Inner {
             .collect()
     }
 
+    /// The slot `mints` is complete through once the pending rows are written: the highest
+    /// slot applied, but never at or past an open gap.
+    fn complete_through(&self) -> u64 {
+        match self.lowest_gap {
+            Some(gap) => self.last_slot.min(gap.saturating_sub(1)),
+            None => self.last_slot,
+        }
+    }
+
     /// Takes the rows for a background write, when one is due: while bootstrapping once
     /// `pending_to_db` fills a chunk (no `last_db_slot` yet), after it once
     /// `db-write-interval-slots` passed since `last_db_slot`. Returns the rows and the
@@ -94,8 +106,10 @@ impl Inner {
         let new_last_db_slot = match self.last_db_slot {
             None if self.pending_to_db.len() >= UPSERT_CHUNK => None,
             None => return None,
-            Some(last_db_slot) if self.last_slot >= last_db_slot + self.db_write_interval_slots => {
-                Some(self.last_slot)
+            Some(last_db_slot)
+                if self.complete_through() >= last_db_slot + self.db_write_interval_slots =>
+            {
+                Some(self.complete_through())
             }
             Some(_) => return None,
         };
@@ -125,6 +139,7 @@ impl MintCacheIndexer {
             closed_pending: Some(HashMap::new()),
             pending_to_db: HashMap::new(),
             last_slot: 0,
+            lowest_gap: None,
             last_db_slot: None,
             db_write_running: false,
             db_write_interval_slots: config.db_write_interval_slots,
@@ -184,7 +199,7 @@ impl MintCacheIndexer {
                 state.apply(pubkey, slot, MintChange::Closed);
             }
             state.db_write_running = true;
-            (state.take_pending_rows(), state.last_slot)
+            (state.take_pending_rows(), state.complete_through())
         };
         write(db, &closed_pending, Some(new_last_db_slot), None).await?;
 
@@ -205,11 +220,13 @@ impl MintCacheIndexer {
 
     /// Applies a confirmed block's mint writes. Every `db-write-interval-slots` slots it starts
     /// a background write of the changed mints to the `mints` table; a failed write is retried with the next block.
+    /// `lowest_gap` is the lowest slot self-healing still repairs; `last_db_slot` stays below it.
     pub fn on_block(
         &self,
         db: &DatabaseConnection,
         slot: u64,
         accounts: &[SubscribeUpdateAccountInfo],
+        lowest_gap: Option<u64>,
         query_timeout_secs: u64,
     ) {
         let Some(inner) = &self.0 else {
@@ -230,6 +247,7 @@ impl MintCacheIndexer {
         let started = Instant::now();
         let due_write = {
             let mut state = lock(inner);
+            state.lowest_gap = lowest_gap;
             state.last_slot = state.last_slot.max(slot);
 
             // The changes counts from this block, by kind (`create`, `update`, `close`, `reinit`).
@@ -415,6 +433,27 @@ mod tests {
         let (rows, new_last_db_slot) = state.start_write_if_needed().unwrap();
         assert_eq!((rows.len(), new_last_db_slot), (UPSERT_CHUNK, None));
         assert!(state.db_write_running);
+    }
+
+    #[test]
+    fn last_db_slot_never_passes_an_open_gap() {
+        let inner = inner();
+        let mut state = lock(&inner);
+        state.last_db_slot = Some(900);
+        state.last_slot = 1_500;
+        // Slots from 1000 still wait for repair: the table is complete through 999 only.
+        state.lowest_gap = Some(1_000);
+        let (_, new_last_db_slot) = state.start_write_if_needed().unwrap();
+        assert_eq!(new_last_db_slot, Some(999));
+        state.db_write_running = false;
+        state.last_db_slot = Some(999);
+        // While the gap stays open, nothing moves `last_db_slot`.
+        state.last_slot = 2_000;
+        assert!(state.start_write_if_needed().is_none());
+        // Repaired: the next write covers everything applied.
+        state.lowest_gap = None;
+        let (_, new_last_db_slot) = state.start_write_if_needed().unwrap();
+        assert_eq!(new_last_db_slot, Some(2_000));
     }
 
     #[test]

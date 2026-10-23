@@ -865,7 +865,7 @@ Set `[gpa-cache]` in the API config to enable an in-memory cache for `getProgram
 - A close can arrive before the mint it closes (in a snapshot file or block read earlier). Until the bootstrap ends, such a close waits in `closed_pending` and is applied at the end.
 - When the snapshot is loaded, the indexer writes every change not yet in `mints`, then `environment_info.mints_saved_slot` (`last_db_slot`): the slot the table is complete through. The node turns healthy only after this.
 - For each confirmed block, the indexer compares every mint write and every zero-lamport write with its copy, and keeps the real changes for the next write: a new mint, a decimals or config change, a close, a re-init. A supply-only change is skipped.
-- Every `db-write-interval-slots` slots, a background task writes the changed mints, then `last_db_slot`. One write runs at a time. A failed write is retried with the next block. An upsert never overwrites a row with a newer slot.
+- Every `db-write-interval-slots` slots, a background task writes the changed mints, then `last_db_slot`. `last_db_slot` never passes a slot that self-healing still has to repair: an API that loads or reloads during an indexer gap then reads the repaired rows once the gap is filled. One write runs at a time. A failed write is retried with the next block. An upsert never overwrites a row with a newer slot.
 
 **The `mints` table**
 

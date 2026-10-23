@@ -28,7 +28,7 @@ pub async fn save_block(
 ) {
     let IndexerState {
         snapshot_processing_state,
-        self_healing_state: _,
+        self_healing_state,
         slot_finalizer,
         updated_accounts_during_startup,
         buffer_channel_rx_len: _,
@@ -100,6 +100,7 @@ pub async fn save_block(
         db,
         slot,
         &block.accounts,
+        self_healing_state.lowest_gap(),
         config.database.save_block_queries_timeout,
     );
 
