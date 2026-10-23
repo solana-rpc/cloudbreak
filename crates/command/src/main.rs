@@ -51,8 +51,19 @@ pub enum Commands {
     SnapshotDiff(hash_check::DiffArgs),
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// The API holds one blocking thread per gPA in its DB phase; keep the cap above the DB pool size.
+const MAX_BLOCKING_THREADS: usize = 1024;
+
+fn main() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(MAX_BLOCKING_THREADS)
+        .build()
+        .expect("Failed building the Runtime")
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     let args = Cli::parse();
 
     opentelemetry::init_tracer(&args.config);
