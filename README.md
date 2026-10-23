@@ -339,6 +339,15 @@ Maintains the running total-supply figure served by `getSupply` from the non-cir
 | `enabled`             | `bool`  | `false`     | Enables the supply tracker.                                                                      |
 | `hot-accounts`        | `usize` | `1000000`   | Accounts kept resident in the hot-accounts cache (~65 bytes each). Stake accounts live in the non-circulating stake map instead. |
 
+#### `[mint-cache]` (optional)
+
+Fills and maintains the `mints` table that the API `[mint-cache]` loads. See [Mint Cache](#mint-cache). Requires the `[snapshot]` section and both token programs in `[programs]`; the indexer panics at startup otherwise.
+
+| Key              | Type    | Default       | Description                                                                               |
+| ---------------- | ------- | ------------- | ----------------------------------------------------------------------------------------- |
+| `enabled`        | `bool`  | `false`       | Enable the indexer half of the mint cache.                                                |
+| `db-write-interval-slots` | `u64` | `1000` | Slots between two writes of the changed mints to `mints`. A larger value keeps the API reading mutable mints from Postgres longer after a gap. |
+
 #### `[snapshot]` (optional)
 
 When this section is present, the indexer downloads and processes snapshots on startup for fast bootstrapping.
@@ -532,25 +541,49 @@ Example:
 processed-commitment = "use-confirmed"
 ```
 
+#### `[grpc]` (optional)
+
+The API gRPC feed: one Yellowstone subscription to blocks with accounts at processed commitment. It runs when `[processed-accounts]` or `[mint-cache]` is enabled, and feeds both. It uses the indexer's subscription code (`cloudbreak_core::modules::grpc`): the same reconnection, `from_slot` replay, and panic after `reconnect-give-up`. The connection fields default to the values the indexer runs with.
+
+| Field                        | Type       | Default  | Description                                                                         |
+| ---------------------------- | ---------- | -------- | ----------------------------------------------------------------------------------- |
+| `enabled`                    | `bool`     | `false`  | Enable the feed.                                                                    |
+| `endpoint`                   | `string`   | `""`     | Yellowstone gRPC endpoint that allows processed commitment.                         |
+| `x-token`                    | `string`   | none     | Yellowstone gRPC access token.                                                      |
+| `timeout`                    | `u64`      | `60`     | Connection timeout in seconds.                                                      |
+| `max-grpc-errors`            | `usize`    | `1`      | Max gRPC errors before attempting reconnection (always reconnects on stream `None`). |
+| `reconnect-give-up`          | `Duration` | `"600s"` | How long to keep retrying (re)connection/subscription before the API panics.        |
+| `reconnect-backoff`          | `Duration` | `"5s"`   | Delay between (re)connection/subscription attempts.                                 |
+| `reconnect-from-slot-retain` | `Duration` | `"300s"` | How long a reconnection keeps replaying from the last received slot.                |
+
+#### `[mint-cache]` (optional)
+
+Keeps the mint data `jsonParsed` needs in memory. See [Mint Cache](#mint-cache). Requires `[grpc]` and `[slot-syncronizer]`, both with `enabled = true`, and the indexer's `[mint-cache]`. Startup fails without `[grpc]` and `[slot-syncronizer]`.
+
+| Field            | Type    | Default       | Description                                                                                   |
+| ---------------- | ------- | ------------- | --------------------------------------------------------------------------------------------- |
+| `enabled`        | `bool`  | `false`       | Enable the mint cache.                                                                        |
+
 #### `[processed-accounts]` (optional)
 
 Serves `processed` commitment for `getAccountInfo`, `getMultipleAccounts`, `getBalance`, `getTokenAccountBalance`, `getTokenSupply` and `getSlot`. The API subscribes to Yellowstone blocks at processed commitment and keeps the blocks around the Postgres confirmed slot in memory. A key written in those blocks is answered from memory. Any other key reads Postgres at the confirmed slot. When the blocks cannot be linked to the confirmed slot, a processed request answers exactly as a confirmed request would, even with `processed-commitment = "reject"`. Other methods keep following `processed-commitment`.
 
-Requires `[slot-syncronizer]` with `enabled = true`. Startup fails without it. Each API instance carries its own block feed.
+Requires `[grpc]` and `[slot-syncronizer]`, both with `enabled = true`. Startup fails without them. Each API instance carries its own block feed.
 
-| Field      | Type     | Default | Description                                                               |
-| ---------- | -------- | ------- | ------------------------------------------------------------------------- |
-| `enabled`  | `bool`   | `false` | Enable processed commitment for the methods above.                        |
-| `endpoint` | `string` | `""`    | Yellowstone gRPC endpoint that allows processed commitment and interslot updates. |
-| `x-token`  | `string` | none    | Yellowstone gRPC access token.                                            |
+| Field     | Type   | Default | Description                                        |
+| --------- | ------ | ------- | -------------------------------------------------- |
+| `enabled` | `bool` | `false` | Enable processed commitment for the methods above. |
 
 Example:
 
 ```toml
-[processed-accounts]
+[grpc]
 enabled = true
 endpoint = "https://grpc.example:443"
 x-token = "..."
+
+[processed-accounts]
+enabled = true
 ```
 
 #### `unhealthy-response` (top-level, optional)
@@ -822,6 +855,55 @@ The API can operate with or without the query tracker. To disable it, remove the
 
 Set `[gpa-cache]` in the API config to enable an in-memory cache for `getProgramAccounts` responses. The cache stores pre-serialized JSON bytes (ref-counted, zero-copy on hits) and changes the SQL to skip re-sending the body of already-cached accounts. See [`[gpa-cache]` (optional)](#gpa-cache-optional) for the config keys and a benefits breakdown. Omit the section to disable.
 
+### Mint Cache
+
+`jsonParsed` token responses need each account's mint decimals and the mint's interest-bearing and scaled-UI configs. The mint cache keeps that data in memory. `getTokenAccountsByOwner`, `getTokenAccountsByDelegate`, `getTokenAccountsByMint` and token-program `getProgramAccounts` then read it without a Postgres lookup. Enable `[mint-cache]` on the indexer and on the API.
+
+**Indexer**
+
+- The indexer keeps every mint in memory, immutable ones included (without them, every mint or burn of one would look like a new mint and rewrite its row). While the startup snapshot loads, each snapshot mint and close goes into the in-memory copy, and every 50,000 changed keys are written to `mints` in the background. Confirmed blocks that arrive meanwhile go into the same copy. Per mint, the higher slot wins, so files and blocks can arrive in any order.
+- A close can arrive before the mint it closes (in a snapshot file or block read earlier). Until the bootstrap ends, such a close waits in `closed_pending` and is applied at the end.
+- When the snapshot is loaded, the indexer writes every change not yet in `mints`, then `environment_info.mints_saved_slot` (`last_db_slot`): the slot the table is complete through. The node turns healthy only after this.
+- For each confirmed block, the indexer compares every mint write and every zero-lamport write with its copy, and keeps the real changes for the next write: a new mint, a decimals or config change, a close, a re-init. A supply-only change is skipped.
+- Every `db-write-interval-slots` slots, a background task writes the changed mints, then `last_db_slot`. `last_db_slot` never passes a slot that self-healing still has to repair: an API that loads or reloads during an indexer gap then reads the repaired rows once the gap is filled. One write runs at a time. A failed write is retried with the next block. An upsert never overwrites a row with a newer slot.
+
+**The `mints` table**
+
+One row per mint: `pubkey`, `slot` (the slot of the last change), `decimals`, `mutable`, `closed`, `interest_bearing_config`, `scaled_ui_amount_config`, and an index on `slot`.
+
+A Tokenkeg mint, or a Token-2022 mint without `MintCloseAuthority`, `InterestBearingConfig` and `ScaledUiAmount`, is immutable: nothing `jsonParsed` reads can change. The cache keeps only its decimals, with no slot. Every other mint is mutable and keeps the slot of its last change.
+
+**Tombstones**
+
+A close is stored as a row with `closed = true` and the close slot. The row is never deleted, for four reasons:
+
+1. The API reload `WHERE slot > applied_through` must see a close the API missed. A deleted row returns nothing. The API would then keep the closed mint and return decimals where Agave drops the account.
+2. At API startup, a close the API applied from its buffer must beat an older live row of the table. The tombstone keeps its slot, so the higher slot wins.
+3. A re-init at the same address updates the tombstone row with a higher slot. It needs no special case.
+4. A loaded tombstone answers "closed" from memory, without a Postgres lookup.
+
+Tombstones are not pruned. If pruning is added later, the API must know the pruning horizon and do a full reload when its `applied_through` is below it.
+
+**API**
+
+- The `[grpc]` feed buffers the mint changes of every processed block, by slot and blockhash.
+- On each confirmed `slots` notification, the slot syncronizer first applies the buffered changes of that block and its unapplied ancestors, then publishes the slot. The cache is current through every slot a request can pick.
+- When a block is missing from the buffer, the slot syncronizer asks a background task for a reload and goes on. The task reads `last_db_slot` every 10 s. Once it covers the slot, the task reads `WHERE slot > applied_through` from `mints`, and the cache is current through `last_db_slot`. Until then, requests past `applied_through` read mutable mints from Postgres.
+- At startup, the background task waits until `last_db_slot` is set (the indexer bootstrap wrote the table), reads it, and only then loads the whole table in pages of 100,000 rows (each page one short query, so `api-queries-timeout` applies). The loaded rows hold at least every change through that slot, and the buffer holds the blocks after it. Until the load ends, every lookup reads Postgres.
+- When the indexer turns healthy again after a gap repair, the API reloads the rows changed since it turned unhealthy, in the same background task, once `last_db_slot` covers the confirmed slot.
+
+**Lookups**
+
+Each request picks its slot once and uses it for its accounts and its mints.
+
+| Cache entry                                        | Answer                                                                                       |
+| -------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| Immutable                                          | Memory.                                                                                      |
+| Mutable or tombstone, slot at or below request slot | Memory. A tombstone answers "closed": the account gets no decimals, as in Agave.            |
+| Mutable or tombstone, slot above the request slot  | Postgres at the request slot. The mint changed after the request picked its slot.           |
+| Missing                                            | Postgres, with a warning. While live this means a bug or an indexer gap.                    |
+| Cache behind the request slot, or still loading    | Postgres for mutable and missing mints.                                                      |
+
 ### OpenTelemetry Tracing
 
 Add a `[tracing]` section to any service config to enable OTLP trace export. When omitted, only standard `tracing-subscriber` logging is used.
@@ -841,6 +923,7 @@ Each service exposes HTTP endpoints on its metrics port (or server port for the 
 | `/debug/log_filter`                | GET    | Returns the current `tracing` log filter.                                                                                                                                                                                                                                                                                                                                  |
 | `/debug/log_filter?filter=<value>` | GET    | Dynamically updates the log filter at runtime without restarting the service. Example: `curl "http://localhost:4000/debug/log_filter?filter=debug,hyper=warn"`                                                                                                                                                                                                             |
 | `/debug/modules/gpa_cache`         | GET    | Inspects the live GPA cache. Supports `?detail=summary\|queries\|full`, `?program=<pubkey>`, `?with_pubkeys=true`, `?min_size_bytes`, `?max_size_bytes`, `?limit`. Returns `{"enabled": false}` when `[gpa-cache]` is not configured. See the rustdoc on `gpa_cache_handler` in `crates/api/src/http/operational_endpoints.rs` for the full query-parameter and response-body reference. |
+| `/debug/modules/mint_cache`       | GET    | Inspects the API mint cache: status, `applied_through`, `unhealthy_since`, the reload waiting for `last_db_slot` (`pending_reload`), entry counts and the buffer. Load time and reload counts are in the `cloudbreak_mint_cache_*` metrics. `?pubkey=<base58>` adds one mint's map (`immutable`, `mutable`, `tombstone`, `missing`), slot (`null` for an immutable entry), closed state and decimals. Returns `{"enabled": false}` without `[mint-cache]`. See the rustdoc on `mint_cache_handler` in `crates/api/src/http/operational_endpoints.rs`. |
 
 ### Indexer (default metrics port `:8875`)
 
@@ -850,6 +933,7 @@ Each service exposes HTTP endpoints on its metrics port (or server port for the 
 | `/debug/modules/finalizer`    | GET    | Inspects the live slot finalizer (confirmed-but-not-finalized blocks map, ordered pending queue, pause state). Returns JSON with the DB chain tips (`confirmed`/`finalized` + lag). Supports `?detail=summary\|slots\|full`, `?kind=all\|live\|repaired`, `?min_slot`, `?max_slot`, `?limit`, `?with_pubkeys=true`. See the rustdoc on `handle` in `crates/index/src/operational_endpoints/finalizer.rs` for the full reference.                       |
 | `/debug/modules/self_healing` | GET    | Inspects self-healing gap state. Returns JSON with the DB chain tips and the still-missing slots grouped into gaps (each with `boundary_slot`, `start`/`end`, `len`, and `slots_behind_confirmed`). Supports `?detail=summary\|slots\|full` (`summary` returns only the `stats` counts, omitting the gap list), plus `?min_slot`, `?max_slot`, `?limit` to filter the gap view. See the rustdoc on `handle` in `crates/index/src/operational_endpoints/self_healing.rs`.                                                                                                                   |
 | `/debug/modules/supply`       | GET    | Inspects the live supply tracker: status, total, slot, startup slot, gap-close count, and the hot-accounts cache counters (hot, pinned, capacity, cap, last sweep slot). Supports `?detail=full&pubkey=<base58>` for one cache entry. Returns `{"enabled": false}` when `[supply]` is not configured. See the rustdoc on `handle` in `crates/index/src/operational_endpoints/supply.rs`.                                                                                                                                                              |
+| `/debug/modules/mint_cache`   | GET    | Inspects the indexer half of the mint cache: `last_db_slot` (`null` until the bootstrap wrote `mints`), `last_slot`, entry counts, closes waiting for their mint (`closed_pending`, `null` after the bootstrap), keys waiting for the next write (`pending_to_db`), whether a write runs, and the last block's changes by kind. The bootstrap write time is the `cloudbreak_mint_cache_startup_seconds{side="indexer"}` metric. `?pubkey=<base58>` adds one mint's map, slot, closed state and decimals. Returns `{"enabled": false}` without `[mint-cache]`. See the rustdoc on `handle` in `crates/index/src/operational_endpoints/mint_cache.rs`. |
 | `/debug/modules/non_circulating` | GET | Inspects the live non-circulating tracker: status, slot, clock, member count, running non-circulating lamports, stake map size, the sizes and heads of the two lockup-expiry sets (`?limit=` heads each, default 10). Supports `?detail=full&pubkey=<base58>` for one stake map entry. Returns `{"enabled": false}` when neither `[largest-accounts]` nor `[supply]` is configured. See the rustdoc on `handle` in `crates/index/src/operational_endpoints/non_circulating.rs`.                                                                                        |
 | `/debug/accounts_owner_map`   | GET    | Returns debug info about the in-memory account-to-owner map. Only populated when `accounts-owner-map-enabled = true` in the indexer config.                                                                                            |
 
@@ -900,6 +984,15 @@ All metrics are emitted in the Prometheus text exposition format on each service
 | `cloudbreak_gpa_cache_skipped_total`                 | Counter           | `method`, `bytes`, `reason` | Responses large enough to cache (`min-bytes-per-query`) that were not cached. `method` is the request label (`gpa`, `gpa_mint`, `gpa_delegate`, `gpa_token`, `gtabo`, `gtabd`, `gtabm`), `bytes` the response-size bucket. `reason` is `mutable_mint` (a `jsonParsed` token account uses a mint with close authority, interest-bearing or scaled-UI config, or a missing mint) or `dropped_account` (a `jsonParsed` token account did not parse and was left out). |
 | `cloudbreak_api_processed_requests_total`            | Counter           | `method`, `route`, `reason` | Processed commitment requests for the methods `[processed-accounts]` serves. `route` is `view` when the processed blocks answer, `degraded` when the request reads as confirmed. `reason` is `none`, `no_blocks`, `unhealthy`, `head_behind` or `finalized_above_anchor`. Registered only when `[processed-accounts]` is enabled. |
 | `cloudbreak_api_processed_confirm_latency_ms`         | Histogram         | —                      | Time from receiving a processed block to the Postgres confirmed slot reaching it, in milliseconds. Registered only when `[processed-accounts]` is enabled. |
+| `cloudbreak_mint_cache_entries`                      | IntGaugeVec       | `side`, `map`          | Mint cache entries: `immutable`, `mutable`, `tombstone`. `side` is `api` here and `indexer` on the indexer. Registered only with `[mint-cache]`. |
+| `cloudbreak_mint_cache_changes_per_block`            | HistogramVec      | `side`, `kind`         | Mint changes applied per confirmed block: `create`, `update`, `close`, `reinit`. |
+| `cloudbreak_mint_cache_block_microseconds`           | HistogramVec      | `side`, `stage`        | Mint cache time in microseconds. API stages: `ingest` (feed thread), `apply` (confirmed notification). Reloads run in a background task. |
+| `cloudbreak_mint_cache_startup_seconds`              | GaugeVec          | `side`                 | API: duration of the full `mints` load at startup. |
+| `cloudbreak_mint_cache_lookups_total`                | IntCounterVec     | `source`, `reason`     | Mint lookups. `source="memory"` with `reason` `hit` or `closed`; `source="postgres"` with `loading`, `newer_than_request`, `behind` or `missing`. `missing` while live also logs a warning. |
+| `cloudbreak_mint_cache_reloads_total`                | IntCounterVec     | `reason`, `result`     | Reloads of `WHERE slot > applied_through`, run by a background task once `last_db_slot` covers the slot. `reason`: `block_missing` (the feed lagged or had a gap), `health_restored` (after an indexer gap). `result`: `ok`, `error`. |
+| `cloudbreak_mint_cache_buffer_blocks`                | IntGauge          | —                      | Blocks waiting in the mint buffer for their confirmed notification. |
+| `cloudbreak_mint_cache_applied_through`              | IntGauge          | —                      | Last confirmed slot applied to the mint cache. |
+| `cloudbreak_grpc_errors`, `cloudbreak_grpc_timeout_errors`, `cloudbreak_grpc_total_updates_received`, `cloudbreak_grpc_buffer_channel_size_sender` | Counter / IntGauge | — | The `[grpc]` feed, with the same meaning as the indexer metrics of the same name. Registered only when `[grpc]` is enabled. |
 
 ### Indexer (`cloudbreak-index`)
 
@@ -941,6 +1034,12 @@ All metrics are emitted in the Prometheus text exposition format on each service
 | `cloudbreak_non_circulating_block_microseconds`      | Histogram         | —             | Per-block non-circulating time in microseconds: the stake map apply plus the lockup-expiry pop. Only emitted when `[largest-accounts]` or `[supply]` is enabled.                                                                                                                                                                                                                                                                                                                                             |
 | `cloudbreak_non_circulating_members`                 | IntGauge          | —             | Current non-circulating member count, set on the bootstrap flip and on every block that changed membership.                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `cloudbreak_non_circulating_changes_total`           | IntCounterVec     | `kind`        | Non-circulating membership changes, labelled `join` and `leave`.                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `cloudbreak_mint_cache_entries`                      | IntGaugeVec       | `side`, `map` | Entries of the indexer's mint store (`side="indexer"`): `immutable`, `mutable`, `tombstone`. Only with `[mint-cache]`. |
+| `cloudbreak_mint_cache_changes_per_block`            | HistogramVec      | `side`, `kind` | Mint changes per confirmed block, kept for the next write to `mints`: `create`, `update`, `close`, `reinit`. |
+| `cloudbreak_mint_cache_block_microseconds`           | HistogramVec      | `side`, `stage` | Mint cache indexer time in microseconds: `classify` and `apply` per block, `write` per write to `mints`. |
+| `cloudbreak_mint_cache_startup_seconds`              | GaugeVec          | `side`        | Indexer: duration of the final `mints` write of the bootstrap. |
+| `cloudbreak_mint_cache_unchanged_writes_total`       | IntCounter        | —             | Mint writes that changed nothing `jsonParsed` reads (supply only). |
+| `cloudbreak_mint_cache_db_write_errors_total`        | IntCounter        | —             | Failed writes to `mints`. The rows are retried with the next write. |
 
 ### Snapshot (`cloudbreak-snapshot`)
 
@@ -1056,6 +1155,28 @@ See [`docs/benchmarks/README.md`](docs/benchmarks/README.md) for the full write-
 cargo build
 cargo build --release
 ```
+
+### Optional modules
+
+New optional modules follow two rules. The mint cache is the reference: `MintCacheConfig` in `crates/core/src/config.rs`, `MintCache` in `crates/core/src/modules/mint_cache/mod.rs`, and its halves `MintCacheApi` in `crates/core/src/modules/mint_cache/api.rs` and `MintCacheIndexer` in `crates/core/src/modules/mint_cache/indexer.rs`.
+
+**Config: an `Option` section with an `enabled` flag**
+
+- The binary's config has a field `x: Option<XConfig>`, and `XConfig` has `enabled: bool` and `#[serde(deny_unknown_fields)]`.
+- An `x_enabled() -> bool` accessor on the binary's config gives the switch, for example `ApiConfig::mint_cache_enabled()`.
+- When the module needs other sections, `XConfig` checks them in `check_required_modules(&self, config)`. The check does nothing while the module is disabled. A section that two binaries share has one check per binary, for example `check_required_api_modules` and `check_required_indexer_modules`.
+- The binary runs these checks at startup, before it builds any module. A failed check stops startup with an error.
+
+**Module: a null-object handle**
+
+- The handle is `pub struct X(Option<Arc<Inner>>)` and derives `Clone` and `Default`. `Default` is the disabled handle.
+- `X::from_config(Option<&XConfig>)` returns the disabled handle when the section is absent or `enabled = false`. It is the only place where config becomes the module.
+- Each method starts with `let Some(inner) = &self.0 else { return … };` and does nothing on the disabled handle. Callers do not check whether the module is enabled.
+- `is_enabled()` is for the few callers that must act differently when the module is off, for example to reject a method.
+- A module that runs in two binaries is one handle with a half per binary, for example `MintCache` with `api()` and `indexer()`. Each half is a null-object handle. Each binary builds the handle with its own constructor (`MintCache::from_api_config`, `MintCache::from_indexer_config`), which enables only its half, and calls its half by name: `mint_cache.api().on_block(..)`.
+- A handle with a single owner holds `Option<Inner>` without `Arc` and does not derive `Clone`. `ProcessedWriter` in `crates/core/src/modules/processed/writer.rs` is the example: it owns the processed block store without a lock, and `ProcessedAccounts::writer()` returns the disabled writer when `[processed-accounts]` is off.
+
+Some older modules do not follow these rules yet. For example, `[gpa-cache]` and `[query-tracker-client]` have no `enabled` flag, and `[slot-syncronizer]` is not an `Option`.
 
 ### Logging
 

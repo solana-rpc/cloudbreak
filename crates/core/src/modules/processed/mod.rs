@@ -22,35 +22,29 @@
 //! - `mod.rs`: the public surface and the constants.
 //! - `ingest.rs`: builds a `SlotBlock` and classifies each account as live or
 //!   closed. A write by an owner outside the API program filter is a close.
-//! - `store.rs`: the block store. One block per slot, slot statuses, the
-//!   anchor, conflicts, retention, the slot cap and the latest chained blocks.
+//! - `store.rs`: the block store. One block per slot, the anchor, conflicts,
+//!   retention, the slot cap and the latest chained blocks.
 //! - `read.rs`: [`ProcessedBlocks::get_account`], the one read function the API calls,
 //!   and the `processed_read` span with the store size.
-//! - `subscribe.rs`: the feed thread. The shared gRPC client in `crate::grpc`
-//!   drives the single writer, which owns the store without a lock.
+//! - `writer.rs`: [`ProcessedWriter`], the single writer, which owns the store
+//!   without a lock.
 //!
 //! # Runtime model
 //!
-//! [`ProcessedAccounts::spawn`] starts the `processed-feed` thread. After every
-//! block, slot status or anchor change the writer prunes, selects the latest
-//! chained blocks and publishes them behind an `RwLock`. A request clones one
-//! `Arc` and holds no lock while it reads. A block leaves memory when the last
-//! [`ProcessedBlocks`] that pins it drops, on the feed thread after the publish
-//! lock or in a request.
-//!
-//! The feed subscribes without `from_slot`, keeps retrying on every failure
-//! and never changes node health. While it is down, requests take the
-//! confirmed path.
+//! The API gRPC feed (`modules::grpc` at processed commitment) hands each block
+//! to the [`ProcessedWriter`], and the API slot syncronizer hands it each
+//! [`Anchor`]. After every block or anchor change the writer prunes, selects the
+//! latest chained blocks and publishes them behind an `RwLock`. A request clones
+//! one `Arc` and holds no lock while it reads. A block leaves memory when the
+//! last [`ProcessedBlocks`] that pins it drops, in the writer after the publish
+//! lock or in a request. While the feed is down, requests take the confirmed path.
 //!
 //! # Latest chained blocks
 //!
 //! The head is the highest stored slot. Its walk follows parent links, each
 //! checked by blockhash, down to the confirmed slot, whose blockhash comes from
 //! the `slots` row. The walk fails, and no blocks are served, when a link is
-//! missing, a blockhash differs, the head has no `block_time`, or a slot above
-//! the confirmed slot is poisoned: dead, restarted by a second
-//! `SLOT_CREATED_BANK`, without a `SLOT_CREATED_BANK` in this session, or at or
-//! below the highest slot seen before the last reconnect. A second blockhash
+//! missing, a blockhash differs, or the head has no `block_time`. A second blockhash
 //! for a stored slot, or a parent blockhash that does not match the stored
 //! parent, deletes the conflicting block and its descendants and serves nothing
 //! until the confirmed slot passes that slot.
@@ -67,13 +61,12 @@
 //! # Enable rules
 //!
 //! The API `[processed-accounts]` section with `enabled = true` turns it on.
-//! Otherwise [`ProcessedAccounts::default()`] is a no-op handle: `spawn` does
-//! nothing and `blocks` returns `None`.
+//! Otherwise [`ProcessedAccounts::default()`] is a no-op handle and `blocks`
+//! returns `None`. [`ProcessedAccounts::writer`] gives the API feed the writer.
 //!
 //! # Node requirements
 //!
-//! - A Yellowstone endpoint that allows processed commitment and
-//!   `interslot_updates`, plus its x-token.
+//! - A `[grpc]` Yellowstone endpoint that allows processed commitment, plus its x-token.
 //! - `[slot-syncronizer]` enabled, which publishes the [`Anchor`].
 //! - No owner map, no program filter change, no indexer change, no
 //!   `replay_stored_slots`. Each API instance carries a full block feed.
@@ -92,33 +85,26 @@
 //! - Account writes are sent before the block seals. The plugin's message
 //!   ordering enforces it. If it breaks, a block misses writes and serves stale
 //!   data.
-//! - `SLOT_CREATED_BANK` is sent for every bank creation. The plugin's
-//!   `update_slot_status` enforces it. If it breaks, a restarted slot goes
-//!   undetected and a block that mixes two attempts can be served.
+//! - A `Block` message holds exactly one bank. The plugin buffers by `bank_id`
+//!   and seals a bank only after its freeze-time sysvar writes
+//!   (`block_reconstruction_v2.rs`), so a dead bank sends no block. If it
+//!   breaks, a block that mixes two attempts at a slot can be served.
 //! - `parent_blockhash` equals the parent block's `blockhash`. Agave bank
 //!   construction enforces it. If it breaks, nothing links and no blocks are served.
 
 mod ingest;
 mod read;
 mod store;
-mod subscribe;
+mod writer;
 
 pub use read::{ProcessedAccount, ProcessedBlocks};
+pub use writer::ProcessedWriter;
 
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
 
 use solana_pubkey::Pubkey;
-use yellowstone_grpc_client::GeyserGrpcClient;
 
 use crate::config::{AccountSelectorConfig, ProcessedAccountsConfig};
-
-/// Bound on connecting and on each request.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Reconnects when the stream is silent this long. Above the 10 s server ping.
-const STALL_TIMEOUT: Duration = Duration::from_secs(30);
-const RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
-const MAX_DECODING_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
 /// Stored slots above the confirmed slot.
 pub(crate) const MAX_SLOTS_ABOVE_CONFIRMED: usize = 32;
 /// Slots kept below the confirmed slot.
@@ -151,7 +137,6 @@ pub(crate) enum AccountEntry {
 }
 
 struct Shared {
-    config: ProcessedAccountsConfig,
     program_filter: Arc<AccountSelectorConfig>,
     latest: RwLock<Option<Arc<ProcessedBlocks>>>,
 }
@@ -172,32 +157,26 @@ pub struct ProcessedAccounts(Option<Arc<Shared>>);
 
 impl ProcessedAccounts {
     /// Returns the disabled handle when the section is absent or disabled.
-    /// Otherwise checks the endpoint and x-token. Does not connect.
     pub fn from_config(
         config: Option<&ProcessedAccountsConfig>,
         program_filter: Arc<AccountSelectorConfig>,
-    ) -> anyhow::Result<Self> {
-        let Some(config) = config.filter(|c| c.enabled) else {
-            return Ok(Self::default());
-        };
-        GeyserGrpcClient::build_from_shared(config.endpoint.clone())?
-            .x_token(config.x_token.clone())?;
-        Ok(Self(Some(Arc::new(Shared {
-            config: config.clone(),
+    ) -> Self {
+        if !config.is_some_and(|c| c.enabled) {
+            return Self::default();
+        }
+        Self(Some(Arc::new(Shared {
             program_filter,
             latest: RwLock::new(None),
-        }))))
+        })))
     }
 
     pub fn is_enabled(&self) -> bool {
         self.0.is_some()
     }
 
-    /// Starts the `processed-feed` thread. No-op when disabled.
-    pub fn spawn(&self, anchor_rx: tokio::sync::watch::Receiver<Option<Anchor>>) {
-        if let Some(shared) = &self.0 {
-            subscribe::spawn_feed(shared.clone(), anchor_rx);
-        }
+    /// The single writer for the API feed; the disabled writer when disabled. Call it once.
+    pub fn writer(&self) -> ProcessedWriter {
+        self.0.clone().map(ProcessedWriter::new).unwrap_or_default()
     }
 
     /// The blocks for one request, or `None` when no chain can be proven.
@@ -216,42 +195,34 @@ mod tests {
     use super::store::tests::{TestChain, anchor_at};
     use super::*;
 
-    pub(super) fn config(endpoint: &str) -> ProcessedAccountsConfig {
-        ProcessedAccountsConfig {
-            enabled: true,
-            endpoint: endpoint.to_string(),
-            x_token: None,
-        }
+    pub(super) fn config() -> ProcessedAccountsConfig {
+        ProcessedAccountsConfig { enabled: true }
     }
 
-    pub(super) fn handle(config: &ProcessedAccountsConfig) -> anyhow::Result<ProcessedAccounts> {
+    pub(super) fn handle(config: &ProcessedAccountsConfig) -> ProcessedAccounts {
         ProcessedAccounts::from_config(Some(config), Arc::new(AccountSelectorConfig::default()))
     }
 
     #[test]
-    fn from_config_gates_on_enabled_and_checks_the_endpoint() {
+    fn from_config_gates_on_enabled() {
         let disabled = ProcessedAccounts::default();
         assert!(!disabled.is_enabled());
-        let (_tx, rx) = tokio::sync::watch::channel(None);
-        disabled.spawn(rx);
         assert!(disabled.blocks().is_none());
 
-        let mut off = config("");
+        let mut off = config();
         off.enabled = false;
-        assert!(!handle(&off).unwrap().is_enabled());
+        assert!(!handle(&off).is_enabled());
         let none = ProcessedAccounts::from_config(None, Arc::new(AccountSelectorConfig::default()));
-        assert!(!none.unwrap().is_enabled());
+        assert!(!none.is_enabled());
 
-        assert!(handle(&config("not a uri")).is_err());
-
-        let enabled = handle(&config("http://grpc:10000")).unwrap();
+        let enabled = handle(&config());
         assert!(enabled.is_enabled());
         assert!(enabled.blocks().is_none());
     }
 
     #[test]
     fn blocks_returns_the_latest_blocks() {
-        let handle = handle(&config("http://grpc:10000")).unwrap();
+        let handle = handle(&config());
         let shared = handle.0.as_ref().unwrap();
         let mut chain = TestChain::new();
         chain.linear(101, 101);

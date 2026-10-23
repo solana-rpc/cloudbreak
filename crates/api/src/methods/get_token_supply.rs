@@ -15,7 +15,7 @@ use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
 use crate::methods::processed;
 use crate::metrics;
-use crate::utils::token::{is_token_program, parse_additional_mint_data};
+use cloudbreak_core::utils::token::{MintState, is_token_program};
 
 #[tracing::instrument(name = "get_token_supply_rpc", skip_all, fields(pubkey = %mint))]
 pub async fn get_token_supply(
@@ -75,7 +75,8 @@ pub async fn get_token_supply(
         })?;
 
     let supply = mint_state.base.supply;
-    let additional_mint_data = parse_additional_mint_data(&pubkey, data, block_time);
+    let additional_mint_data =
+        MintState::from_mint(&pubkey, data).map(|mint| mint.additional_data(block_time));
     let additional_data = additional_mint_data
         .as_ref()
         .and_then(|d| d.spl_token_additional_data.as_ref())

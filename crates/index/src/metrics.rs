@@ -7,7 +7,10 @@ use std::sync::{Once, OnceLock};
 
 use cloudbreak_core::IndexConfig;
 pub use cloudbreak_core::metrics::{
-    CURRENT_TOKIO_TASKS, LARGEST_ACCOUNTS_DB_ERRORS, LARGEST_ACCOUNTS_STALE_MINTS,
+    CURRENT_TOKIO_TASKS, GRPC_BUFFER_CHANNEL_SIZE_SENDER, GRPC_ERRORS, GRPC_TIMEOUT_ERRORS,
+    GRPC_TOTAL_UPDATES_RECEIVED, LARGEST_ACCOUNTS_DB_ERRORS, LARGEST_ACCOUNTS_STALE_MINTS,
+    MINT_CACHE_BLOCK_MICROSECONDS, MINT_CACHE_CHANGES_PER_BLOCK, MINT_CACHE_DB_WRITE_ERRORS_TOTAL,
+    MINT_CACHE_ENTRIES, MINT_CACHE_STARTUP_SECONDS, MINT_CACHE_UNCHANGED_WRITES_TOTAL,
     NON_CIRCULATING_BLOCK_MICROSECONDS, NON_CIRCULATING_CHANGES_TOTAL, NON_CIRCULATING_MEMBERS,
     SUPPLY_BLOCK_MICROSECONDS, SUPPLY_CACHE_ENTRIES, SUPPLY_CACHE_HITS_TOTAL,
     SUPPLY_CACHE_MISSES_TOTAL, SUPPLY_DB_MICROSECONDS, SUPPLY_PROBE_MICROSECONDS,
@@ -196,26 +199,6 @@ lazy_static::lazy_static! {
     )
     .expect("Failed to create block size histogram");
 
-    pub static ref GRPC_BUFFER_CHANNEL_SIZE_SENDER: IntGauge = IntGauge::new(
-        "cloudbreak_grpc_buffer_channel_size_sender", "Size of the GRPC buffer channel sender"
-    )
-    .expect("Failed to create GRPC buffer channel size sender gauge");
-
-    pub static ref GRPC_TIMEOUT_ERRORS: Counter = Counter::new(
-        "cloudbreak_grpc_timeout_errors", "Number of GRPC timeout errors"
-    )
-    .expect("Failed to create GRPC timeout errors counter");
-
-    pub static ref GRPC_ERRORS: Counter = Counter::new(
-        "cloudbreak_grpc_errors", "Number of GRPC errors"
-    )
-    .expect("Failed to create GRPC errors counter");
-
-    pub static ref GRPC_TOTAL_UPDATES_RECEIVED: Counter = Counter::new(
-        "cloudbreak_grpc_total_updates_received", "Number of GRPC updates received"
-    )
-    .expect("Failed to create GRPC total updates received counter");
-
     pub static ref GRPC_GAP_ERRORS: Counter = Counter::new(
         "cloudbreak_grpc_gap_errors", "Number of slot gaps on grpc reconnection"
     )
@@ -326,14 +309,6 @@ pub fn record_grpc_buffer_channel_size(size: usize) {
         .observe(size as f64);
 }
 
-pub fn increment_grpc_timeout_errors() {
-    GRPC_TIMEOUT_ERRORS.inc();
-}
-
-pub fn increment_grpc_errors() {
-    GRPC_ERRORS.inc();
-}
-
 pub fn increment_grpc_gap_errors() {
     GRPC_GAP_ERRORS.inc();
 }
@@ -392,6 +367,12 @@ pub fn register_collectors() {
         register!(GRPC_BUFFER_CHANNEL_SIZE_SENDER);
         register!(FINALIZE_SLOT_DELETED_ACCOUNTS);
         register!(LARGEST_ACCOUNTS_DB_ERRORS);
+        register!(MINT_CACHE_ENTRIES);
+        register!(MINT_CACHE_CHANGES_PER_BLOCK);
+        register!(MINT_CACHE_BLOCK_MICROSECONDS);
+        register!(MINT_CACHE_STARTUP_SECONDS);
+        register!(MINT_CACHE_UNCHANGED_WRITES_TOTAL);
+        register!(MINT_CACHE_DB_WRITE_ERRORS_TOTAL);
         register!(LARGEST_ACCOUNTS_STALE_MINTS);
         register!(CLEANUP_LAG_SLOTS);
         register!(SUPPLY_CACHE_ENTRIES);

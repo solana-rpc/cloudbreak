@@ -1624,6 +1624,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "urlencoding",
+ "yellowstone-grpc-proto",
 ]
 
 [[package]]
@@ -1633,6 +1634,7 @@ dependencies = [
  "anyhow",
  "bincode",
  "blake3",
+ "bytemuck",
  "clap",
  "cloudbreak-entity",
  "env_logger",
@@ -1642,14 +1644,16 @@ dependencies = [
  "lazy_static",
  "prometheus",
  "rust_decimal",
- "rustls",
  "sea-orm",
  "serde",
  "serde_json",
+ "solana-account-decoder",
  "solana-program",
  "solana-pubkey 4.3.0",
  "solana-rpc-client-api",
  "solana-stake-interface",
+ "spl-token-2022-interface",
+ "spl-token-interface",
  "thiserror 2.0.20",
  "tokio",
  "toml",
@@ -1721,7 +1725,6 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
- "yellowstone-grpc-client",
  "yellowstone-grpc-proto",
 ]
 

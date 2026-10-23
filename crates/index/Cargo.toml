@@ -46,5 +46,3 @@ solana-client = { workspace = true }
 
 solana-lattice-hash = { workspace = true }
 hex = { workspace = true }
-
-yellowstone-grpc-client = { workspace = true }

@@ -28,7 +28,7 @@ pub async fn save_block(
 ) {
     let IndexerState {
         snapshot_processing_state,
-        self_healing_state: _,
+        self_healing_state,
         slot_finalizer,
         updated_accounts_during_startup,
         buffer_channel_rx_len: _,
@@ -37,6 +37,7 @@ pub async fn save_block(
         largest_accounts,
         non_circulating,
         supply_tracker,
+        mint_cache,
     } = indexer_state;
 
     let start_time = Instant::now();
@@ -55,6 +56,7 @@ pub async fn save_block(
         largest_accounts.clone(),
         non_circulating.clone(),
         supply_tracker.clone(),
+        mint_cache.clone(),
     )
     .await;
 
@@ -94,6 +96,13 @@ pub async fn save_block(
         &stake_block.expired,
     );
     let supply_pending = supply_tracker.build_block_pending(&block.accounts);
+    mint_cache.indexer().on_block(
+        db,
+        slot,
+        &block.accounts,
+        self_healing_state.lowest_gap(),
+        config.database.save_block_queries_timeout,
+    );
 
     // Create the chunks for updating the "accounts" table
     let system_program_id = [0u8; 32].to_vec();

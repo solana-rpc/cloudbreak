@@ -5,12 +5,10 @@
 
 use crate::modules::mint_resolver::MintResolver;
 use crate::{
-    error::RpcError,
-    http::CloudbreakRpcState,
-    methods::get_program_accounts::GpaStreamingResponse,
-    utils::token::{LEGACY_TOKEN_PROGRAM_ID, is_token_program},
+    error::RpcError, http::CloudbreakRpcState, methods::get_program_accounts::GpaStreamingResponse,
 };
 use cloudbreak_core::modules::rpc_filter_type::{Memcmp, RpcFilterType, RpcProgramAccountsConfig};
+use cloudbreak_core::utils::token::{LEGACY_TOKEN_PROGRAM_ID, is_token_program};
 use serde::{Deserialize, Serialize};
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::config::RpcAccountInfoConfig;

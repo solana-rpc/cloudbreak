@@ -7,4 +7,3 @@
 
 pub mod encoding;
 pub mod sql_filters;
-pub mod token;
