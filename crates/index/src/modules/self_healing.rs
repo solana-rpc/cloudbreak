@@ -61,6 +61,16 @@ impl SelfHealingState {
         }
     }
 
+    /// The lowest slot still waiting for repair, if any.
+    pub fn lowest_gap(&self) -> Option<u64> {
+        self.gaps_list
+            .lock()
+            .expect("Failed to lock gaps_list")
+            .iter()
+            .min()
+            .copied()
+    }
+
     fn remove_slot_from_gaps_list(&self, slot: u64) {
         self.gaps_list
             .lock()
