@@ -115,7 +115,7 @@ pub async fn run(args: &Args) -> Result<()> {
         name,
     };
     let ctx = Ctx {
-        client: reqwest::Client::builder()
+        client: crate::utils::http_client_builder()
             .timeout(Duration::from_secs(args.timeout))
             .build()?,
         cloudbreak: endpoint("cloudbreak".to_string(), &args.rpc),
