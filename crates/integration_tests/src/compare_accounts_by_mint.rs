@@ -332,7 +332,7 @@ pub async fn run(args: &Args) -> Result<()> {
     let config: Config = toml::from_str(&config_content)
         .with_context(|| format!("Failed to parse config file: {}", args.config))?;
 
-    let client = reqwest::Client::builder()
+    let client = crate::utils::http_client_builder()
         .timeout(std::time::Duration::from_secs(config.timeout))
         .build()?;
 

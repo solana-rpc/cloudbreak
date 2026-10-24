@@ -15,21 +15,38 @@ use serde_json::Value as JsonValue;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// User-Agent on every request the integration tests send.
+/// The VictoriaLogs source excludes it, so a run never replays its own requests.
+pub const USER_AGENT: &str = "cloudbreak-integration-tests";
+
+/// HTTP client builder with the integration-tests User-Agent.
+pub fn http_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().user_agent(USER_AGENT)
+}
+
 pub async fn send_rpc_request(
     client: &reqwest::Client,
     endpoint: &RpcEndpoint,
     request: &JsonValue,
     meter: Option<&std::sync::Arc<crate::bandwidth::BwMeter>>,
 ) -> Result<(JsonValue, u128)> {
+    // The API records x-request-id as the trace `request_id`, so the timing line below joins to the trace.
+    let request_id = format!("it-{:016x}", rand::random::<u64>());
+    let sent_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
     let start = Instant::now();
 
     let response = client
         .post(&endpoint.url)
         .header("x-subscription-id", "test-value")
+        .header("x-request-id", &request_id)
         .json(request)
         .send()
         .await
         .with_context(|| format!("Failed to connect to {}", endpoint.name))?;
+    let headers_ms = start.elapsed().as_millis();
 
     // Read the raw body first so we can account the true received wire size
     // cheaply: `reqwest::Response::json()` already buffers the full body into
@@ -41,6 +58,17 @@ pub async fn send_rpc_request(
         .await
         .with_context(|| format!("Failed to read response from {}", endpoint.name))?;
     let duration = start.elapsed().as_millis();
+
+    tracing::info!(
+        target: "bench_request",
+        request_id = %request_id,
+        endpoint = %endpoint.name,
+        sent_at_ms,
+        headers_ms,
+        total_ms = duration,
+        bytes = body.len(),
+        "rpc timing"
+    );
 
     if let Some(meter) = meter {
         meter.record(body.len() as u64);
