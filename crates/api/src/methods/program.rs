@@ -5,7 +5,6 @@
 
 use std::num::NonZeroUsize;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::time::Duration;
 
 use crate::error::RpcError;
@@ -26,7 +25,7 @@ use futures::{Stream, StreamExt};
 use rust_decimal::prelude::ToPrimitive;
 use sea_orm::sqlx::postgres::PgRow;
 use sea_orm::sqlx::{self, Row};
-use solana_account::AccountSharedData;
+use solana_account::ReadableAccount;
 use solana_account_decoder::parse_account_data::AccountAdditionalDataV3;
 use solana_account_decoder::{UiAccountEncoding, UiDataSliceConfig, encode_ui_account};
 use solana_commitment_config::CommitmentLevel;
@@ -522,7 +521,7 @@ pub fn gpa_encoding_stream(input: GpaEncodingInput) -> EncodedAccountBatchStream
             let batch = if apply_value_cmp {
                 batch
                     .into_iter()
-                    .filter(|row| account_matches_value_cmps(&filters, &row.get::<Vec<u8>, _>(6)))
+                    .filter(|row| account_matches_value_cmps(&filters, row.get::<&[u8], _>(6)))
                     .collect::<Vec<_>>()
             } else {
                 batch
@@ -592,6 +591,37 @@ pub fn load_sql(input: &GpaDbQueryInput) -> GpaSql {
     }
 }
 
+/// An account whose data borrows the row buffer, so encoding needs no copy of the data.
+struct RowAccount<'a> {
+    lamports: u64,
+    data: &'a [u8],
+    owner: Pubkey,
+    executable: bool,
+    rent_epoch: u64,
+}
+
+impl ReadableAccount for RowAccount<'_> {
+    fn lamports(&self) -> u64 {
+        self.lamports
+    }
+
+    fn data(&self) -> &[u8] {
+        self.data
+    }
+
+    fn owner(&self) -> &Pubkey {
+        &self.owner
+    }
+
+    fn executable(&self) -> bool {
+        self.executable
+    }
+
+    fn rent_epoch(&self) -> u64 {
+        self.rent_epoch
+    }
+}
+
 pub fn process_row(
     row: PgRow,
     encoding: UiAccountEncoding,
@@ -606,23 +636,24 @@ pub fn process_row(
         let lamports = row.get::<i64, _>(2);
         let executable = row.get(4);
         let rent_epoch = row.get::<rust_decimal::Decimal, _>(5);
-        let data: Vec<u8> = row.get(6);
+        // Bound queries return binary results, so the data is read in place from the row buffer.
+        let data: &[u8] = row.get(6);
 
         *response_bytes += data.len() as u64;
 
-        let account_shared_data = AccountSharedData::create_from_existing_shared_data(
-            lamports as u64,
-            Arc::new(data.clone()),
+        let account = RowAccount {
+            lamports: lamports as u64,
+            data,
             owner,
             executable,
-            rent_epoch.to_u64().unwrap_or(0),
-        );
+            rent_epoch: rent_epoch.to_u64().unwrap_or(0),
+        };
 
         check_account_data_len_for_encoding(encoding, data_slice, data.len(), &pubkey)?;
 
         let maybe_encoded_account = encode_ui_account(
             &pubkey,
-            &account_shared_data,
+            &account,
             encoding,
             additional_mint_data,
             data_slice,
@@ -645,6 +676,45 @@ mod tests {
 
     fn memcmp(offset: usize, bytes: &[u8]) -> RpcFilterType {
         RpcFilterType::Memcmp(Memcmp::new_raw_bytes(offset, bytes.to_vec()))
+    }
+
+    #[test]
+    fn row_account_encodes_like_an_owned_account() {
+        let pubkey = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let data: Vec<u8> = (0..=255).cycle().take(1000).collect();
+        let owned = solana_account::AccountSharedData::create_from_existing_shared_data(
+            42,
+            std::sync::Arc::new(data.clone()),
+            owner,
+            true,
+            7,
+        );
+        let borrowed = RowAccount {
+            lamports: 42,
+            data: &data,
+            owner,
+            executable: true,
+            rent_epoch: 7,
+        };
+        let slice = Some(UiDataSliceConfig {
+            offset: 10,
+            length: 100,
+        });
+
+        for encoding in [
+            UiAccountEncoding::Base58,
+            UiAccountEncoding::Base64,
+            UiAccountEncoding::Base64Zstd,
+            UiAccountEncoding::JsonParsed,
+        ] {
+            for data_slice in [None, slice] {
+                assert_eq!(
+                    encode_ui_account(&pubkey, &borrowed, encoding, None, data_slice),
+                    encode_ui_account(&pubkey, &owned, encoding, None, data_slice),
+                );
+            }
+        }
     }
 
     #[test]
