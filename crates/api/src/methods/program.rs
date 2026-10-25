@@ -20,7 +20,7 @@ use crate::modules::cache::{GpaProcessor, KeyedRpcAccount, MaybeJsonAccount};
 use crate::{db_query, metrics};
 use async_stream::try_stream;
 use cloudbreak_core::modules::rpc_filter_type::{
-    RpcProgramAccountsConfig, account_matches_value_cmps, has_value_cmp,
+    RpcFilterType, RpcProgramAccountsConfig, account_matches_value_cmps, has_value_cmp,
 };
 use futures::{Stream, StreamExt};
 use rust_decimal::prelude::ToPrimitive;
@@ -192,29 +192,8 @@ pub async fn get_program_accounts(
     }
 
     // Build filter clauses for both tables
-    let accounts_filters = if let Some(ref filters) = config.filters {
-        filters
-            .iter()
-            .filter_map(|f| SqlDataSliceFilter::new(f, "accounts", is_token_program).to_string())
-            .map(|filter| format!("AND {}", filter))
-            .collect::<Vec<_>>()
-            .join("\n                    ")
-    } else {
-        String::new()
-    };
-
-    let snapshot_filters = if let Some(ref filters) = config.filters {
-        filters
-            .iter()
-            .filter_map(|f| {
-                SqlDataSliceFilter::new(f, "snapshot_accounts", is_token_program).to_string()
-            })
-            .map(|filter| format!("AND {}", filter))
-            .collect::<Vec<_>>()
-            .join("\n                    ")
-    } else {
-        String::new()
-    };
+    let (accounts_filters, snapshot_filters, filter_params) =
+        bound_filters(config.filters.as_deref().unwrap_or(&[]), is_token_program);
 
     let metrics_data = GpaMetricsData::new(format!("gpa{mint_filter_label}"));
 
@@ -231,6 +210,7 @@ pub async fn get_program_accounts(
             latest_slot,
             accounts_filters,
             snapshot_filters,
+            filter_params,
             metrics_data: metrics_data.clone(),
         },
         &mut request_processor,
@@ -262,7 +242,72 @@ pub struct GpaDbQueryInput {
     pub latest_slot: u64,
     pub accounts_filters: String,
     pub snapshot_filters: String,
+    /// Memcmp bytes bound to `$1..$n` in the filters.
+    pub filter_params: Vec<Vec<u8>>,
     pub metrics_data: GpaMetricsData,
+}
+
+/// gPA SQL text and the slot values bound after the filter parameters, in placeholder order.
+pub struct GpaSql {
+    pub sql: String,
+    pub slot_params: Vec<i64>,
+}
+
+/// Renders the filters of both tables. Memcmp bytes become `$1..$n`, shared by both tables;
+/// the values that select a query-tracker index (dataSize, offsets, lengths) stay literal.
+fn bound_filters(
+    filters: &[RpcFilterType],
+    is_token_program: bool,
+) -> (String, String, Vec<Vec<u8>>) {
+    let mut accounts_filters = Vec::new();
+    let mut snapshot_filters = Vec::new();
+    let mut params = Vec::new();
+
+    for filter in filters {
+        let param = params.len() + 1;
+        let Some((accounts_filter, value)) =
+            SqlDataSliceFilter::new(filter, "accounts", is_token_program).to_bound_sql(param)
+        else {
+            continue;
+        };
+        if let Some((snapshot_filter, _)) =
+            SqlDataSliceFilter::new(filter, "snapshot_accounts", is_token_program)
+                .to_bound_sql(param)
+        {
+            snapshot_filters.push(format!("AND {}", snapshot_filter));
+        }
+        accounts_filters.push(format!("AND {}", accounts_filter));
+        params.extend(value);
+    }
+
+    (
+        accounts_filters.join("\n                    "),
+        snapshot_filters.join("\n                    "),
+        params,
+    )
+}
+
+/// Writes the template's `$1` as the literal program, so each program prunes to its partition
+/// at plan time, and renumbers `$2`, `$3`, ... to `$first_slot_param`, `$first_slot_param + 1`, ...
+pub fn render_template_params(sql: &str, program: &Pubkey, first_slot_param: usize) -> String {
+    let mut out = String::with_capacity(sql.len() + 64);
+    let mut rest = sql;
+
+    while let Some(pos) = rest.find('$') {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + 1..];
+        let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+
+        match after[..digits].parse::<usize>() {
+            Ok(1) => out.push_str(&format!("'\\x{}'::bytea", hex::encode(program.as_ref()))),
+            Ok(n) if n >= 2 => out.push_str(&format!("${}", first_slot_param + n - 2)),
+            _ => out.push_str(&rest[pos..pos + 1 + digits]),
+        }
+        rest = &after[digits..];
+    }
+    out.push_str(rest);
+
+    out
 }
 
 fn gpa_db_query(
@@ -270,19 +315,19 @@ fn gpa_db_query(
     gpa_processor: &mut GpaProcessor,
 ) -> UnboundedReceiver<Result<Vec<PgRow>, RpcError>> {
     // `load_sql` mutates the caller-owned processor
-    let sql = gpa_processor.load_sql(&input);
-
-    let program_bytes = input.program.as_ref().to_vec();
-    let sql = sql.replace(
-        "$1",
-        &format!("'\\x{}'::bytea", hex::encode(&program_bytes)),
-    );
+    let GpaSql { sql, slot_params } = gpa_processor.load_sql(&input);
 
     tracing::debug!(target: "gpa_sql", "## sql: {}", sql);
 
     let pool = input.state.database.get_postgres_connection_pool().clone();
 
-    let sql = db_query::add_trace_traceparent_to_query(&sql);
+    // A traced SQL text is unique, so it runs as an unnamed statement and stays out of the statement cache.
+    let traceparent = db_query::traceparent_comment();
+    let persistent = traceparent.is_none();
+    let sql = match traceparent {
+        Some(comment) => format!("{comment} {sql}"),
+        None => sql,
+    };
 
     let queries_timeout = input.state.queries_timeout;
     // `None` sends every row as one batch, so DB failures surface before the response starts.
@@ -309,7 +354,14 @@ fn gpa_db_query(
             );
             let mut first_loop_iteration = true;
 
-            let mut rows = sqlx::raw_sql(&sql).fetch(&pool);
+            let mut query = sqlx::query(&sql).persistent(persistent);
+            for value in &input.filter_params {
+                query = query.bind(value.as_slice());
+            }
+            for slot in &slot_params {
+                query = query.bind(*slot);
+            }
+            let mut rows = query.fetch(&pool);
             let mut batch: Vec<PgRow> = Vec::with_capacity(gpa_stream_batch_size.unwrap_or(0));
 
             loop {
@@ -528,12 +580,16 @@ pub fn encoding_to_string(encoding: &UiAccountEncoding) -> &'static str {
     }
 }
 
-pub fn load_sql(input: &GpaDbQueryInput) -> String {
+pub fn load_sql(input: &GpaDbQueryInput) -> GpaSql {
     let sql = include_str!("../db/getProgramAccounts.sql");
+    let sql = render_template_params(sql, &input.program, input.filter_params.len() + 1);
     let sql = sql.replace("-- {accounts_filters}", &input.accounts_filters);
     let sql = sql.replace("-- {snapshot_filters}", &input.snapshot_filters);
 
-    sql.replace("$2", input.latest_slot.to_string().as_str())
+    GpaSql {
+        sql,
+        slot_params: vec![input.latest_slot as i64],
+    }
 }
 
 pub fn process_row(
@@ -580,4 +636,98 @@ pub fn process_row(
             },
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cloudbreak_core::modules::rpc_filter_type::Memcmp;
+
+    fn memcmp(offset: usize, bytes: &[u8]) -> RpcFilterType {
+        RpcFilterType::Memcmp(Memcmp::new_raw_bytes(offset, bytes.to_vec()))
+    }
+
+    #[test]
+    fn memcmp_bytes_are_bound_and_index_shape_stays_literal() {
+        let filters = vec![
+            RpcFilterType::DataSize(165),
+            memcmp(8, &[1, 2, 3]),
+            memcmp(40, &[9]),
+        ];
+
+        let (accounts, snapshot, params) = bound_filters(&filters, false);
+
+        assert_eq!(
+            accounts,
+            "AND length(accounts.data) = 165\n                    \
+             AND SUBSTRING(accounts.data FROM 9 FOR 3) = $1\n                    \
+             AND SUBSTRING(accounts.data FROM 41 FOR 1) = $2"
+        );
+        assert_eq!(
+            snapshot,
+            accounts.replace("accounts.", "snapshot_accounts.")
+        );
+        assert_eq!(params, vec![vec![1, 2, 3], vec![9]]);
+    }
+
+    #[test]
+    fn token_owner_and_mint_values_are_bound() {
+        let filters = vec![memcmp(0, &[7; 32]), memcmp(32, &[8; 32])];
+
+        let (accounts, _, params) = bound_filters(&filters, true);
+
+        assert_eq!(
+            accounts,
+            "AND accounts.token_mint = $1\n                    AND accounts.token_owner = $2"
+        );
+        assert_eq!(params, vec![vec![7; 32], vec![8; 32]]);
+    }
+
+    #[test]
+    fn template_program_is_literal_and_slots_follow_filter_params() {
+        let program = Pubkey::new_from_array([0xab; 32]);
+        let program_sql = format!("'\\x{}'::bytea", "ab".repeat(32));
+
+        let sql = render_template_params(
+            "owner = $1 AND slot <= $2 AND cached <= $3 -- {accounts_filters}",
+            &program,
+            3,
+        );
+
+        assert_eq!(
+            sql,
+            format!(
+                "owner = {program_sql} AND slot <= $3 AND cached <= $4 -- {{accounts_filters}}"
+            )
+        );
+    }
+
+    #[test]
+    fn rendered_templates_use_every_placeholder_once_in_order() {
+        let program = Pubkey::new_unique();
+        let filters = vec![memcmp(8, &[1, 2, 3]), RpcFilterType::DataSize(10)];
+        let (accounts, snapshot, params) = bound_filters(&filters, false);
+
+        for (template, slot_params) in [
+            (include_str!("../db/getProgramAccounts.sql"), 1),
+            (include_str!("../modules/cache/gpa_with_cache.sql"), 2),
+        ] {
+            let sql = render_template_params(template, &program, params.len() + 1)
+                .replace("-- {accounts_filters}", &accounts)
+                .replace("-- {snapshot_filters}", &snapshot);
+
+            let used: std::collections::BTreeSet<usize> = sql
+                .split('$')
+                .skip(1)
+                .map(|s| {
+                    let digits = s.bytes().take_while(u8::is_ascii_digit).count();
+                    s[..digits].parse().expect("placeholder number")
+                })
+                .collect();
+
+            let expected = (1..=params.len() + slot_params).collect();
+            assert_eq!(used, expected);
+            assert!(sql.contains(&hex::encode(program.as_ref())));
+        }
+    }
 }

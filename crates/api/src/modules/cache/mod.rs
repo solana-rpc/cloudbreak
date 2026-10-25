@@ -25,7 +25,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::error::RpcError;
 use crate::methods::program;
-use crate::methods::program::GpaDbQueryInput;
+use crate::methods::program::{GpaDbQueryInput, GpaSql};
 use crate::metrics;
 
 /// A query that has been accepted for caching, carrying everything needed to
@@ -291,7 +291,7 @@ impl GpaProcessor {
         }
     }
 
-    pub fn load_sql(&mut self, input: &GpaDbQueryInput) -> String {
+    pub fn load_sql(&mut self, input: &GpaDbQueryInput) -> GpaSql {
         match self {
             Self::Standard => program::load_sql(input),
             Self::Cached {
@@ -313,11 +313,18 @@ impl GpaProcessor {
                 *new_slot = input.latest_slot;
 
                 let sql = include_str!("./gpa_with_cache.sql");
+                let sql = program::render_template_params(
+                    sql,
+                    &input.program,
+                    input.filter_params.len() + 1,
+                );
                 let sql = sql.replace("-- {accounts_filters}", &input.accounts_filters);
                 let sql = sql.replace("-- {snapshot_filters}", &input.snapshot_filters);
-                let sql = sql.replace("$2", input.latest_slot.to_string().as_str());
 
-                sql.replace("$3", cached_slot.to_string().as_str())
+                GpaSql {
+                    sql,
+                    slot_params: vec![input.latest_slot as i64, cached_slot as i64],
+                }
             }
         }
     }

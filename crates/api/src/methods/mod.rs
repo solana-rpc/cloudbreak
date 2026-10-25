@@ -116,4 +116,54 @@ impl<'a> SqlDataSliceFilter<'a> {
             RpcFilterType::ValueCmp(_) => None,
         }
     }
+
+    /// Same SQL as [`Self::to_string`], but memcmp bytes become the `$param` placeholder.
+    /// Returns the bytes to bind to it, or `None` when the filter has no value.
+    pub fn to_bound_sql(&self, param: usize) -> Option<(String, Option<Vec<u8>>)> {
+        match self.filter_type {
+            RpcFilterType::DataSize(size) => {
+                Some((format!("length({}.data) = {}", self.table, size), None))
+            }
+            RpcFilterType::Memcmp(memcmp) => {
+                let bytes = memcmp.bytes()?.to_vec();
+                let offset = memcmp.offset();
+
+                if self.is_token_program {
+                    let is_token_filter = offset == 32 && bytes.len() == 32;
+                    let is_mint_filter = offset == 0 && bytes.len() == 32;
+
+                    if is_token_filter {
+                        return Some((
+                            format!("{}.token_owner = ${}", self.table, param),
+                            Some(bytes),
+                        ));
+                    } else if is_mint_filter {
+                        return Some((
+                            format!("{}.token_mint = ${}", self.table, param),
+                            Some(bytes),
+                        ));
+                    }
+                }
+
+                Some((
+                    format!(
+                        "SUBSTRING({}.data FROM {} FOR {}) = ${}",
+                        self.table,
+                        memcmp.offset() + 1,
+                        bytes.len(),
+                        param
+                    ),
+                    Some(bytes),
+                ))
+            }
+            RpcFilterType::TokenAccountState => Some((
+                format!(
+                    "(length({0}.data) = 165 OR (length({0}.data) > 165 AND SUBSTRING({0}.data FROM 166 FOR 1) = E'\\\\x02'::bytea))",
+                    self.table
+                ),
+                None,
+            )),
+            RpcFilterType::ValueCmp(_) => None,
+        }
+    }
 }
