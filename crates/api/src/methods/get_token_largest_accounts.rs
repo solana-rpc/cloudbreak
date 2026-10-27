@@ -17,8 +17,8 @@ use tracing::Instrument;
 use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
 use crate::methods::get_largest_accounts::fetch_largest_record;
-use crate::methods::token::parse_additional_mint_data;
-use crate::methods::{is_token_program, resolve_commitment};
+use crate::methods::resolve_commitment;
+use crate::utils::token::{is_token_program, parse_additional_mint_data};
 use crate::{db_query, metrics};
 
 #[tracing::instrument(name = "get_token_largest_accounts_rpc", skip_all, fields(pubkey = %mint))]

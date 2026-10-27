@@ -63,6 +63,7 @@ span-filter = [
   "gpa_encode2", 
   "http_connection", 
   "gtabo_rpc", 
+  "gtabd_rpc",
   "slot_db",
   "mint_db",
   "mint_data",

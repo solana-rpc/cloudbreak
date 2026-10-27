@@ -61,8 +61,8 @@ use tracing::Instrument;
 use crate::db_query;
 use crate::error::RpcError;
 use crate::http::{CachedFeatureSet, CloudbreakRpcState};
-use crate::methods::is_token_program;
-use crate::methods::token::parse_additional_mint_data;
+use crate::utils::token::is_token_program;
+use crate::utils::token::parse_additional_mint_data;
 
 /// Default cluster lamports-per-signature
 const LAMPORTS_PER_SIGNATURE: u64 = 5000;
@@ -1174,7 +1174,7 @@ fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::methods::LEGACY_TOKEN_PROGRAM_ID;
+    use crate::utils::token::LEGACY_TOKEN_PROGRAM_ID;
     use solana_account::Account;
 
     const MINT_DECIMALS: u8 = 6;

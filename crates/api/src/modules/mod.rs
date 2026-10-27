@@ -5,5 +5,6 @@
 
 pub mod bandwidth;
 pub mod cache;
+pub mod mint_resolver;
 pub mod supply_cache;
 pub mod vote_accounts_cache;

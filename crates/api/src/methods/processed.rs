@@ -45,10 +45,12 @@ use solana_pubkey::Pubkey;
 use tokio::time::timeout;
 use tracing::Instrument;
 
+use crate::db_query::{bytea_array_literal, bytea_literal};
 use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
-use crate::methods::{is_token_program, resolve_commitment};
+use crate::methods::resolve_commitment;
 use crate::slot_syncronizer::SlotSyncronizerData;
+use crate::utils::token::is_token_program;
 use crate::{db_query, metrics};
 
 /// How one request reads: at a commitment, or through processed blocks.
@@ -367,20 +369,11 @@ fn pubkey_column(row: &PgRow, column: &str) -> Result<Pubkey, RpcError> {
     })
 }
 
-fn bytea_literal(pubkey: &Pubkey) -> String {
-    format!("'\\x{}'::bytea", hex::encode(pubkey.as_ref()))
-}
-
-fn bytea_array_literal(pubkeys: &[Pubkey]) -> String {
-    let literals: Vec<String> = pubkeys.iter().map(bytea_literal).collect();
-    format!("ARRAY[{}]", literals.join(", "))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::methods::LEGACY_TOKEN_PROGRAM_ID;
     use crate::slot_syncronizer::SlotData;
+    use crate::utils::token::LEGACY_TOKEN_PROGRAM_ID;
 
     fn slots(confirmed: u64, finalized: u64, healthy: bool) -> SlotSyncronizerData {
         SlotSyncronizerData {

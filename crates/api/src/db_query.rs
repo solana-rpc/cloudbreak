@@ -89,6 +89,17 @@ pub async fn get_slot_data(db: &DatabaseConnection) -> Option<SlotSyncronizerDat
     })
 }
 
+/// `bytes` as a SQL bytea literal, `'\\x<hex>'::bytea`, for SQL built by substitution.
+pub fn bytea_literal(bytes: impl AsRef<[u8]>) -> String {
+    format!("'\\x{}'::bytea", hex::encode(bytes))
+}
+
+/// `ARRAY['\\x...'::bytea, ...]`, for `unnest($1)` in SQL built by substitution.
+pub fn bytea_array_literal(pubkeys: &[Pubkey]) -> String {
+    let literals: Vec<String> = pubkeys.iter().map(bytea_literal).collect();
+    format!("ARRAY[{}]", literals.join(", "))
+}
+
 /// # W3C traceparent format:
 /// 00-00000000000000000000000000000123-0000000000000123-01
 /// ^^                                                   ^^

@@ -11,9 +11,9 @@ use solana_rpc_client_api::response::{Response as RpcResponse, RpcResponseContex
 
 use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
-use crate::methods::token::parse_additional_mint_data;
-use crate::methods::{is_token_program, processed};
+use crate::methods::processed;
 use crate::metrics;
+use crate::utils::token::{is_token_program, parse_additional_mint_data};
 
 #[tracing::instrument(name = "get_token_account_balance_rpc", skip_all, fields(pubkey = %pubkey))]
 pub async fn get_token_account_balance(
