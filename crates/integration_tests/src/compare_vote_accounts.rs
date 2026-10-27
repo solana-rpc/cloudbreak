@@ -48,7 +48,7 @@ pub async fn run(args: &Args) -> Result<(), anyhow::Error> {
     let config_content = std::fs::read_to_string(&args.config)?;
     let config: Config = toml::from_str(&config_content)?;
 
-    let client = reqwest::Client::new();
+    let client = crate::utils::http_client_builder().build()?;
 
     let stakes1 = fetch(&client, &config.rpc1).await?;
     let stakes2 = fetch(&client, &config.rpc2).await?;
