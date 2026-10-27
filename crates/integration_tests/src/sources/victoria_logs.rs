@@ -49,42 +49,45 @@ pub fn get_body_query(
             .unwrap_or_default(),
     };
 
+    // Skip requests the integration tests sent themselves (see `utils::USER_AGENT`).
+    let own_filter = format!("NOT ua:=\"{}\" AND ", utils::USER_AGENT);
+
     match request_type {
         RequestType::Gtabo => format!(
-            "query={time_filter}rpc_call:=\"getTokenAccountsByOwner\" {encoding_filter}{pool_filter} {min_filter} {max_filter} | limit {limit}"
+            "query={time_filter}{own_filter}rpc_call:=\"getTokenAccountsByOwner\" {encoding_filter}{pool_filter} {min_filter} {max_filter} | limit {limit}"
         ),
         RequestType::Gtabd => format!(
-            "query={time_filter}rpc_call:=\"getTokenAccountsByDelegate\" {encoding_filter}{pool_filter} {min_filter} {max_filter} | limit {limit}"
+            "query={time_filter}{own_filter}rpc_call:=\"getTokenAccountsByDelegate\" {encoding_filter}{pool_filter} {min_filter} {max_filter} | limit {limit}"
         ),
         RequestType::Gpa => format!(
-            "query={time_filter}rpc_call:=\"getProgramAccounts\" {pool_filter} AND NOT body:~\"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA|TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb\" {encoding_filter} {min_filter} {max_filter} | limit {limit}"
+            "query={time_filter}{own_filter}rpc_call:=\"getProgramAccounts\" {pool_filter} AND NOT body:~\"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA|TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb\" {encoding_filter} {min_filter} {max_filter} | limit {limit}"
         ),
         RequestType::GpaTokenOwner => format!(
-            "query={time_filter}rpc_call:=\"getProgramAccounts\" {encoding_filter} AND b_end:~\"tokenowner\" AND body:~\"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA|TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb\" AND body:~`memcmp.*offset.:\\s*32` | limit {limit}"
+            "query={time_filter}{own_filter}rpc_call:=\"getProgramAccounts\" {encoding_filter} AND b_end:~\"tokenowner\" AND body:~\"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA|TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb\" AND body:~`memcmp.*offset.:\\s*32` | limit {limit}"
         ),
         RequestType::GpaTokenMint => format!(
-            "query={time_filter}rpc_call:=\"getProgramAccounts\" {encoding_filter} AND b_end:~\"liquid-tokenmint\" AND body:~\"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA|TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb\" AND body:~`memcmp.*offset.:\\s*0` | limit {limit}"
+            "query={time_filter}{own_filter}rpc_call:=\"getProgramAccounts\" {encoding_filter} AND b_end:~\"liquid-tokenmint\" AND body:~\"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA|TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb\" AND body:~`memcmp.*offset.:\\s*0` | limit {limit}"
         ),
         RequestType::GetAccountInfo => format!(
-            "query={time_filter}rpc_call:=\"getAccountInfo\"{pool_filter} | limit {limit}"
+            "query={time_filter}{own_filter}rpc_call:=\"getAccountInfo\"{pool_filter} | limit {limit}"
         ),
         RequestType::GetMultipleAccounts => format!(
-            "query={time_filter}rpc_call:=\"getMultipleAccounts\"{pool_filter} | limit {limit}"
+            "query={time_filter}{own_filter}rpc_call:=\"getMultipleAccounts\"{pool_filter} | limit {limit}"
         ),
         RequestType::GetBalance => format!(
-            "query={time_filter}rpc_call:=\"getBalance\"{pool_filter} | limit {limit}"
+            "query={time_filter}{own_filter}rpc_call:=\"getBalance\"{pool_filter} | limit {limit}"
         ),
         RequestType::GetTokenAccountBalance => format!(
-            "query={time_filter}rpc_call:=\"getTokenAccountBalance\"{pool_filter} | limit {limit}"
+            "query={time_filter}{own_filter}rpc_call:=\"getTokenAccountBalance\"{pool_filter} | limit {limit}"
         ),
         RequestType::GetTokenSupply => format!(
-            "query={time_filter}rpc_call:=\"getTokenSupply\" AND pool_dedicated:~\"liquid\" | limit {limit}"
+            "query={time_filter}{own_filter}rpc_call:=\"getTokenSupply\" AND pool_dedicated:~\"liquid\" | limit {limit}"
         ),
         RequestType::GetTokenLargestAccounts => format!(
-            "query={time_filter}rpc_call:=\"getTokenLargestAccounts\" AND pool_dedicated:~\"liquid\" | limit {limit}"
+            "query={time_filter}{own_filter}rpc_call:=\"getTokenLargestAccounts\" AND pool_dedicated:~\"liquid\" | limit {limit}"
         ),
         RequestType::SimulateTransaction => format!(
-            "query={time_filter}rpc_call:=\"simulateTransaction\"{simulate_pool_filter} AND body:* | limit {limit}"
+            "query={time_filter}{own_filter}rpc_call:=\"simulateTransaction\"{simulate_pool_filter} AND body:* | limit {limit}"
         ),
     }
 }
@@ -214,4 +217,32 @@ pub async fn get_requests(
         .collect();
 
     Ok(logs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_query_excludes_own_requests() {
+        let own = format!("NOT ua:=\"{}\" AND rpc_call:=", utils::USER_AGENT);
+        for request_type in [
+            RequestType::Gpa,
+            RequestType::Gtabo,
+            RequestType::Gtabd,
+            RequestType::GpaTokenOwner,
+            RequestType::GpaTokenMint,
+            RequestType::GetAccountInfo,
+            RequestType::GetMultipleAccounts,
+            RequestType::GetBalance,
+            RequestType::GetTokenAccountBalance,
+            RequestType::GetTokenSupply,
+            RequestType::GetTokenLargestAccounts,
+            RequestType::SimulateTransaction,
+        ] {
+            let query =
+                get_body_query(request_type, "", "", None, Some(1), None, 10, Some("liquid"));
+            assert!(query.contains(&own), "{request_type:?}: {query}");
+        }
+    }
 }

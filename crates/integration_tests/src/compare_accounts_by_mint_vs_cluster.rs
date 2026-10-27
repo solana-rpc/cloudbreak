@@ -49,7 +49,7 @@ pub struct Args {
 }
 
 pub async fn run(args: &Args) -> Result<()> {
-    let client = reqwest::Client::builder()
+    let client = crate::utils::http_client_builder()
         .timeout(Duration::from_secs(args.timeout))
         .build()?;
 

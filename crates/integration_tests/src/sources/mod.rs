@@ -72,7 +72,7 @@ pub async fn load_requests_from_source(
             poll_interval_secs,
             replay_once,
         } => {
-            let client = reqwest::Client::builder()
+            let client = crate::utils::http_client_builder()
                 .pool_max_idle_per_host(0)
                 .build()?;
 
