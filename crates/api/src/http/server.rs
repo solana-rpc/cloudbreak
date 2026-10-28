@@ -28,7 +28,7 @@ use std::task::Context;
 use std::task::Poll;
 use tokio::net::TcpListener;
 use tracing::Instrument;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::http::operational_endpoints;
 use crate::http::rpc;
@@ -58,6 +58,10 @@ impl HttpServer {
 
         loop {
             let (stream, _remote_addr) = listener.accept().await?;
+            // Nagle holds a small final frame of a streamed body until the client ACKs the first one.
+            if let Err(e) = stream.set_nodelay(true) {
+                warn!("Failed to set TCP_NODELAY: {e}");
+            }
 
             let io = TokioIo::new(stream);
             let state = state.clone();
