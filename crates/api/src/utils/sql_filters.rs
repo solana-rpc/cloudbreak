@@ -69,8 +69,6 @@ impl SqlFilters {
             add_delegate_tag = has_memcmp(filters, TOKEN_ACCOUNT_DELEGATE_OFFSET, Some(32))
                 && !has_memcmp(filters, TOKEN_ACCOUNT_DELEGATE_TAG_OFFSET, None);
         }
-        // With a token owner filter, the mint stays off its index: a popular mint has many holders.
-        let has_tokenowner_filter = has_memcmp(filters, TOKEN_ACCOUNT_OWNER_OFFSET, Some(32));
 
         let delegate_tag = RpcFilterType::Memcmp(Memcmp::new_raw_bytes(
             TOKEN_ACCOUNT_DELEGATE_TAG_OFFSET,
@@ -80,9 +78,7 @@ impl SqlFilters {
             filters
                 .iter()
                 .chain(add_delegate_tag.then_some(&delegate_tag))
-                .filter_map(|filter| {
-                    filter_sql(filter, table, is_token_program, has_tokenowner_filter)
-                })
+                .filter_map(|filter| filter_sql(filter, table, is_token_program))
                 .map(|clause| format!("AND {clause}"))
                 .collect::<Vec<_>>()
                 .join("\n                    ")
@@ -128,14 +124,9 @@ fn has_memcmp(filters: &[RpcFilterType], offset: usize, len: Option<usize>) -> b
     })
 }
 
-/// One filter as a SQL predicate on `table`. Token owner, delegate-tag and mint memcmps become the
-/// token index expressions; the mint does not when `has_tokenowner_filter` is set.
-fn filter_sql(
-    filter: &RpcFilterType,
-    table: &str,
-    token_program: bool,
-    has_tokenowner_filter: bool,
-) -> Option<String> {
+/// One filter as a SQL predicate on `table`. For a token program, owner, mint and delegate-tag
+/// memcmps become the exact expressions the token indexes are built on.
+fn filter_sql(filter: &RpcFilterType, table: &str, token_program: bool) -> Option<String> {
     match filter {
         RpcFilterType::DataSize(size) => Some(format!("length({table}.data) = {size}")),
         RpcFilterType::Memcmp(memcmp) => {
@@ -145,10 +136,7 @@ fn filter_sql(
             if token_program {
                 if offset == TOKEN_ACCOUNT_OWNER_OFFSET && bytes.len() == 32 {
                     return Some(format!("{table}.token_owner = {}", bytea_literal(bytes)));
-                } else if !has_tokenowner_filter
-                    && offset == TOKEN_ACCOUNT_MINT_OFFSET
-                    && bytes.len() == 32
-                {
+                } else if offset == TOKEN_ACCOUNT_MINT_OFFSET && bytes.len() == 32 {
                     return Some(format!("{table}.token_mint = {}", bytea_literal(bytes)));
                 } else if offset == TOKEN_ACCOUNT_DELEGATE_TAG_OFFSET && bytes == [1, 0, 0, 0] {
                     // The first byte alone is the predicate of the token delegate partial index.
@@ -180,7 +168,7 @@ mod tests {
     use cloudbreak_core::utils::token::LEGACY_TOKEN_PROGRAM_ID;
 
     fn sql(filter: RpcFilterType, token_program: bool) -> String {
-        filter_sql(&filter, "accounts", token_program, false).unwrap()
+        filter_sql(&filter, "accounts", token_program).unwrap()
     }
 
     fn memcmp(offset: usize, bytes: &[u8]) -> RpcFilterType {
@@ -199,27 +187,6 @@ mod tests {
             sql(memcmp(0, &key), true),
             format!("accounts.token_mint = '\\x{hex}'::bytea")
         );
-    }
-
-    #[test]
-    fn with_a_tokenowner_filter_the_mint_is_a_plain_byte_comparison() {
-        let (owner, mint) = ([7u8; 32], [8u8; 32]);
-        let sql = SqlFilters::build(
-            &LEGACY_TOKEN_PROGRAM_ID,
-            &[memcmp(0, &mint), memcmp(32, &owner)],
-            "gpa",
-        )
-        .unwrap();
-        assert_eq!(
-            sql.accounts,
-            format!(
-                "AND SUBSTRING(accounts.data FROM 1 FOR 32) = E'\\\\x{}'::bytea\n                    AND accounts.token_owner = '\\x{}'::bytea",
-                hex::encode(mint),
-                hex::encode(owner)
-            )
-        );
-        assert!(!sql.snapshot.contains("token_mint"));
-        assert_eq!(sql.label, "gpa_mint");
     }
 
     #[test]
