@@ -471,7 +471,7 @@ The first batch is fetched, encoded, and serialized before the response status l
 
 - `{ "mint" }` reads the mint first. Its token program becomes the program. A missing or closed mint returns `Invalid param: could not find mint`, and a mint that does not unpack returns `Invalid param: Token mint could not be unpacked`. `{ "programId" }` must be a token program.
 - The response always has a context.
-- For a token program, the SQL uses the token indexes: `memcmp(32)` becomes `token_owner`, `memcmp(0)` becomes `token_mint`, and `memcmp(72, [1,0,0,0])` is written as the delegate index predicate. `tokenAccountState` matches Agave's `Account::valid_account_data`: initialized, 165 bytes, or longer with account type 2 and not a 355-byte multisig.
+- For a token program, the SQL uses the token indexes: `memcmp(32)` becomes `token_owner`, `memcmp(0)` becomes `token_mint`, and `memcmp(72, [1,0,0,0])` is written as the delegate index predicate. An owner and a mint filter together use the `(token_owner, token_mint)` index on `snapshot_accounts`. `tokenAccountState` matches Agave's `Account::valid_account_data`: initialized, 165 bytes, or longer with account type 2 and not a 355-byte multisig.
 - A token-program `getProgramAccounts` must filter on owner, mint or delegate (`memcmp` of 32 bytes at 32, 0 or 76). Otherwise it returns `Invalid params`. Agave accepts it as a full scan.
 - With `jsonParsed`, each account is encoded with its own mint, as in Agave. Each batch of fresh rows looks up its distinct mints in one query by pubkey. A token account whose mint is missing or does not unpack has no decimals, does not parse, and is left out, as in Agave. This applies to `getProgramAccounts` on a token program too.
 

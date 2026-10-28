@@ -1779,6 +1779,8 @@ pub struct SnapshotPgIndexesConfig {
     #[serde(default = "default_true")]
     pub idx_snapshot_accounts_token_owner: bool,
     #[serde(default = "default_true")]
+    pub idx_snapshot_accounts_token_owner_mint: bool,
+    #[serde(default = "default_true")]
     pub idx_snapshot_accounts_token_delegate: bool,
 }
 
@@ -1789,6 +1791,7 @@ impl Default for SnapshotPgIndexesConfig {
             idx_snapshot_accounts_pubkey_slot: true,
             idx_snapshot_accounts_token_mint: true,
             idx_snapshot_accounts_token_owner: true,
+            idx_snapshot_accounts_token_owner_mint: true,
             idx_snapshot_accounts_token_delegate: true,
         }
     }
