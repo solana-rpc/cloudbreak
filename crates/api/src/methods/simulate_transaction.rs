@@ -61,8 +61,7 @@ use tracing::Instrument;
 use crate::db_query;
 use crate::error::RpcError;
 use crate::http::{CachedFeatureSet, CloudbreakRpcState};
-use crate::utils::token::is_token_program;
-use crate::utils::token::parse_additional_mint_data;
+use cloudbreak_core::utils::token::{MintState, is_token_program};
 
 /// Default cluster lamports-per-signature
 const LAMPORTS_PER_SIGNATURE: u64 = 5000;
@@ -838,7 +837,7 @@ fn additional_mint_data(
         .get(&mint_pubkey)
         .map(|mint| mint.data())
         .unwrap_or(&[]);
-    parse_additional_mint_data(&mint_pubkey, mint_data, block_time)
+    MintState::from_mint(&mint_pubkey, mint_data).map(|mint| mint.additional_data(block_time))
 }
 
 /// Mint pubkey held in bytes 0..32 of a token account
@@ -1174,7 +1173,7 @@ fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::token::LEGACY_TOKEN_PROGRAM_ID;
+    use cloudbreak_core::utils::token::LEGACY_TOKEN_PROGRAM_ID;
     use solana_account::Account;
 
     const MINT_DECIMALS: u8 = 6;

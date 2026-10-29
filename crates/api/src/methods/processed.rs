@@ -50,7 +50,7 @@ use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
 use crate::methods::resolve_commitment;
 use crate::slot_syncronizer::SlotSyncronizerData;
-use crate::utils::token::is_token_program;
+use cloudbreak_core::utils::token::is_token_program;
 use crate::{db_query, metrics};
 
 /// How one request reads: at a commitment, or through processed blocks.
@@ -373,7 +373,7 @@ fn pubkey_column(row: &PgRow, column: &str) -> Result<Pubkey, RpcError> {
 mod tests {
     use super::*;
     use crate::slot_syncronizer::SlotData;
-    use crate::utils::token::LEGACY_TOKEN_PROGRAM_ID;
+    use cloudbreak_core::utils::token::LEGACY_TOKEN_PROGRAM_ID;
 
     fn slots(confirmed: u64, finalized: u64, healthy: bool) -> SlotSyncronizerData {
         SlotSyncronizerData {

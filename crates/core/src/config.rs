@@ -3,6 +3,9 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+//! The config of every binary. Optional modules follow the "Optional modules" rules in the
+//! README: an `Option` section with `enabled` here, a null-object handle in the module.
+
 // use crate::AccountSelect;
 use anyhow::Result;
 use sea_orm::{ConnectOptions, ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
@@ -433,6 +436,10 @@ pub struct IndexConfig {
     /// section is present with `enabled = true`.
     #[serde(rename = "token-largest-accounts")]
     pub token_largest_accounts: Option<TokenLargestAccountsConfig>,
+    /// The indexer keeps the `mints` table and its in-memory copy when this section is present
+    /// with `enabled = true`. Requires `[snapshot]` and both token programs indexed.
+    #[serde(rename = "mint-cache")]
+    pub mint_cache: Option<MintCacheConfig>,
 }
 
 /// The `[supply]` section. Enabled by presence with `enabled = true`.
@@ -564,6 +571,10 @@ impl IndexConfig {
 
     pub fn supply_enabled(&self) -> bool {
         self.supply.as_ref().is_some_and(|supply| supply.enabled)
+    }
+
+    pub fn mint_cache_enabled(&self) -> bool {
+        self.mint_cache.as_ref().is_some_and(|mints| mints.enabled)
     }
 }
 
@@ -759,25 +770,169 @@ pub struct ApiConfig {
     /// `[token-largest-accounts]` state.
     #[serde(rename = "token-largest-accounts", default)]
     pub token_largest_accounts: Option<MethodSection>,
+    /// The API gRPC feed: blocks with accounts at processed commitment. Required by
+    /// `[processed-accounts]` and `[mint-cache]`.
+    #[serde(default)]
+    pub grpc: Option<ApiGrpcConfig>,
     /// Serves processed commitment for getAccountInfo, getMultipleAccounts, getBalance,
-    /// getTokenAccountBalance, getTokenSupply and getSlot. Requires `[slot-syncronizer]`.
+    /// getTokenAccountBalance, getTokenSupply and getSlot. Requires `[grpc]` and `[slot-syncronizer]`.
     #[serde(rename = "processed-accounts", default)]
     pub processed_accounts: Option<ProcessedAccountsConfig>,
+    /// Keeps the mint data `jsonParsed` needs in memory. Requires `[grpc]`, `[slot-syncronizer]`
+    /// and the indexer's `[mint-cache]`.
+    #[serde(rename = "mint-cache", default)]
+    pub mint_cache: Option<MintCacheConfig>,
 }
 
-/// The in-memory processed blocks around the Postgres confirmed slot, fed by a
-/// Yellowstone block subscription. See `modules::processed`.
+/// The Yellowstone gRPC endpoint of the API feed. See `modules::grpc`. The connection knobs
+/// default to the values the indexer runs with.
 #[derive(Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
-pub struct ProcessedAccountsConfig {
+pub struct ApiGrpcConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// Yellowstone gRPC endpoint that allows processed commitment and interslot updates.
+    /// Yellowstone gRPC endpoint that allows processed commitment.
     #[serde(default)]
     pub endpoint: String,
     /// Sent as the `x-token` header.
     #[serde(rename = "x-token", default)]
     pub x_token: Option<String>,
+    /// Connect and request timeout, in seconds.
+    #[serde(default = "ApiGrpcConfig::default_timeout")]
+    pub timeout: u64,
+    #[serde(
+        rename = "max-grpc-errors",
+        default = "ApiGrpcConfig::default_max_grpc_errors"
+    )]
+    pub max_grpc_errors: usize,
+    #[serde(
+        rename = "reconnect-give-up",
+        default = "GrpcConfig::default_reconnect_give_up",
+        deserialize_with = "deserialize_duration_required"
+    )]
+    pub reconnect_give_up: Duration,
+    #[serde(
+        rename = "reconnect-backoff",
+        default = "GrpcConfig::default_reconnect_backoff",
+        deserialize_with = "deserialize_duration_required"
+    )]
+    pub reconnect_backoff: Duration,
+    #[serde(
+        rename = "reconnect-from-slot-retain",
+        default = "GrpcConfig::default_reconnect_from_slot_retain",
+        deserialize_with = "deserialize_duration_required"
+    )]
+    pub reconnect_from_slot_retain: Duration,
+}
+
+impl ApiGrpcConfig {
+    const fn default_timeout() -> u64 {
+        60
+    }
+    const fn default_max_grpc_errors() -> usize {
+        1
+    }
+
+    /// The indexer `[grpc]` shape that `modules::grpc` takes. Indexer-only fields keep their defaults.
+    pub fn to_grpc_config(&self) -> GrpcConfig {
+        GrpcConfig {
+            endpoint: self.endpoint.clone(),
+            x_token: self.x_token.clone(),
+            timeout: self.timeout,
+            jobs: None,
+            sources_channel_size: GrpcConfig::default_sources_channel_size(),
+            chunk_size: GrpcConfig::default_chunk_size(),
+            max_chunk_bytes_data: GrpcConfig::default_max_chunk_bytes_data(),
+            max_grpc_errors: self.max_grpc_errors,
+            reconnect_give_up: self.reconnect_give_up,
+            reconnect_backoff: self.reconnect_backoff,
+            reconnect_from_slot_retain: self.reconnect_from_slot_retain,
+        }
+    }
+}
+
+/// The in-memory processed blocks around the Postgres confirmed slot, fed by the
+/// `[grpc]` feed. See `modules::processed`.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessedAccountsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl ProcessedAccountsConfig {
+    /// An enabled `[processed-accounts]` needs the `[grpc]` feed and the slot syncronizer anchor.
+    pub fn check_required_modules(&self, config: &ApiConfig) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            config.grpc_enabled(),
+            "processed-accounts requires [grpc] enabled = true"
+        );
+        anyhow::ensure!(
+            config.slot_syncronizer.enabled,
+            "processed-accounts requires [slot-syncronizer] enabled = true"
+        );
+        Ok(())
+    }
+}
+
+/// The `[mint-cache]` section of the API and the indexer. See `modules::mint_cache`.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct MintCacheConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Indexer only: how many slots pass between two writes of the changed mints to `mints`.
+    #[serde(
+        rename = "db-write-interval-slots",
+        default = "MintCacheConfig::default_db_write_interval_slots"
+    )]
+    pub db_write_interval_slots: u64,
+}
+
+impl MintCacheConfig {
+    /// About 2.5 minutes with Alpenglow's 150 ms slots.
+    const fn default_db_write_interval_slots() -> u64 {
+        1_000
+    }
+
+    /// On the API, an enabled `[mint-cache]` needs the `[grpc]` feed and the slot syncronizer,
+    /// which applies each confirmed slot's mint changes.
+    pub fn check_required_api_modules(&self, config: &ApiConfig) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            config.grpc_enabled(),
+            "mint-cache requires [grpc] enabled = true"
+        );
+        anyhow::ensure!(
+            config.slot_syncronizer.enabled,
+            "mint-cache requires [slot-syncronizer] enabled = true"
+        );
+        Ok(())
+    }
+
+    /// On the indexer, an enabled `[mint-cache]` fills `mints` after the snapshot load, and must
+    /// see every write of both token programs.
+    pub fn check_required_indexer_modules(&self, config: &IndexConfig) -> Result<()> {
+        use crate::utils::token::{LEGACY_TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID};
+        if !self.enabled {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            config.snapshot.is_some(),
+            "mint-cache requires the [snapshot] section"
+        );
+        anyhow::ensure!(
+            config.programs.is_program_selected(&LEGACY_TOKEN_PROGRAM_ID)
+                && config.programs.is_program_selected(&TOKEN_2022_PROGRAM_ID),
+            "mint-cache requires both token programs in the [programs] filter"
+        );
+        Ok(())
+    }
 }
 
 /// Config section for an optional API method; the method is served only when
@@ -1443,13 +1598,12 @@ impl ApiConfig {
             .is_some_and(|processed| processed.enabled)
     }
 
-    /// Checks the `[slot-syncronizer]` requirement of an enabled `[processed-accounts]`.
-    pub fn validate_processed_accounts(&self) -> Result<()> {
-        anyhow::ensure!(
-            !self.processed_accounts_enabled() || self.slot_syncronizer.enabled,
-            "processed-accounts requires [slot-syncronizer] enabled = true"
-        );
-        Ok(())
+    pub fn mint_cache_enabled(&self) -> bool {
+        self.mint_cache.as_ref().is_some_and(|mints| mints.enabled)
+    }
+
+    pub fn grpc_enabled(&self) -> bool {
+        self.grpc.as_ref().is_some_and(|grpc| grpc.enabled)
     }
 }
 
@@ -1625,6 +1779,8 @@ pub struct SnapshotPgIndexesConfig {
     #[serde(default = "default_true")]
     pub idx_snapshot_accounts_token_owner: bool,
     #[serde(default = "default_true")]
+    pub idx_snapshot_accounts_token_owner_mint: bool,
+    #[serde(default = "default_true")]
     pub idx_snapshot_accounts_token_delegate: bool,
 }
 
@@ -1635,6 +1791,7 @@ impl Default for SnapshotPgIndexesConfig {
             idx_snapshot_accounts_pubkey_slot: true,
             idx_snapshot_accounts_token_mint: true,
             idx_snapshot_accounts_token_owner: true,
+            idx_snapshot_accounts_token_owner_mint: true,
             idx_snapshot_accounts_token_delegate: true,
         }
     }
@@ -1730,7 +1887,9 @@ url = "postgres://localhost/cloudbreak"
         ] {
             let config = api_config(extra).unwrap();
             assert!(!config.processed_accounts_enabled());
-            config.validate_processed_accounts().unwrap();
+            if let Some(processed) = &config.processed_accounts {
+                processed.check_required_modules(&config).unwrap();
+            }
         }
     }
 
@@ -1749,16 +1908,84 @@ url = "postgres://localhost/cloudbreak"
         assert!(err.contains("unknown field"), "{err}");
     }
 
+    const GRPC: &str = "[grpc]\nenabled = true\nendpoint = \"http://grpc\"\n";
+
+    /// Runs the `check_required_modules` of the enabled API section under test.
+    fn check(config: &ApiConfig, section: &str) -> Result<()> {
+        match section {
+            "processed-accounts" => config
+                .processed_accounts
+                .as_ref()
+                .unwrap()
+                .check_required_modules(config),
+            _ => config
+                .mint_cache
+                .as_ref()
+                .unwrap()
+                .check_required_api_modules(config),
+        }
+    }
+
     #[test]
-    fn processed_accounts_requires_slot_syncronizer() {
-        let config = api_config(
-            "[slot-syncronizer]\nenabled = false\n\n[processed-accounts]\nenabled = true\nendpoint = \"http://grpc\"\n",
-        )
-        .unwrap();
-        let err = config
-            .validate_processed_accounts()
+    fn grpc_consumers_require_slot_syncronizer() {
+        for section in ["processed-accounts", "mint-cache"] {
+            let config = api_config(&format!(
+                "{GRPC}\n[slot-syncronizer]\nenabled = false\n\n[{section}]\nenabled = true\n"
+            ))
+            .unwrap();
+            let err = check(&config, section).unwrap_err().to_string();
+            assert!(err.contains("slot-syncronizer") && err.contains(section), "{err}");
+        }
+    }
+
+    #[test]
+    fn grpc_consumers_require_grpc() {
+        for section in ["processed-accounts", "mint-cache"] {
+            for grpc in ["", "[grpc]\nenabled = false\nendpoint = \"http://grpc\"\n"] {
+                let config =
+                    api_config(&format!("{grpc}\n[{section}]\nenabled = true\n")).unwrap();
+                let err = check(&config, section).unwrap_err().to_string();
+                assert!(err.contains("[grpc]") && err.contains(section), "{err}");
+            }
+            // A disabled section requires nothing.
+            let config = api_config(&format!("[{section}]\nenabled = false\n")).unwrap();
+            check(&config, section).unwrap();
+        }
+    }
+
+    #[test]
+    fn grpc_section_is_read_and_gated_on_enabled() {
+        let config = api_config(&format!("{GRPC}x-token = \"t\"\n")).unwrap();
+        assert!(config.grpc_enabled());
+        let grpc = config.grpc.as_ref().unwrap();
+        assert_eq!(grpc.endpoint, "http://grpc");
+        assert_eq!(grpc.x_token.as_deref(), Some("t"));
+        let indexer = grpc.to_grpc_config();
+        assert_eq!((indexer.timeout, indexer.max_grpc_errors), (60, 1));
+        assert_eq!(indexer.reconnect_give_up, Duration::from_secs(600));
+        assert_eq!(indexer.reconnect_backoff, Duration::from_secs(5));
+        assert_eq!(indexer.reconnect_from_slot_retain, Duration::from_secs(300));
+        assert!(
+            !api_config("[grpc]\nendpoint = \"http://grpc\"\n")
+                .unwrap()
+                .grpc_enabled()
+        );
+        assert!(!api_config("").unwrap().grpc_enabled());
+    }
+
+    #[test]
+    fn processed_accounts_no_longer_takes_an_endpoint() {
+        let err = api_config("[processed-accounts]\nenabled = true\nendpoint = \"http://grpc\"\n")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("slot-syncronizer"), "{err}");
+        assert!(err.contains("unknown field"), "{err}");
+    }
+
+    #[test]
+    fn mint_cache_defaults_and_gate() {
+        let config = api_config("[mint-cache]\nenabled = true\n").unwrap();
+        assert!(config.mint_cache_enabled());
+        let config = api_config("[mint-cache]\nenabled = false\n").unwrap();
+        assert!(!config.mint_cache_enabled());
     }
 }

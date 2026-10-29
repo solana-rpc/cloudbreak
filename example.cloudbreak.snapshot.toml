@@ -28,4 +28,5 @@ idx_snapshot_accounts_pubkey = false
 idx_snapshot_accounts_pubkey_slot = true
 idx_snapshot_accounts_token_mint = true
 idx_snapshot_accounts_token_owner = true
+idx_snapshot_accounts_token_owner_mint = true
 idx_snapshot_accounts_token_delegate = true

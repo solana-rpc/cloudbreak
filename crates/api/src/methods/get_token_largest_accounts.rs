@@ -18,8 +18,8 @@ use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
 use crate::methods::get_largest_accounts::fetch_largest_record;
 use crate::methods::resolve_commitment;
-use crate::utils::token::{is_token_program, parse_additional_mint_data};
 use crate::{db_query, metrics};
+use cloudbreak_core::utils::token::{MintState, is_token_program};
 
 #[tracing::instrument(name = "get_token_largest_accounts_rpc", skip_all, fields(pubkey = %mint))]
 pub async fn get_token_largest_accounts(
@@ -83,7 +83,8 @@ pub async fn get_token_largest_accounts(
     }
     // Agave unpacks the mint data before it checks the owner.
     let data: Vec<u8> = mint_row.get("data");
-    let additional_mint_data = parse_additional_mint_data(&pubkey, &data, block_time);
+    let additional_mint_data =
+        MintState::from_mint(&pubkey, &data).map(|mint| mint.additional_data(block_time));
     let additional_data = additional_mint_data
         .as_ref()
         .and_then(|d| d.spl_token_additional_data.as_ref())

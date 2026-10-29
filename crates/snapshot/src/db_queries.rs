@@ -114,16 +114,31 @@ pub async fn create_database_indexes(
     }
 
     if cfg.idx_snapshot_accounts_token_owner {
+        // The program is in the key: an owner's accounts in the other token program are not read.
         db.execute_unprepared(
             r#"
                 CREATE INDEX idx_snapshot_accounts_token_owner
-                ON snapshot_accounts (token_owner)
+                ON snapshot_accounts (token_owner, owner)
                 WHERE owner = '\x06ddf6e1d765a193d9cbe146ceeb79ac1cb485ed5f5b37913a8cf5857eff00a9'::bytea
                 OR owner = '\x06ddf6e1ee758fde18425dbce46ccddab61afc4d83b90d27febdf928d8a18bfc'::bytea;
             "#
         )
         .await?;
         tracing::info!(target: "create_database_indexes", "created idx_snapshot_accounts_token_owner in {} seconds (total accumulated)", start_time.elapsed().as_secs_f64());
+    }
+
+    if cfg.idx_snapshot_accounts_token_owner_mint {
+        // Serves an owner and mint filter together: either side alone can match millions of rows.
+        db.execute_unprepared(
+            r#"
+                CREATE INDEX idx_snapshot_accounts_token_owner_mint
+                ON snapshot_accounts (token_owner, token_mint)
+                WHERE owner = '\x06ddf6e1d765a193d9cbe146ceeb79ac1cb485ed5f5b37913a8cf5857eff00a9'::bytea
+                OR owner = '\x06ddf6e1ee758fde18425dbce46ccddab61afc4d83b90d27febdf928d8a18bfc'::bytea;
+            "#
+        )
+        .await?;
+        tracing::info!(target: "create_database_indexes", "created idx_snapshot_accounts_token_owner_mint in {} seconds (total accumulated)", start_time.elapsed().as_secs_f64());
     }
 
     if cfg.idx_snapshot_accounts_pubkey_slot {

@@ -6,12 +6,14 @@
 //! Keeps the confirmed and finalized slots and the service health in memory. The `slots_notify`
 //! trigger sends every real change of a `slots` row on [`SLOTS_CHANNEL`]; this task applies it.
 //! A lost connection, a bad payload or [`IDLE_TIMEOUT`] without a notification panics.
-//! With `[processed-accounts]` enabled it also publishes the processed [`Anchor`].
+//! With `[processed-accounts]` enabled it also publishes the processed [`Anchor`]. With
+//! `[mint-cache]` it applies each confirmed slot's mint changes before publishing the slot.
 
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use cloudbreak_core::ApiConfig;
+use cloudbreak_core::modules::mint_cache::MintCache;
 use cloudbreak_core::modules::processed::Anchor;
 use sea_orm::DatabaseConnection;
 use sea_orm::sqlx::postgres::PgListener;
@@ -83,6 +85,7 @@ pub fn start_slot_syncronizer(
     db: DatabaseConnection,
     config: &ApiConfig,
     anchor_tx: watch::Sender<Option<Anchor>>,
+    mint_cache: MintCache,
 ) -> Option<(JoinHandle<()>, Arc<RwLock<SlotSyncronizerData>>)> {
     if !config.slot_syncronizer.enabled {
         return None;
@@ -90,7 +93,7 @@ pub fn start_slot_syncronizer(
 
     let data = Arc::new(RwLock::new(SlotSyncronizerData::default()));
     let anchor_tx = config.processed_accounts_enabled().then_some(anchor_tx);
-    let handle = tokio::spawn(run(db, data.clone(), anchor_tx));
+    let handle = tokio::spawn(run(db, data.clone(), anchor_tx, mint_cache));
 
     Some((handle, data))
 }
@@ -101,6 +104,7 @@ async fn run(
     db: DatabaseConnection,
     data: Arc<RwLock<SlotSyncronizerData>>,
     anchor_tx: Option<watch::Sender<Option<Anchor>>>,
+    mint_cache: MintCache,
 ) {
     let mut listener = PgListener::connect_with(db.get_postgres_connection_pool())
         .await
@@ -126,8 +130,19 @@ async fn run(
                 notification.payload()
             )
         });
+        // The cache must hold a slot's mint changes before a request can pick that slot.
+        if mint_cache.is_enabled() && confirmed_advance(&data, &row) {
+            mint_cache
+                .api()
+                .on_confirmed(row.slot as u64, row.blockhash.as_deref(), row.health);
+        }
         apply(&data, anchor_tx.as_ref(), &row);
     }
+}
+
+fn confirmed_advance(data: &RwLock<SlotSyncronizerData>, row: &SlotRow) -> bool {
+    row.commitment == COMMITMENT_CONFIRMED
+        && row.slot as u64 > data.read().expect("Failed to lock slot data").confirmed_slot.slot
 }
 
 /// Applies one row. Slots never move backwards. A confirmed advance publishes the anchor.

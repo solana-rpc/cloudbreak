@@ -6,7 +6,8 @@
 //! Mint data for `jsonParsed` token accounts in a gPA,
 //! each account is encoded with its own mint, read by pubkey only, and an account that does not
 //! parse is left out. The caller builds the resolver; it remembers every mint it resolves, so a
-//! mint costs one lookup per request. It also records whether every account used an immutable
+//! mint costs one lookup per request: the mint cache (`[mint-cache]`) when it can answer,
+//! otherwise one Postgres query per batch. It also records whether every account used an immutable
 //! mint and parsed, so the response only changes when its accounts change but it can't be affected
 //! by changes to the mint account.
 //! Queries are marked as volatile inside [`MintResolver::get_mint_data`] on mutable or missing mints,
@@ -21,10 +22,6 @@ use solana_account_decoder::UiAccountEncoding;
 use solana_account_decoder::parse_account_data::AccountAdditionalDataV3;
 use solana_account_decoder::parse_token::get_token_account_mint;
 use solana_pubkey::Pubkey;
-use spl_token_2022_interface::extension::{
-    BaseStateWithExtensions, ExtensionType, StateWithExtensions,
-};
-use spl_token_2022_interface::state::Mint;
 use tokio::time::timeout;
 use tracing::Instrument;
 
@@ -32,9 +29,7 @@ use crate::db_query::{self, bytea_array_literal};
 use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
 use crate::modules::cache::MaybeJsonAccount;
-use crate::utils::token::{
-    LEGACY_TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, is_token_program, parse_additional_mint_data,
-};
+use cloudbreak_core::utils::token::{MintState, is_token_program};
 
 /// The data column of the gPA SQL rows.
 const DATA_COLUMN: usize = 6;
@@ -67,14 +62,9 @@ struct Inner {
     /// The gPA slot and block time, set once by the gPA.
     at: OnceLock<(u64, i64)>,
     /// Mints found so far. A mint that does not exist at the slot has no entry.
-    mints: Mutex<HashMap<Pubkey, StoredMint>>,
+    mints: Mutex<HashMap<Pubkey, MintState>>,
     /// `None` while every account used an immutable mint and parsed.
     volatility: Mutex<Option<Volatility>>,
-}
-
-struct StoredMint {
-    owner: Pubkey,
-    data: Vec<u8>,
 }
 
 impl std::fmt::Debug for MintResolver {
@@ -108,12 +98,14 @@ impl MintResolver {
 
     /// Adds a mint the caller already read, so the gPA never looks it up.
     pub fn with_mint(self, mint: Pubkey, owner: Pubkey, data: Vec<u8>) -> Self {
-        if let Some(inner) = &self.0 {
+        if let Some(inner) = &self.0
+            && let Some(state) = MintState::from_mint(&mint, &data)
+        {
             inner
                 .mints
                 .lock()
                 .expect("mint resolver mutex poisoned")
-                .insert(mint, StoredMint { owner, data });
+                .insert(mint, state.classify(&owner));
         }
         self
     }
@@ -125,8 +117,8 @@ impl MintResolver {
         }
     }
 
-    /// Looks up the mints of the batch's fresh token accounts that are not resolved yet, in one
-    /// query, by pubkey only.
+    /// Resolves the mints of the batch's fresh token accounts that are not resolved yet: from
+    /// the mint cache when it can answer, otherwise in one Postgres query by pubkey only.
     pub async fn resolve_mints(&self, rows: &[PgRow]) -> Result<(), RpcError> {
         let Some(inner) = &self.0 else {
             return Ok(());
@@ -141,12 +133,18 @@ impl MintResolver {
                 .into_iter()
                 .collect()
         };
-        if new_mint_keys.is_empty() {
-            return Ok(());
-        }
 
         // Use the same slot the gPA is operating at for consistency.
         let (slot, _) = inner.slot_and_block_time();
+
+        let new_mint_keys = inner
+            .state
+            .mint_cache
+            .api()
+            .resolve(new_mint_keys, slot, &inner.mints);
+        if new_mint_keys.is_empty() {
+            return Ok(());
+        }
 
         let sql = include_str!("../db/getMultipleAccounts.sql")
             .replace("$1", &bytea_array_literal(&new_mint_keys))
@@ -179,13 +177,10 @@ impl MintResolver {
                 tracing::error!("Mint lookup returned a row without pubkey, owner or data");
                 return Err(RpcError::InternalError);
             };
-            mints.insert(
-                Pubkey::new_from_array(pubkey),
-                StoredMint {
-                    owner: Pubkey::new_from_array(owner),
-                    data,
-                },
-            );
+            let pubkey = Pubkey::new_from_array(pubkey);
+            if let Some(state) = MintState::from_mint(&pubkey, &data) {
+                mints.insert(pubkey, state.classify(&Pubkey::new_from_array(owner)));
+            }
         }
         Ok(())
     }
@@ -198,14 +193,14 @@ impl MintResolver {
         let mint = get_mint_from_token_account(row)?;
         let (_, block_time) = inner.slot_and_block_time();
         if mint == spl_token_interface::native_mint::id() {
-            return parse_additional_mint_data(&mint, &[], block_time);
+            return MintState::from_mint(&mint, &[]).map(|state| state.additional_data(block_time));
         }
         let mints = inner.mints.lock().expect("mint resolver mutex poisoned");
-        let additional = mints.get(&mint).and_then(|stored| {
-            if !is_immutable_mint(&stored.owner, &stored.data) {
+        let additional = mints.get(&mint).map(|state| {
+            if !state.immutable {
                 inner.mark_as_volatile(Volatility::MutableMint);
             }
-            parse_additional_mint_data(&mint, &stored.data, block_time)
+            state.additional_data(block_time)
         });
         if additional.is_none() {
             inner.mark_as_volatile(Volatility::MutableMint);
@@ -268,104 +263,4 @@ impl Inner {
 fn get_mint_from_token_account(row: &PgRow) -> Option<Pubkey> {
     let data: Option<Vec<u8>> = row.try_get(DATA_COLUMN).ok().flatten();
     get_token_account_mint(&data?)
-}
-
-/// True when nothing `jsonParsed` reads from the mint can change: a Tokenkeg mint, or a
-/// Token-2022 mint without close authority, interest-bearing or scaled-UI config.
-pub(crate) fn is_immutable_mint(owner: &Pubkey, data: &[u8]) -> bool {
-    if *owner == LEGACY_TOKEN_PROGRAM_ID {
-        return true;
-    }
-    if *owner != TOKEN_2022_PROGRAM_ID {
-        return false;
-    }
-    let Ok(mint) = StateWithExtensions::<Mint>::unpack(data) else {
-        return false;
-    };
-    let Ok(extension_types) = mint.get_extension_types() else {
-        return false;
-    };
-    !extension_types.iter().any(|extension_type| {
-        matches!(
-            extension_type,
-            ExtensionType::MintCloseAuthority
-                | ExtensionType::InterestBearingConfig
-                | ExtensionType::ScaledUiAmount
-        )
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use spl_token_2022_interface::extension::{
-        BaseStateWithExtensionsMut, StateWithExtensionsMut,
-        mint_close_authority::MintCloseAuthority,
-    };
-
-    /// An 82-byte mint with no authorities: decimals at byte 44, `is_initialized` at byte 45.
-    fn legacy_mint_data() -> Vec<u8> {
-        let mut data = vec![0u8; 82];
-        data[44] = 6;
-        data[45] = 1;
-        data
-    }
-
-    fn token_2022_mint_data(extensions: &[ExtensionType]) -> Vec<u8> {
-        let len = ExtensionType::try_calculate_account_len::<Mint>(extensions).unwrap();
-        let mut data = vec![0u8; len];
-        let mut mint = StateWithExtensionsMut::<Mint>::unpack_uninitialized(&mut data).unwrap();
-        for extension in extensions {
-            match extension {
-                ExtensionType::MintCloseAuthority => {
-                    mint.init_extension::<MintCloseAuthority>(true).unwrap();
-                }
-                ExtensionType::MetadataPointer => {
-                    mint.init_extension::<
-                        spl_token_2022_interface::extension::metadata_pointer::MetadataPointer,
-                    >(true)
-                    .unwrap();
-                }
-                other => panic!("unsupported test extension {other:?}"),
-            }
-        }
-        mint.base.decimals = 6;
-        mint.base.is_initialized = true;
-        mint.pack_base();
-        mint.init_account_type().unwrap();
-        data
-    }
-
-    #[test]
-    fn tokenkeg_mints_are_immutable() {
-        assert!(is_immutable_mint(
-            &LEGACY_TOKEN_PROGRAM_ID,
-            &legacy_mint_data()
-        ));
-    }
-
-    #[test]
-    fn token_2022_mints_are_immutable_without_close_authority_or_configs() {
-        assert!(is_immutable_mint(
-            &TOKEN_2022_PROGRAM_ID,
-            &legacy_mint_data()
-        ));
-        assert!(is_immutable_mint(
-            &TOKEN_2022_PROGRAM_ID,
-            &token_2022_mint_data(&[ExtensionType::MetadataPointer])
-        ));
-        assert!(!is_immutable_mint(
-            &TOKEN_2022_PROGRAM_ID,
-            &token_2022_mint_data(&[ExtensionType::MintCloseAuthority])
-        ));
-    }
-
-    #[test]
-    fn other_owners_and_garbage_are_mutable() {
-        assert!(!is_immutable_mint(
-            &Pubkey::new_unique(),
-            &legacy_mint_data()
-        ));
-        assert!(!is_immutable_mint(&TOKEN_2022_PROGRAM_ID, &[1, 2, 3]));
-    }
 }
