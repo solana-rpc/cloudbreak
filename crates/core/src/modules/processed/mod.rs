@@ -81,7 +81,8 @@
 //! # Upstream invariants
 //!
 //! Correctness leans on yellowstone-grpc plugin and Agave behaviour. Recheck
-//! each one on every plugin major version bump.
+//! each one on every plugin major version bump. Last rechecked at proto 14
+//! (yellowstone v17, Agave 4.4): all five hold, and `seal()` is unchanged.
 //!
 //! - At most one entry per pubkey per block, the one with the highest
 //!   `write_version`. The plugin's `ProcessingSlot::seal()` enforces it. Ingest
@@ -97,6 +98,8 @@
 //!   undetected and a block that mixes two attempts can be served.
 //! - `parent_blockhash` equals the parent block's `blockhash`. Agave bank
 //!   construction enforces it. If it breaks, nothing links and no blocks are served.
+//! - A slot carries one bank at a time. Proto 14 adds `bank_id` to the block and
+//!   slot updates; the store still keys conflicts on blockhash and ignores it.
 
 mod ingest;
 mod read;

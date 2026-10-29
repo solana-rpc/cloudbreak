@@ -9,8 +9,8 @@ use serde::Deserialize;
 use solana_accounts_db::blockhash_queue::BlockhashQueue;
 use solana_program::clock::{Epoch, Slot, UnixTimestamp};
 use solana_pubkey::Pubkey;
-use solana_runtime::stake_history::StakeHistory;
 use solana_serde::default_on_eof;
+use solana_stake_interface::stake_history::StakeHistory;
 use solana_vote::vote_account::VoteAccounts;
 
 pub const MAX_STREAM_SIZE: u64 = 32 * 1024 * 1024 * 1024;
@@ -92,7 +92,9 @@ pub struct DeserializableVersionedBank {
     pub slots_per_year: f64,
     pub accounts_data_len: u64,
     pub slot: Slot,
-    pub epoch: Epoch,
+    // Agave serializes this as a placeholder and always writes 0. Derive the epoch from
+    // `epoch_schedule` and `slot` instead.
+    pub unused_epoch: Epoch,
     pub block_height: u64,
     pub collector_id: Pubkey,
     pub collector_fees: u64,
