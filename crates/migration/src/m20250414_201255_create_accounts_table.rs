@@ -57,12 +57,14 @@ impl MigrationTrait for Migration {
         }
 
         if indexes.idx_accounts_token_owner {
+            // The program is in the key: an owner's accounts in the other token program are not read.
             manager
                 .create_index(
                     Index::create()
                         .name("idx_accounts_token_owner")
                         .table(Account::Table)
                         .col(Account::TokenOwner)
+                        .col(Account::Owner)
                         .cond_where(
                             Condition::any()
                                 .add(Expr::col(Account::Owner).eq(TOKEN_KEG_ID.as_ref()))

@@ -114,10 +114,11 @@ pub async fn create_database_indexes(
     }
 
     if cfg.idx_snapshot_accounts_token_owner {
+        // The program is in the key: an owner's accounts in the other token program are not read.
         db.execute_unprepared(
             r#"
                 CREATE INDEX idx_snapshot_accounts_token_owner
-                ON snapshot_accounts (token_owner)
+                ON snapshot_accounts (token_owner, owner)
                 WHERE owner = '\x06ddf6e1d765a193d9cbe146ceeb79ac1cb485ed5f5b37913a8cf5857eff00a9'::bytea
                 OR owner = '\x06ddf6e1ee758fde18425dbce46ccddab61afc4d83b90d27febdf928d8a18bfc'::bytea;
             "#
