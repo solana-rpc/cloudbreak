@@ -17,8 +17,8 @@ program_accounts AS MATERIALIZED (
         accounts.token_owner
     FROM accounts
     WHERE
-        accounts.owner = $1
-        AND accounts.slot <= $2
+        accounts.owner = {program}
+        AND accounts.slot <= {latest_slot}
     -- {accounts_filters}
     UNION ALL
     SELECT
@@ -33,8 +33,8 @@ program_accounts AS MATERIALIZED (
         snapshot_accounts.token_owner
     FROM snapshot_accounts
     WHERE
-        snapshot_accounts.owner = $1
-        AND snapshot_accounts.slot <= $2
+        snapshot_accounts.owner = {program}
+        AND snapshot_accounts.slot <= {latest_slot}
 -- {snapshot_filters}
 )
 

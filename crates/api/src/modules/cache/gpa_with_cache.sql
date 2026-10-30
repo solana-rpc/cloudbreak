@@ -17,8 +17,8 @@ program_accounts AS MATERIALIZED (
         accounts.token_owner
     FROM accounts
     WHERE
-        accounts.owner = $1
-        AND accounts.slot <= $2
+        accounts.owner = {program}
+        AND accounts.slot <= {latest_slot}
     -- {accounts_filters}
     UNION ALL
     SELECT
@@ -33,20 +33,20 @@ program_accounts AS MATERIALIZED (
         snapshot_accounts.token_owner
     FROM snapshot_accounts
     WHERE
-        snapshot_accounts.owner = $1
-        AND snapshot_accounts.slot <= $2
+        snapshot_accounts.owner = {program}
+        AND snapshot_accounts.slot <= {latest_slot}
 -- {snapshot_filters}
 )
 
 SELECT
     pubkey,
-    CASE WHEN slot <= $3 THEN NULL ELSE owner END, -- noqa: AL03
-    CASE WHEN slot <= $3 THEN NULL ELSE lamports END AS lamports,
-    CASE WHEN slot <= $3 THEN slot ELSE slot END AS slot,
-    CASE WHEN slot <= $3 THEN NULL ELSE executable END AS executable,
-    CASE WHEN slot <= $3 THEN NULL ELSE rent_epoch END AS rent_epoch,
-    CASE WHEN slot <= $3 THEN NULL ELSE data END, -- noqa: AL03
-    CASE WHEN slot <= $3 THEN NULL ELSE token_mint END AS token_mint
+    CASE WHEN slot <= {cache_slot} THEN NULL ELSE owner END, -- noqa: AL03
+    CASE WHEN slot <= {cache_slot} THEN NULL ELSE lamports END AS lamports,
+    CASE WHEN slot <= {cache_slot} THEN slot ELSE slot END AS slot,
+    CASE WHEN slot <= {cache_slot} THEN NULL ELSE executable END AS executable,
+    CASE WHEN slot <= {cache_slot} THEN NULL ELSE rent_epoch END AS rent_epoch,
+    CASE WHEN slot <= {cache_slot} THEN NULL ELSE data END, -- noqa: AL03
+    CASE WHEN slot <= {cache_slot} THEN NULL ELSE token_mint END AS token_mint
 FROM (
     SELECT DISTINCT ON (program_accounts.pubkey)
         program_accounts.pubkey,

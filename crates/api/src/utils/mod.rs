@@ -6,4 +6,5 @@
 //! Helpers shared by several RPC methods.
 
 pub mod encoding;
+pub mod row_account;
 pub mod sql_filters;

@@ -8,8 +8,9 @@ use cloudbreak_core::GpaCacheConfig;
 use cloudbreak_core::modules::rpc_filter_type::{
     RpcFilterType, RpcProgramAccountsConfig, has_value_cmp,
 };
-use sea_orm::sqlx::Row;
-use sea_orm::sqlx::postgres::PgRow;
+use sea_orm::sqlx::postgres::{PgArguments, PgRow};
+use sea_orm::sqlx::query::Query;
+use sea_orm::sqlx::{self, Postgres, Row};
 use solana_account_decoder::UiAccountEncoding;
 use solana_account_decoder::UiDataSliceConfig;
 use solana_account_decoder::parse_account_data::AccountAdditionalDataV3;
@@ -23,6 +24,7 @@ use std::sync::Mutex;
 use std::sync::RwLock;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+use crate::db_query::{self, bytea_literal};
 use crate::error::RpcError;
 use crate::methods::get_program_accounts;
 use crate::methods::get_program_accounts::GpaDbQueryInput;
@@ -225,6 +227,63 @@ pub struct GpaCache {
     pub pinned_size: u64,
 }
 
+/// One gPA statement and its values: the filter values, the latest slot, then the cache slot
+/// when it has one.
+pub struct GpaSql {
+    sql: String,
+    /// False for a traced request: its SQL text is unique, so it runs as an unnamed statement
+    /// and stays out of the statement cache.
+    persistent: bool,
+    filter_params: Vec<Vec<u8>>,
+    latest_slot: u64,
+    cache_slot: Option<u64>,
+}
+
+impl GpaSql {
+    /// Fills `template` for `input` and adds the pg_tracing comment only when the request is traced.
+    /// The program stays literal SQL, so each program prunes to its partition at plan time; the
+    /// slots become the parameters after the filter values.
+    pub fn new(template: &str, input: &GpaDbQueryInput, cache_slot: Option<u64>) -> Self {
+        let filters = &input.sql_filters;
+        let latest_slot = filters.params.len() + 1;
+        let mut sql = template
+            .replace("-- {accounts_filters}", &filters.accounts)
+            .replace("-- {snapshot_filters}", &filters.snapshot)
+            .replace("{program}", &bytea_literal(input.program))
+            .replace("{latest_slot}", &format!("${latest_slot}"));
+        if cache_slot.is_some() {
+            sql = sql.replace("{cache_slot}", &format!("${}", latest_slot + 1));
+        }
+
+        tracing::debug!(target: "gpa_sql", "## sql: {}", sql);
+
+        let traceparent = db_query::traceparent_comment();
+        Self {
+            persistent: traceparent.is_none(),
+            sql: match traceparent {
+                Some(comment) => format!("{comment} {sql}"),
+                None => sql,
+            },
+            filter_params: filters.params.clone(),
+            latest_slot: input.latest_slot,
+            cache_slot,
+        }
+    }
+
+    /// The statement with every value bound, in placeholder order.
+    pub fn query(&self) -> Query<'_, Postgres, PgArguments> {
+        let mut query = sqlx::query(&self.sql).persistent(self.persistent);
+        for value in &self.filter_params {
+            query = query.bind(value.as_slice());
+        }
+        query = query.bind(self.latest_slot as i64);
+        if let Some(cache_slot) = self.cache_slot {
+            query = query.bind(cache_slot as i64);
+        }
+        query
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum GpaProcessor {
     Standard,
@@ -297,9 +356,11 @@ impl GpaProcessor {
         }
     }
 
-    pub fn load_sql(&mut self, input: &GpaDbQueryInput) -> String {
+    pub fn load_sql(&mut self, input: &GpaDbQueryInput) -> GpaSql {
         match self {
-            Self::Standard => get_program_accounts::load_sql(input),
+            Self::Standard => {
+                GpaSql::new(include_str!("../../db/getProgramAccounts.sql"), input, None)
+            }
             Self::Cached {
                 cache,
                 cached_query,
@@ -318,12 +379,11 @@ impl GpaProcessor {
                 *normalized_query = Some(normalized_query_result);
                 *new_slot = input.latest_slot;
 
-                let sql = include_str!("./gpa_with_cache.sql");
-                let sql = sql.replace("-- {accounts_filters}", &input.accounts_filters);
-                let sql = sql.replace("-- {snapshot_filters}", &input.snapshot_filters);
-                let sql = sql.replace("$2", input.latest_slot.to_string().as_str());
-
-                sql.replace("$3", cached_slot.to_string().as_str())
+                GpaSql::new(
+                    include_str!("./gpa_with_cache.sql"),
+                    input,
+                    Some(cached_slot),
+                )
             }
         }
     }

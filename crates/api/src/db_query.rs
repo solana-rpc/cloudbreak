@@ -108,16 +108,24 @@ pub fn bytea_array_literal(pubkeys: &[Pubkey]) -> String {
 ///     trace-id (32 hex chars)         parent-id (16 hex chars)
 ///
 pub fn add_trace_traceparent_to_query(sql: &str) -> String {
+    match traceparent_comment() {
+        Some(comment) => format!("{comment} {sql}"),
+        None => sql.to_string(),
+    }
+}
+
+/// The pg_tracing `traceparent` comment for the current span, or `None` when it is not sampled.
+pub fn traceparent_comment() -> Option<String> {
     let cx = tracing::Span::current().context();
     let sc = cx.span().span_context().clone();
 
     if sc.is_valid() && sc.is_sampled() {
-        format!(
-            "/*traceparent='00-{}-{}-01'*/ {sql}",
+        Some(format!(
+            "/*traceparent='00-{}-{}-01'*/",
             sc.trace_id(),
             sc.span_id()
-        )
+        ))
     } else {
-        sql.to_string()
+        None
     }
 }

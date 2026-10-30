@@ -5,27 +5,25 @@
 
 use std::num::NonZeroUsize;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::time::Duration;
 
-use crate::db_query::bytea_literal;
 use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
+use crate::metrics;
 use crate::metrics::GpaMetricsData;
 use crate::modules::cache::{GpaProcessor, KeyedRpcAccount, MaybeJsonAccount};
 use crate::modules::mint_resolver::MintResolver;
 use crate::utils::encoding::check_account_data_len_for_encoding;
+use crate::utils::row_account::RowAccount;
 use crate::utils::sql_filters::SqlFilters;
-use crate::{db_query, metrics};
 use async_stream::try_stream;
 use cloudbreak_core::modules::rpc_filter_type::{
     RpcProgramAccountsConfig, account_matches_value_cmps, has_value_cmp,
 };
 use futures::{Stream, StreamExt};
 use rust_decimal::prelude::ToPrimitive;
+use sea_orm::sqlx::Row;
 use sea_orm::sqlx::postgres::PgRow;
-use sea_orm::sqlx::{self, Row};
-use solana_account::AccountSharedData;
 use solana_account_decoder::parse_account_data::AccountAdditionalDataV3;
 use solana_account_decoder::{UiAccountEncoding, UiDataSliceConfig, encode_ui_account};
 use solana_commitment_config::CommitmentLevel;
@@ -103,7 +101,7 @@ pub async fn get_program_accounts(
         .then_some(latest_slot);
 
     let sql_filters = SqlFilters::build(&program, config.filters.as_deref().unwrap_or(&[]), label)?;
-    let metrics_data = GpaMetricsData::new(sql_filters.label);
+    let metrics_data = GpaMetricsData::new(sql_filters.label.clone());
 
     let mut request_processor = state
         .gpa_processor
@@ -116,8 +114,7 @@ pub async fn get_program_accounts(
             config: config.clone(),
             state: state.clone(),
             latest_slot,
-            accounts_filters: sql_filters.accounts,
-            snapshot_filters: sql_filters.snapshot,
+            sql_filters,
             metrics_data: metrics_data.clone(),
         },
         &mut request_processor,
@@ -147,8 +144,7 @@ pub struct GpaDbQueryInput {
     pub config: RpcProgramAccountsConfig,
     pub state: CloudbreakRpcState,
     pub latest_slot: u64,
-    pub accounts_filters: String,
-    pub snapshot_filters: String,
+    pub sql_filters: SqlFilters,
     pub metrics_data: GpaMetricsData,
 }
 
@@ -157,15 +153,9 @@ fn gpa_db_query(
     gpa_processor: &mut GpaProcessor,
 ) -> UnboundedReceiver<Result<Vec<PgRow>, RpcError>> {
     // `load_sql` mutates the caller-owned processor
-    let sql = gpa_processor.load_sql(&input);
-
-    let sql = sql.replace("$1", &bytea_literal(input.program));
-
-    tracing::debug!(target: "gpa_sql", "## sql: {}", sql);
+    let gpa_sql = gpa_processor.load_sql(&input);
 
     let pool = input.state.database.get_postgres_connection_pool().clone();
-
-    let sql = db_query::add_trace_traceparent_to_query(&sql);
 
     let queries_timeout = input.state.queries_timeout;
     // `None` sends every row as one batch, so DB failures surface before the response starts.
@@ -192,7 +182,7 @@ fn gpa_db_query(
             );
             let mut first_loop_iteration = true;
 
-            let mut rows = sqlx::raw_sql(&sql).fetch(&pool);
+            let mut rows = gpa_sql.query().fetch(&pool);
             let mut batch: Vec<PgRow> = Vec::with_capacity(gpa_stream_batch_size.unwrap_or(0));
 
             loop {
@@ -353,7 +343,7 @@ pub fn gpa_encoding_stream(input: GpaEncodingInput) -> EncodedAccountBatchStream
             let batch = if apply_value_cmp {
                 batch
                     .into_iter()
-                    .filter(|row| account_matches_value_cmps(&filters, &row.get::<Vec<u8>, _>(6)))
+                    .filter(|row| account_matches_value_cmps(&filters, row.get::<&[u8], _>(6)))
                     .collect::<Vec<_>>()
             } else {
                 batch
@@ -416,14 +406,6 @@ pub fn encoding_to_string(encoding: &UiAccountEncoding) -> &'static str {
     }
 }
 
-pub fn load_sql(input: &GpaDbQueryInput) -> String {
-    let sql = include_str!("../db/getProgramAccounts.sql");
-    let sql = sql.replace("-- {accounts_filters}", &input.accounts_filters);
-    let sql = sql.replace("-- {snapshot_filters}", &input.snapshot_filters);
-
-    sql.replace("$2", input.latest_slot.to_string().as_str())
-}
-
 pub fn process_row(
     row: PgRow,
     encoding: UiAccountEncoding,
@@ -438,23 +420,23 @@ pub fn process_row(
         let lamports = row.get::<i64, _>(2);
         let executable = row.get(4);
         let rent_epoch = row.get::<rust_decimal::Decimal, _>(5);
-        let data: Vec<u8> = row.get(6);
+        let data: &[u8] = row.get(6);
 
         *response_bytes += data.len() as u64;
 
-        let account_shared_data = AccountSharedData::create_from_existing_shared_data(
-            lamports as u64,
-            Arc::new(data.clone()),
+        let account = RowAccount {
+            lamports: lamports as u64,
+            data,
             owner,
             executable,
-            rent_epoch.to_u64().unwrap_or(0),
-        );
+            rent_epoch: rent_epoch.to_u64().unwrap_or(0),
+        };
 
         check_account_data_len_for_encoding(encoding, data_slice, data.len(), &pubkey)?;
 
         let maybe_encoded_account = encode_ui_account(
             &pubkey,
-            &account_shared_data,
+            &account,
             encoding,
             additional_mint_data,
             data_slice,

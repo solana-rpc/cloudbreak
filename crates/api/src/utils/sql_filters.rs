@@ -8,7 +8,6 @@
 use cloudbreak_core::modules::rpc_filter_type::{Memcmp, RpcFilterType};
 use solana_pubkey::Pubkey;
 
-use crate::db_query::bytea_literal;
 use crate::error::RpcError;
 use cloudbreak_core::utils::token::{
     TOKEN_ACCOUNT_DELEGATE_OFFSET, TOKEN_ACCOUNT_DELEGATE_TAG_OFFSET, TOKEN_ACCOUNT_MINT_OFFSET,
@@ -20,6 +19,8 @@ use cloudbreak_core::utils::token::{
 pub struct SqlFilters {
     pub accounts: String,
     pub snapshot: String,
+    /// Values bound to `$1..$n` in the clauses, shared by both tables.
+    pub params: Vec<Vec<u8>>,
     pub label: String,
 }
 
@@ -74,19 +75,31 @@ impl SqlFilters {
             TOKEN_ACCOUNT_DELEGATE_TAG_OFFSET,
             vec![1, 0, 0, 0],
         ));
-        let clauses = |table: &str| {
-            filters
-                .iter()
-                .chain(add_delegate_tag.then_some(&delegate_tag))
-                .filter_map(|filter| filter_sql(filter, table, is_token_program))
-                .map(|clause| format!("AND {clause}"))
-                .collect::<Vec<_>>()
-                .join("\n                    ")
-        };
+        let mut accounts = Vec::new();
+        let mut snapshot = Vec::new();
+        let mut params = Vec::new();
+        for filter in filters
+            .iter()
+            .chain(add_delegate_tag.then_some(&delegate_tag))
+        {
+            let param = params.len() + 1;
+            let Some((clause, value)) = filter_sql(filter, "accounts", is_token_program, param)
+            else {
+                continue;
+            };
+            accounts.push(format!("AND {clause}"));
+            if let Some((clause, _)) =
+                filter_sql(filter, "snapshot_accounts", is_token_program, param)
+            {
+                snapshot.push(format!("AND {clause}"));
+            }
+            params.extend(value);
+        }
 
         Ok(Self {
-            accounts: clauses("accounts"),
-            snapshot: clauses("snapshot_accounts"),
+            accounts: accounts.join("\n                    "),
+            snapshot: snapshot.join("\n                    "),
+            params,
             label,
         })
     }
@@ -124,39 +137,54 @@ fn has_memcmp(filters: &[RpcFilterType], offset: usize, len: Option<usize>) -> b
     })
 }
 
-/// One filter as a SQL predicate on `table`. For a token program, owner, mint and delegate-tag
-/// memcmps become the exact expressions the token indexes are built on.
-fn filter_sql(filter: &RpcFilterType, table: &str, token_program: bool) -> Option<String> {
+/// One filter as a SQL predicate on `table`, and the value it binds to `$param`, if any. Values
+/// that select an index (dataSize, memcmp offset and length, the delegate tag) stay literal SQL.
+/// For a token program, owner, mint and delegate-tag memcmps become the exact expressions the
+/// token indexes are built on.
+fn filter_sql(
+    filter: &RpcFilterType,
+    table: &str,
+    token_program: bool,
+    param: usize,
+) -> Option<(String, Option<Vec<u8>>)> {
     match filter {
-        RpcFilterType::DataSize(size) => Some(format!("length({table}.data) = {size}")),
+        RpcFilterType::DataSize(size) => Some((format!("length({table}.data) = {size}"), None)),
         RpcFilterType::Memcmp(memcmp) => {
             let bytes = memcmp.bytes()?.to_vec();
             let offset = memcmp.offset();
 
             if token_program {
                 if offset == TOKEN_ACCOUNT_OWNER_OFFSET && bytes.len() == 32 {
-                    return Some(format!("{table}.token_owner = {}", bytea_literal(bytes)));
+                    return Some((format!("{table}.token_owner = ${param}"), Some(bytes)));
                 } else if offset == TOKEN_ACCOUNT_MINT_OFFSET && bytes.len() == 32 {
-                    return Some(format!("{table}.token_mint = {}", bytea_literal(bytes)));
+                    return Some((format!("{table}.token_mint = ${param}"), Some(bytes)));
                 } else if offset == TOKEN_ACCOUNT_DELEGATE_TAG_OFFSET && bytes == [1, 0, 0, 0] {
                     // The first byte alone is the predicate of the token delegate partial index.
-                    return Some(format!(
-                        "SUBSTRING({table}.data FROM 73 FOR 1) = '\\x01'::bytea AND SUBSTRING({table}.data FROM 74 FOR 3) = '\\x000000'::bytea"
+                    return Some((
+                        format!(
+                            "SUBSTRING({table}.data FROM 73 FOR 1) = '\\x01'::bytea AND SUBSTRING({table}.data FROM 74 FOR 3) = '\\x000000'::bytea"
+                        ),
+                        None,
                     ));
                 }
             }
 
-            Some(format!(
-                "SUBSTRING({table}.data FROM {} FOR {}) = E'\\\\x{}'::bytea",
-                offset + 1,
-                bytes.len(),
-                hex::encode(bytes)
+            Some((
+                format!(
+                    "SUBSTRING({table}.data FROM {} FOR {}) = ${param}",
+                    offset + 1,
+                    bytes.len()
+                ),
+                Some(bytes),
             ))
         }
         // Agave's `spl_token_2022_interface::state::Account::valid_account_data`: byte 108 is the
         // account state (0 = uninitialized), a 355-byte account is a multisig.
-        RpcFilterType::TokenAccountState => Some(format!(
-            "(SUBSTRING({table}.data FROM 109 FOR 1) <> '\\x00'::bytea AND (length({table}.data) = 165 OR (length({table}.data) > 165 AND length({table}.data) <> 355 AND SUBSTRING({table}.data FROM 166 FOR 1) = '\\x02'::bytea)))"
+        RpcFilterType::TokenAccountState => Some((
+            format!(
+                "(SUBSTRING({table}.data FROM 109 FOR 1) <> '\\x00'::bytea AND (length({table}.data) = 165 OR (length({table}.data) > 165 AND length({table}.data) <> 355 AND SUBSTRING({table}.data FROM 166 FOR 1) = '\\x02'::bytea)))"
+            ),
+            None,
         )),
         RpcFilterType::ValueCmp(_) => None,
     }
@@ -168,7 +196,11 @@ mod tests {
     use cloudbreak_core::utils::token::LEGACY_TOKEN_PROGRAM_ID;
 
     fn sql(filter: RpcFilterType, token_program: bool) -> String {
-        filter_sql(&filter, "accounts", token_program).unwrap()
+        filter_sql(&filter, "accounts", token_program, 1).unwrap().0
+    }
+
+    fn bound(filter: RpcFilterType, token_program: bool) -> Option<Vec<u8>> {
+        filter_sql(&filter, "accounts", token_program, 1).unwrap().1
     }
 
     fn memcmp(offset: usize, bytes: &[u8]) -> RpcFilterType {
@@ -178,15 +210,10 @@ mod tests {
     #[test]
     fn token_owner_and_mint_memcmps_use_the_indexed_columns() {
         let key = [7u8; 32];
-        let hex = hex::encode(key);
-        assert_eq!(
-            sql(memcmp(32, &key), true),
-            format!("accounts.token_owner = '\\x{hex}'::bytea")
-        );
-        assert_eq!(
-            sql(memcmp(0, &key), true),
-            format!("accounts.token_mint = '\\x{hex}'::bytea")
-        );
+        assert_eq!(sql(memcmp(32, &key), true), "accounts.token_owner = $1");
+        assert_eq!(sql(memcmp(0, &key), true), "accounts.token_mint = $1");
+        assert_eq!(bound(memcmp(32, &key), true), Some(key.to_vec()));
+        assert_eq!(bound(memcmp(0, &key), true), Some(key.to_vec()));
     }
 
     #[test]
@@ -195,11 +222,13 @@ mod tests {
             sql(memcmp(72, &[1, 0, 0, 0]), true),
             "SUBSTRING(accounts.data FROM 73 FOR 1) = '\\x01'::bytea AND SUBSTRING(accounts.data FROM 74 FOR 3) = '\\x000000'::bytea"
         );
+        assert_eq!(bound(memcmp(72, &[1, 0, 0, 0]), true), None);
         // Any other shape at 72 stays a plain byte comparison.
         assert_eq!(
             sql(memcmp(72, &[1]), true),
-            "SUBSTRING(accounts.data FROM 73 FOR 1) = E'\\\\x01'::bytea"
+            "SUBSTRING(accounts.data FROM 73 FOR 1) = $1"
         );
+        assert_eq!(bound(memcmp(72, &[1]), true), Some(vec![1]));
     }
 
     #[test]
@@ -207,24 +236,25 @@ mod tests {
         let key = [9u8; 32];
         assert_eq!(
             sql(memcmp(76, &key), true),
-            format!(
-                "SUBSTRING(accounts.data FROM 77 FOR 32) = E'\\\\x{}'::bytea",
-                hex::encode(key)
-            )
+            "SUBSTRING(accounts.data FROM 77 FOR 32) = $1"
         );
+        assert_eq!(bound(memcmp(76, &key), true), Some(key.to_vec()));
     }
 
     #[test]
     fn non_token_programs_keep_plain_byte_comparisons() {
         let key = [7u8; 32];
-        let hex = hex::encode(key);
         assert_eq!(
             sql(memcmp(32, &key), false),
-            format!("SUBSTRING(accounts.data FROM 33 FOR 32) = E'\\\\x{hex}'::bytea")
+            "SUBSTRING(accounts.data FROM 33 FOR 32) = $1"
         );
         assert_eq!(
             sql(memcmp(72, &[1, 0, 0, 0]), false),
-            "SUBSTRING(accounts.data FROM 73 FOR 4) = E'\\\\x01000000'::bytea"
+            "SUBSTRING(accounts.data FROM 73 FOR 4) = $1"
+        );
+        assert_eq!(
+            bound(memcmp(72, &[1, 0, 0, 0]), false),
+            Some(vec![1, 0, 0, 0])
         );
     }
 
@@ -305,16 +335,35 @@ mod tests {
         assert_eq!(sql.label, "gpa");
         assert_eq!(
             sql.accounts,
-            format!(
-                "AND SUBSTRING(accounts.data FROM 33 FOR 32) = E'\\\\x{}'::bytea",
-                hex::encode([7; 32])
-            )
+            "AND SUBSTRING(accounts.data FROM 33 FOR 32) = $1"
         );
+        assert_eq!(sql.params, vec![vec![7; 32]]);
         assert!(
             SqlFilters::build(&Pubkey::new_unique(), &[], "gpa")
                 .unwrap()
                 .accounts
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn both_tables_share_the_parameter_numbers() {
+        let filters = [
+            RpcFilterType::DataSize(165),
+            memcmp(8, &[1, 2, 3]),
+            memcmp(40, &[9]),
+        ];
+        let sql = SqlFilters::build(&Pubkey::new_unique(), &filters, "gpa").unwrap();
+        assert_eq!(
+            sql.accounts,
+            "AND length(accounts.data) = 165\n                    \
+             AND SUBSTRING(accounts.data FROM 9 FOR 3) = $1\n                    \
+             AND SUBSTRING(accounts.data FROM 41 FOR 1) = $2"
+        );
+        assert_eq!(
+            sql.snapshot,
+            sql.accounts.replace("accounts.", "snapshot_accounts.")
+        );
+        assert_eq!(sql.params, vec![vec![1, 2, 3], vec![9]]);
     }
 }
