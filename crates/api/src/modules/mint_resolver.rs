@@ -261,6 +261,7 @@ impl Inner {
 
 /// It parses the Token account data, returning the mint `Pubkey` if available.
 fn get_mint_from_token_account(row: &PgRow) -> Option<Pubkey> {
-    let data: Option<Vec<u8>> = row.try_get(DATA_COLUMN).ok().flatten();
-    get_token_account_mint(&data?)
+    // gPA rows are binary, so the data is read in place from the row buffer.
+    let data: Option<&[u8]> = row.try_get(DATA_COLUMN).ok().flatten();
+    get_token_account_mint(data?)
 }
