@@ -99,7 +99,7 @@ impl SelfHealingState {
         blockhash: &str,
         parent_slot: u64,
         parent_blockhash: &str,
-    ) {
+    ) -> bool {
         let last_slot_received = *self
             .last_slot_received
             .lock()
@@ -115,20 +115,7 @@ impl SelfHealingState {
             // If we had added the slot to the gaps list, remove it
             self.remove_slot_from_gaps_list(slot);
 
-            let no_gaps_left = self
-                .gaps_list
-                .lock()
-                .expect("Failed to lock gaps_list")
-                .is_empty();
-            if no_gaps_left && !self.filling.load(Ordering::SeqCst) {
-                self.gap_boundaries
-                    .lock()
-                    .expect("Failed to lock gap_boundaries")
-                    .clear();
-                self.finalizer.resume().await;
-            }
-
-            return;
+            return self.no_gaps_left();
         }
 
         if last_slot_received != 0 && slot > last_slot_received + 1 {
@@ -192,6 +179,27 @@ impl SelfHealingState {
             .last_blockhash_received
             .lock()
             .expect("Failed to lock last_blockhash_received") = blockhash.to_owned();
+
+        false
+    }
+
+    fn no_gaps_left(&self) -> bool {
+        self.gaps_list
+            .lock()
+            .expect("Failed to lock gaps_list")
+            .is_empty()
+            && !self.filling.load(Ordering::SeqCst)
+    }
+
+    pub async fn resume_after_late_block(&self) {
+        if !self.no_gaps_left() {
+            return;
+        }
+        self.gap_boundaries
+            .lock()
+            .expect("Failed to lock gap_boundaries")
+            .clear();
+        self.finalizer.resume().await;
     }
 
     /// Starts a separate task that periodically repairs confirmed slot gaps out of incremental snapshots.
