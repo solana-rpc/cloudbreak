@@ -11,7 +11,10 @@ use sea_orm::DatabaseConnection;
 use std::{
     collections::{BTreeSet, HashSet},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::{sync::mpsc::Receiver, task::JoinHandle};
@@ -41,6 +44,7 @@ pub struct SelfHealingState {
     /// carry no chain data and therefore can not bridge the walk back to them (see
     /// [`SlotFinalizer::enqueue_gap_boundary`]).
     pub gap_boundaries: Arc<Mutex<BTreeSet<u64>>>,
+    filling: Arc<AtomicBool>,
     pub finalizer: SlotFinalizer,
     pub supply_tracker: SupplyTracker,
 }
@@ -56,6 +60,7 @@ impl SelfHealingState {
             last_blockhash_received: Arc::new(Mutex::new(String::new())),
             gaps_list: Arc::new(Mutex::new(Vec::new())),
             gap_boundaries: Arc::new(Mutex::new(BTreeSet::new())),
+            filling: Arc::new(AtomicBool::new(false)),
             finalizer,
             supply_tracker,
         }
@@ -94,7 +99,7 @@ impl SelfHealingState {
         blockhash: &str,
         parent_slot: u64,
         parent_blockhash: &str,
-    ) {
+    ) -> bool {
         let last_slot_received = *self
             .last_slot_received
             .lock()
@@ -110,7 +115,7 @@ impl SelfHealingState {
             // If we had added the slot to the gaps list, remove it
             self.remove_slot_from_gaps_list(slot);
 
-            return;
+            return self.no_gaps_left();
         }
 
         if last_slot_received != 0 && slot > last_slot_received + 1 {
@@ -174,6 +179,27 @@ impl SelfHealingState {
             .last_blockhash_received
             .lock()
             .expect("Failed to lock last_blockhash_received") = blockhash.to_owned();
+
+        false
+    }
+
+    fn no_gaps_left(&self) -> bool {
+        self.gaps_list
+            .lock()
+            .expect("Failed to lock gaps_list")
+            .is_empty()
+            && !self.filling.load(Ordering::SeqCst)
+    }
+
+    pub async fn resume_after_late_block(&self) {
+        if !self.no_gaps_left() {
+            return;
+        }
+        self.gap_boundaries
+            .lock()
+            .expect("Failed to lock gap_boundaries")
+            .clear();
+        self.finalizer.resume().await;
     }
 
     /// Starts a separate task that periodically repairs confirmed slot gaps out of incremental snapshots.
@@ -350,6 +376,7 @@ impl SelfHealingState {
                     continue;
                 }
 
+                self.filling.store(true, Ordering::SeqCst);
                 let (handle, mut rx) = match download_and_process_snapshot_for_gap_filling(
                     snapshot_pair,
                     snapshot_config,
@@ -357,6 +384,7 @@ impl SelfHealingState {
                 ) {
                     Ok((handle, rx)) => (handle, rx),
                     Err(e) => {
+                        self.filling.store(false, Ordering::SeqCst);
                         tracing::warn!(
                             "Failed to start snapshot processing for gap filling, waiting for next iteration (error: {:?})",
                             e
@@ -447,6 +475,7 @@ impl SelfHealingState {
                     self.supply_tracker.finish_gap();
                     self.finalizer.resume().await;
                 }
+                self.filling.store(false, Ordering::SeqCst);
             }
         })
     }
