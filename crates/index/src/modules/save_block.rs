@@ -14,7 +14,6 @@ use yellowstone_grpc_proto::geyser::SubscribeUpdateBlock;
 
 use crate::indexer::{AccountsReceivedPerBlock, IndexerState};
 use crate::modules::single_version::{self, BlockDeletes, BlockRows};
-use crate::modules::snapshot::SnapshotProcessingState;
 use crate::{db_queries, metrics, modules};
 
 /// Writes the block into the one-row-per-account "accounts" table in one transaction.
@@ -26,7 +25,7 @@ pub async fn save_block(
     indexer_state: IndexerState,
 ) {
     let IndexerState {
-        snapshot_processing_state,
+        snapshot_processing_state: _,
         self_healing_state,
         slot_finalizer,
         updated_accounts_during_startup,
@@ -178,24 +177,15 @@ pub async fn save_block(
         (Vec::new(), Vec::new())
     };
 
-    // `snapshot_accounts` rows are deleted in the block transaction only once the load finished.
-    // Before that the startup one-shot deletes them, so the block's keys go to its cache.
-    let snapshot_processing_state: SnapshotProcessingState = {
-        *snapshot_processing_state
-            .lock()
-            .expect("Failed to lock snapshot_processing_state")
-    };
-    let snapshot_ready = snapshot_processing_state == SnapshotProcessingState::Finished
-        || snapshot_processing_state == SnapshotProcessingState::FinishedAndCleanedUp;
-    if !snapshot_ready {
-        updated_accounts_during_startup.add_batch_to_cache_during_startup(
-            block_rows
-                .pubkeys
-                .iter()
-                .chain(closed_accounts_for_slot.iter())
-                .cloned(),
-        );
-    }
+    // `snapshot_accounts` rows are deleted in the block transaction only after the startup
+    // one-shot finished. Until then the block's keys join its cache, so the two never race.
+    let snapshot_ready = updated_accounts_during_startup.snapshot_ready_or_defer(
+        block_rows
+            .pubkeys
+            .iter()
+            .chain(closed_accounts_for_slot.iter())
+            .cloned(),
+    );
 
     let (routed_pubkeys, routed_owners, unrouted_pubkeys) =
         accounts_owner_map.take_closed_pairs(&closed_accounts_for_slot, slot);
@@ -231,24 +221,32 @@ pub async fn save_block(
     let query_timeout = Duration::from_secs(config.database.save_block_queries_timeout);
     let mut open_block_tx = None;
     let block_writes = async {
-        match single_version::write_block(
-            db.get_postgres_connection_pool(),
-            slot,
-            &block_rows,
-            &block_deletes,
-            snapshot_ready,
-            query_timeout,
-        )
-        .await
-        {
-            Ok(open) => {
-                open_block_tx = Some(open);
-                true
-            }
-            Err(e) => {
-                tracing::error!(target: "single_version", "block {} write failed, rolled back: {}", slot, e);
-                metrics::increment_db_errors();
-                false
+        // A deadlock aborts the whole transaction, so the block is simply written again.
+        let mut attempt = 1;
+        loop {
+            match single_version::write_block(
+                db.get_postgres_connection_pool(),
+                slot,
+                &block_rows,
+                &block_deletes,
+                snapshot_ready,
+                query_timeout,
+            )
+            .await
+            {
+                Ok(open) => {
+                    open_block_tx = Some(open);
+                    break true;
+                }
+                Err(e) if attempt < 3 && e.contains("deadlock detected") => {
+                    tracing::warn!(target: "single_version", "block {} write attempt {} hit a deadlock, retrying: {}", slot, attempt, e);
+                    attempt += 1;
+                }
+                Err(e) => {
+                    tracing::error!(target: "single_version", "block {} write failed, rolled back: {}", slot, e);
+                    metrics::increment_db_errors();
+                    break false;
+                }
             }
         }
     };
