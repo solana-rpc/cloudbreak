@@ -88,12 +88,23 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
         .await
         .expect("Failed to upsert indexer filter");
 
+    // Stage rows left by a crash belong to slots that were never published.
+    modules::single_version::reset_stage(db.get_postgres_connection_pool())
+        .await
+        .expect("Failed to clear accounts_stage");
+
     // Buffer layer that allows to keep track of falling behind ocurrences (and help recovering from them)
     let (buffer_channel_tx, buffer_channel_rx) =
         tokio::sync::mpsc::channel(config.grpc.sources_channel_size);
 
     let snapshot_processing_state = Arc::new(Mutex::new(SnapshotProcessingState::NotStarted));
     let finalize_slot_buffer_size = Arc::new(Mutex::new(0));
+
+    // One row per account: an owner change must delete the row under the old owner's partition.
+    assert!(
+        config.accounts_owner_map_enabled,
+        "the single-version accounts table needs accounts-owner-map-enabled = true"
+    );
 
     let query_timeout = Duration::from_secs(config.database.save_block_queries_timeout);
     let accounts_owner_map = if config.accounts_owner_map_enabled {

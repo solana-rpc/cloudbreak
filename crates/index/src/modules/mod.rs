@@ -12,4 +12,5 @@ pub mod lt_hash;
 pub mod panic_handler;
 pub mod save_block;
 pub mod self_healing;
+pub mod single_version;
 pub mod snapshot;

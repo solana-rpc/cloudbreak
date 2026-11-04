@@ -3,22 +3,21 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+use std::time::Duration;
+
 use cloudbreak_core::IndexConfig;
-use cloudbreak_entity::accounts;
-use sea_orm::{
-    ActiveValue::{NotSet, Set},
-    DatabaseConnection,
-};
+use sea_orm::DatabaseConnection;
 use solana_pubkey::Pubkey;
-use tokio::{task::JoinSet, time::Instant};
+use tokio::time::Instant;
 use yellowstone_grpc_proto::geyser::CommitmentLevel;
 use yellowstone_grpc_proto::geyser::SubscribeUpdateBlock;
 
 use crate::indexer::{AccountsReceivedPerBlock, IndexerState};
-use crate::modules::snapshot::SnapshotProcessingState;
+use crate::modules::single_version::{self, BlockDeletes, BlockRows};
 use crate::{db_queries, metrics, modules};
 
-/// Splits the block into chunks and saves them into the "accounts" table
+/// Writes the block into the one-row-per-account "accounts" table: staged in parallel, then moved
+/// in one transaction.
 /// Also updates the HashMap with the accounts pubkeys that were updated in the slot
 pub async fn save_block(
     block: SubscribeUpdateBlock,
@@ -27,7 +26,7 @@ pub async fn save_block(
     indexer_state: IndexerState,
 ) {
     let IndexerState {
-        snapshot_processing_state,
+        snapshot_processing_state: _,
         self_healing_state,
         slot_finalizer,
         updated_accounts_during_startup,
@@ -41,8 +40,6 @@ pub async fn save_block(
     } = indexer_state;
 
     let start_time = Instant::now();
-    let chunk_size = config.grpc.chunk_size;
-    let max_chunk_bytes_data = config.grpc.max_chunk_bytes_data;
 
     let slot = block.slot;
     let is_repaired = block.blockhash.is_empty();
@@ -61,9 +58,7 @@ pub async fn save_block(
     .await;
 
     let mut block_bytes_data: usize = 0;
-    let mut chunks = Vec::new();
-    let mut current_chunk = Vec::new();
-    let mut current_chunk_bytes = 0;
+    let mut block_rows = BlockRows::default();
 
     let mut updated_accounts_for_slot = Vec::new();
     let mut updated_accounts_owners_for_slot = Vec::new();
@@ -155,41 +150,22 @@ pub async fn save_block(
         accounts_owner_map.upsert_account(&account.pubkey, &account.owner, slot);
 
         block_bytes_data += account.data.len();
-        current_chunk_bytes += account.data.len();
 
         updated_accounts_for_slot.push(account.pubkey.clone());
         if capture_owners {
             updated_accounts_owners_for_slot.push(account.owner.clone());
         }
 
-        current_chunk.push(accounts::ActiveModel {
-            pubkey: Set(account.pubkey),
-            owner: Set(account.owner),
-            lamports: Set(account.lamports as i64),
-            slot: Set(slot as i64),
-            executable: Set(account.executable),
-            rent_epoch: Set(account.rent_epoch.into()),
-            data: Set(account.data),
-            write_version: Set(account.write_version as i64),
-            updated_on: NotSet,
-            txn_signature: Set(account.txn_signature),
-            token_mint: NotSet,
-            token_owner: NotSet,
-        });
-
-        if current_chunk.len() >= chunk_size || current_chunk_bytes >= max_chunk_bytes_data {
-            chunks.push((current_chunk, current_chunk_bytes));
-            current_chunk = Vec::new();
-
-            metrics::record_chunk_size(current_chunk_bytes);
-
-            current_chunk_bytes = 0;
-        }
-    }
-
-    if !current_chunk.is_empty() {
-        tracing::debug!(target: "last_chunk", "last_chunk len: {}", current_chunk.len());
-        chunks.push((current_chunk, current_chunk_bytes));
+        block_rows.push(
+            account.pubkey,
+            account.owner,
+            account.lamports,
+            account.executable,
+            account.rent_epoch,
+            account.data,
+            account.write_version,
+            account.txn_signature,
+        );
     }
 
     let closed_account_for_slot_len = closed_accounts_for_slot.len();
@@ -202,17 +178,23 @@ pub async fn save_block(
         (Vec::new(), Vec::new())
     };
 
-    // We delay the closed accounts insertion until the snapshot is processed to avoid reads while
-    // the `snapshot_accounts` table still doesn't have indexes
-    let snapshot_processing_state: SnapshotProcessingState = {
-        *snapshot_processing_state
-            .lock()
-            .expect("Failed to lock snapshot_processing_state")
+    // `snapshot_accounts` rows are deleted in the block transaction only after the startup
+    // one-shot finished. Until then the block's keys join its cache, so the two never race.
+    let snapshot_ready = updated_accounts_during_startup.snapshot_ready_or_defer(
+        block_rows
+            .pubkeys
+            .iter()
+            .chain(closed_accounts_for_slot.iter())
+            .cloned(),
+    );
+
+    let (routed_pubkeys, routed_owners, unrouted_pubkeys) =
+        accounts_owner_map.take_closed_pairs(&closed_accounts_for_slot, slot);
+    let block_deletes = BlockDeletes {
+        routed_pubkeys,
+        routed_owners,
+        unrouted_pubkeys,
     };
-    let closed_accounts_to_insert = (snapshot_processing_state
-        == SnapshotProcessingState::Finished
-        || snapshot_processing_state == SnapshotProcessingState::FinishedAndCleanedUp)
-        .then(|| closed_accounts_for_slot.clone());
 
     // Record the block data in the finalizer map (keyed by slot). It is held there until the slot
     // is finalized (via a finalized notification or the ancestor walk). For snapshot-repaired
@@ -232,49 +214,58 @@ pub async fn save_block(
         block.parent_blockhash.clone(),
     );
 
-    let chunks_length = chunks.len();
-    tracing::debug!(target: "chunks_length", "chunks_length: {}", chunks_length);
-
     metrics::record_closed_accounts_per_slot(closed_account_for_slot_len);
     metrics::record_block_size(block_bytes_data);
 
-    // Update the "accounts" table. The supply tracker starts these writes after
-    // its cache probe, so its miss read overlaps them.
+    // Stage the rows in parallel, then move them into "accounts" in one transaction, left open
+    // until the slot row. The supply tracker starts this after its cache probe; its miss read
+    // sees the state before the block.
+    let pool = db.get_postgres_connection_pool();
+    let query_timeout = Duration::from_secs(config.database.save_block_queries_timeout);
+    let mut open_block_tx = None;
     let block_writes = async {
-        let closed_accounts_insert_handle = closed_accounts_to_insert.and_then(|closed| {
-            db_queries::insert_closed_accounts(
-                db.clone(),
-                closed,
-                slot,
-                &config,
-                accounts_owner_map,
-            )
-        });
-
-        let mut tasks = JoinSet::new();
-        for (chunk, byte_size) in chunks {
-            let db = db.clone();
-            let config_clone = config.clone();
-            // TODO: Set concurrency limit
-            tasks.spawn(async move {
-                let _guard = metrics::TokioTaskCounterGuard::new("insert_accounts_chunk");
-
-                db_queries::insert_accounts_chunk(&db, chunk, byte_size, &config_clone).await
-            });
+        if let Err(e) = single_version::stage_block(
+            pool,
+            slot,
+            &block_rows,
+            config.grpc.chunk_size,
+            config.grpc.max_chunk_bytes_data,
+            query_timeout,
+        )
+        .await
+        {
+            tracing::error!(target: "single_version", "block {} stage failed: {}", slot, e);
+            metrics::increment_db_errors();
+            return false;
         }
-
-        let mut block_writes_ok = tasks.join_all().await.into_iter().all(|inserted| inserted);
-
-        if let Some(handle) = closed_accounts_insert_handle {
-            match handle.await {
-                Ok(inserted) => block_writes_ok &= inserted,
+        // A deadlock aborts the whole transaction, so the block is simply written again.
+        let mut attempt = 1;
+        loop {
+            match single_version::write_block(
+                pool,
+                slot,
+                &block_rows,
+                &block_deletes,
+                snapshot_ready,
+                query_timeout,
+            )
+            .await
+            {
+                Ok(open) => {
+                    open_block_tx = Some(open);
+                    break true;
+                }
+                Err(e) if attempt < 3 && e.contains("deadlock detected") => {
+                    tracing::warn!(target: "single_version", "block {} write attempt {} hit a deadlock, retrying: {}", slot, attempt, e);
+                    attempt += 1;
+                }
                 Err(e) => {
-                    tracing::error!(target: "save_block_closed_accounts_insert", "failed to insert closed accounts: {:?}", e);
-                    block_writes_ok = false;
+                    tracing::error!(target: "single_version", "block {} write failed, rolled back: {}", slot, e);
+                    metrics::increment_db_errors();
+                    break false;
                 }
             }
         }
-        block_writes_ok
     };
     let (supply_outcome, block_writes_ok) = supply_tracker
         .apply_block(
@@ -293,17 +284,43 @@ pub async fn save_block(
         .persist_block(&stake_block, db, &config)
         .await;
 
-    // Wait until the chunk processing is finished to insert the slot (this ensures that gPA calls can only read from completed slots)
-    db_queries::insert_slot(
-        slot,
-        block.block_time,
-        Some(&block.blockhash),
-        CommitmentLevel::Confirmed,
-        updated_accounts_during_startup.health.is_healthy(),
-        db,
-        &config,
-    )
-    .await;
+    // The slot row commits with the block's rows, so readers see the whole block or none of it.
+    // Without an open transaction (the write failed) the slot row is written on its own, as before.
+    let published = match open_block_tx {
+        Some(open) => match open
+            .publish(
+                slot,
+                block.block_time.unwrap_or_default().timestamp,
+                Some(block.blockhash.clone()),
+                updated_accounts_during_startup.health.is_healthy(),
+                CommitmentLevel::Confirmed as i32,
+            )
+            .await
+        {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::error!(target: "single_version", "block {} publish failed, rolled back: {}", slot, e);
+                metrics::increment_db_errors();
+                false
+            }
+        },
+        None => false,
+    };
+    if let Err(e) = single_version::clear_stage(pool, slot, query_timeout).await {
+        tracing::warn!(target: "single_version", "block {} stage cleanup failed: {}", slot, e);
+    }
+    if !published {
+        db_queries::insert_slot(
+            slot,
+            block.block_time,
+            Some(&block.blockhash),
+            CommitmentLevel::Confirmed,
+            updated_accounts_during_startup.health.is_healthy(),
+            db,
+            &config,
+        )
+        .await;
+    }
 
     db_queries::insert_recent_blockhash(
         slot,

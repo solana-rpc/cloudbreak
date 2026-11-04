@@ -16,7 +16,6 @@ all_mints AS (
         owner
         = '\x06ddf6e1d765a193d9cbe146ceeb79ac1cb485ed5f5b37913a8cf5857eff00a9'::bytea -- noqa: LT05
         AND pubkey = $1
-        AND slot <= $2
     UNION ALL
     -- TokenKeg partition (snapshot_accounts)
     SELECT
@@ -29,7 +28,6 @@ all_mints AS (
         owner
         = '\x06ddf6e1d765a193d9cbe146ceeb79ac1cb485ed5f5b37913a8cf5857eff00a9'::bytea -- noqa: LT05
         AND pubkey = $1
-        AND slot <= $2
     UNION ALL
     -- Token-2022 partition (accounts)
     SELECT
@@ -42,7 +40,6 @@ all_mints AS (
         owner
         = '\x06ddf6e1ee758fde18425dbce46ccddab61afc4d83b90d27febdf928d8a18bfc'::bytea -- noqa: LT05
         AND pubkey = $1
-        AND slot <= $2
     UNION ALL
     -- Token-2022 partition (snapshot_accounts)
     SELECT
@@ -55,7 +52,6 @@ all_mints AS (
         owner
         = '\x06ddf6e1ee758fde18425dbce46ccddab61afc4d83b90d27febdf928d8a18bfc'::bytea -- noqa: LT05
         AND pubkey = $1
-        AND slot <= $2
 )
 
 SELECT

@@ -6,6 +6,7 @@
 use cloudbreak_core::IndexConfig;
 use sea_orm::DatabaseConnection;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{Notify, watch};
@@ -439,7 +440,8 @@ async fn finalize_slot(
     }
 
     let _ = prune_slot_tx.send(slot);
-    cleanup.enqueue(slot, &derived.items);
+    // The block transaction already replaced or deleted every superseded row, so no cleanup keys.
+    let _ = cleanup;
 }
 
 ///Used to store all accounts that are updated/closed while loading the snapshot, and delete them after the snapshot is processed
@@ -448,6 +450,8 @@ pub struct UpdatedAccountsDuringStartup {
     pub accounts: Arc<Mutex<HashSet<Vec<u8>>>>,
     pub snapshot_processing_state: Arc<Mutex<SnapshotProcessingState>>,
     pub health: ServiceHealth,
+    /// Set while the one-shot runs, so a second finalize does not start another one.
+    one_shot_running: Arc<AtomicBool>,
 }
 
 impl UpdatedAccountsDuringStartup {
@@ -459,6 +463,7 @@ impl UpdatedAccountsDuringStartup {
             accounts: Arc::new(Mutex::new(HashSet::new())),
             snapshot_processing_state,
             health,
+            one_shot_running: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -499,6 +504,25 @@ impl UpdatedAccountsDuringStartup {
         accounts.extend(batch);
     }
 
+    /// True once the one-shot has cleared `snapshot_accounts`: the block transaction may then
+    /// delete snapshot rows itself. Until then the keys join the one-shot's cache instead.
+    /// Checked under the cache lock, the same lock the one-shot holds when it finishes.
+    pub fn snapshot_ready_or_defer<I>(&self, keys: I) -> bool
+    where
+        I: IntoIterator<Item = Vec<u8>>,
+    {
+        let mut accounts = self.accounts.lock().expect("Failed to lock accounts");
+        let state = *self
+            .snapshot_processing_state
+            .lock()
+            .expect("Failed to lock snapshot_processing_state");
+        if state == SnapshotProcessingState::FinishedAndCleanedUp {
+            return true;
+        }
+        accounts.extend(keys);
+        false
+    }
+
     /// Only cleans up the accounts if we are NOT in startup and if the accounts cache is not empty already
     fn cleanup_stored_accounts_once(
         &self,
@@ -516,13 +540,11 @@ impl UpdatedAccountsDuringStartup {
             return;
         }
 
-        let accounts = self
-            .accounts
-            .lock()
-            .expect("Failed to lock accounts")
-            .drain()
-            .collect::<Vec<_>>();
+        if self.one_shot_running.swap(true, Ordering::SeqCst) {
+            return;
+        }
 
+        let cache = self.accounts.clone();
         let db = db.clone();
         let query_timeout = Duration::from_secs(config.database.finalize_slot_queries_timeout);
         let snapshot_processing_state = self.snapshot_processing_state.clone();
@@ -532,13 +554,40 @@ impl UpdatedAccountsDuringStartup {
             let _guard = metrics::TokioTaskCounterGuard::new("startup_snapshot_accounts_cleanup");
 
             let start_time = Instant::now();
-            let total = accounts.len();
-            tracing::info!(target: "cleanup_stored_accounts", "Cleaning up stored accounts from snapshot_accounts - accounts: {}", total);
 
-            // A uniform cutoff is safe on this table only. See delete_below_uniform_cutoff.
-            let result =
-                cleanup::persist::delete_below_uniform_cutoff(&db, accounts, slot, query_timeout)
-                    .await;
+            // Blocks keep adding keys until the state flips, so drain until the cache is empty.
+            // The flip happens under the cache lock, which `snapshot_ready_or_defer` also takes.
+            let mut result = Ok(0);
+            loop {
+                let accounts = {
+                    let mut cache = cache.lock().expect("Failed to lock accounts");
+                    if cache.is_empty() {
+                        *snapshot_processing_state
+                            .lock()
+                            .expect("Failed to lock snapshot_processing_state") =
+                            SnapshotProcessingState::FinishedAndCleanedUp;
+                        break;
+                    }
+                    cache.drain().collect::<Vec<_>>()
+                };
+                tracing::info!(target: "cleanup_stored_accounts", "Cleaning up stored accounts from snapshot_accounts - accounts: {}", accounts.len());
+
+                // A uniform cutoff is safe on this table only. See delete_below_uniform_cutoff.
+                match cleanup::persist::delete_below_uniform_cutoff(
+                    &db,
+                    accounts,
+                    slot,
+                    query_timeout,
+                )
+                .await
+                {
+                    Ok(deleted) => result = result.map(|total| total + deleted),
+                    Err(error) => {
+                        result = Err(error);
+                        break;
+                    }
+                }
+            }
 
             let elapsed = start_time.elapsed().as_secs_f64();
             match result {
@@ -548,10 +597,6 @@ impl UpdatedAccountsDuringStartup {
                     // Startup is complete only when every batch landed. A batch that never ran
                     // leaves rows a closed account still needs removed, so the node stays
                     // unhealthy instead of declaring itself ready over them.
-                    *snapshot_processing_state
-                        .lock()
-                        .expect("Failed to lock snapshot_processing_state") =
-                        SnapshotProcessingState::FinishedAndCleanedUp;
                     health.remove_reason(HealthReason::Startup).await;
                 }
                 Err(error) => {

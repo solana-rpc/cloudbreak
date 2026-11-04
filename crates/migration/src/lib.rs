@@ -24,6 +24,9 @@ mod m20260711_000000_create_index_patterns_table;
 mod m20260717_000000_create_supply_tables;
 mod m20260808_000000_largest_accounts_record;
 mod m20261008_000000_create_mints_table;
+mod m20261104_000000_single_version_accounts;
+mod m20261104_000001_lz4_account_data;
+mod m20261104_000002_accounts_stage;
 
 pub struct Migrator;
 
@@ -48,6 +51,9 @@ impl MigratorTrait for Migrator {
             Box::new(m20260717_000000_create_supply_tables::Migration),
             Box::new(m20260808_000000_largest_accounts_record::Migration),
             Box::new(m20261008_000000_create_mints_table::Migration),
+            Box::new(m20261104_000000_single_version_accounts::Migration),
+            Box::new(m20261104_000001_lz4_account_data::Migration),
+            Box::new(m20261104_000002_accounts_stage::Migration),
         ]
     }
 }

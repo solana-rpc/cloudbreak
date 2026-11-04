@@ -6,7 +6,7 @@
 -- getMultipleAccounts (raw / non-jsonParsed variant).
 --
 -- $1 = ARRAY['\x...'::bytea, ...] - input pubkeys (order doesn't matter)
--- $2 = bound on slot derived from the requested commitment (literal)
+-- $2 = unused: `accounts` holds one row per account, so reads take no slot bound
 
 WITH input AS (
     SELECT DISTINCT pubkey
@@ -43,7 +43,6 @@ latest_account AS (
                 FROM accounts
                 WHERE
                     accounts.pubkey = input.pubkey
-                    AND accounts.slot <= $2
                 ORDER BY accounts.slot DESC
                 LIMIT 1
             )
@@ -59,7 +58,6 @@ latest_account AS (
                 FROM snapshot_accounts
                 WHERE
                     snapshot_accounts.pubkey = input.pubkey
-                    AND snapshot_accounts.slot <= $2
                 ORDER BY snapshot_accounts.slot DESC
                 LIMIT 1
             )

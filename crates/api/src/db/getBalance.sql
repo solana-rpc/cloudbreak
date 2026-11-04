@@ -20,7 +20,6 @@ all_versions AS (
     FROM accounts, latest_slot
     WHERE
         accounts.pubkey = $1
-        AND accounts.slot <= latest_slot.slot
     UNION ALL
     SELECT
         snapshot_accounts.owner,
@@ -29,7 +28,6 @@ all_versions AS (
     FROM snapshot_accounts, latest_slot
     WHERE
         snapshot_accounts.pubkey = $1
-        AND snapshot_accounts.slot <= latest_slot.slot
 ),
 
 latest_account AS (
