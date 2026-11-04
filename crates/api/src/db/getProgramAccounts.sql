@@ -3,8 +3,18 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-WITH
-program_accounts AS MATERIALIZED (
+-- `accounts` holds one row per account and shares no pubkey with `snapshot_accounts`, so the
+-- filtered rows of both tables are the answer. {latest_slot} is bound but not referenced.
+SELECT
+    latest.pubkey,
+    latest.owner,
+    latest.lamports,
+    latest.slot,
+    latest.executable,
+    latest.rent_epoch,
+    latest.data,
+    latest.token_mint
+FROM (
     SELECT
         accounts.pubkey,
         accounts.owner,
@@ -13,12 +23,10 @@ program_accounts AS MATERIALIZED (
         accounts.executable,
         accounts.rent_epoch,
         accounts.data,
-        accounts.token_mint,
-        accounts.token_owner
+        accounts.token_mint
     FROM accounts
     WHERE
         accounts.owner = {program}
-        AND accounts.slot <= {latest_slot}
     -- {accounts_filters}
     UNION ALL
     SELECT
@@ -29,28 +37,10 @@ program_accounts AS MATERIALIZED (
         snapshot_accounts.executable,
         snapshot_accounts.rent_epoch,
         snapshot_accounts.data,
-        snapshot_accounts.token_mint,
-        snapshot_accounts.token_owner
+        snapshot_accounts.token_mint
     FROM snapshot_accounts
     WHERE
         snapshot_accounts.owner = {program}
-        AND snapshot_accounts.slot <= {latest_slot}
 -- {snapshot_filters}
-)
-
-SELECT * FROM (
-    SELECT DISTINCT ON (program_accounts.pubkey)
-        program_accounts.pubkey,
-        program_accounts.owner,
-        program_accounts.lamports,
-        program_accounts.slot,
-        program_accounts.executable,
-        program_accounts.rent_epoch,
-        program_accounts.data,
-        program_accounts.token_mint
-    FROM program_accounts
-    ORDER BY program_accounts.pubkey ASC, program_accounts.slot DESC
 ) AS latest
-WHERE lamports > 0
--- DISTINCT ON already sorts by pubkey; this makes the output order explicit.
 ORDER BY latest.pubkey ASC;

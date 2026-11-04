@@ -76,8 +76,12 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
 
     let mut connect_options = ConnectOptions::from(config.database.clone());
     let server_side_timeout = config.database.server_side_timeout.to_string();
+    // `temp_buffers` keeps a whole block's COPY stage table in memory.
     connect_options.map_sqlx_postgres_opts(move |pg_opts| {
-        pg_opts.options([("statement_timeout", &server_side_timeout)])
+        pg_opts.options([
+            ("statement_timeout", server_side_timeout.as_str()),
+            ("temp_buffers", "256MB"),
+        ])
     });
 
     let db = Database::connect(connect_options)
@@ -94,6 +98,12 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
 
     let snapshot_processing_state = Arc::new(Mutex::new(SnapshotProcessingState::NotStarted));
     let finalize_slot_buffer_size = Arc::new(Mutex::new(0));
+
+    // One row per account: an owner change must delete the row under the old owner's partition.
+    assert!(
+        config.accounts_owner_map_enabled,
+        "the single-version accounts table needs accounts-owner-map-enabled = true"
+    );
 
     let query_timeout = Duration::from_secs(config.database.save_block_queries_timeout);
     let accounts_owner_map = if config.accounts_owner_map_enabled {

@@ -47,6 +47,19 @@ lazy_static::lazy_static! {
         &["origin"]
     ).unwrap();
 
+    /// Single-version block transaction time, per write mode and phase.
+    pub static ref BLOCK_TX_SECONDS: HistogramVec = HistogramVec::new(
+        HistogramOpts::new(
+            "cloudbreak_single_version_block_tx_seconds",
+            "Single-version block transaction time per write mode and phase"
+        )
+        .buckets(vec![
+            0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.25, 0.3,
+            0.4, 0.5, 0.75, 1.0, 2.5, 10.0,
+        ]),
+        &["mode", "phase"]
+    ).unwrap();
+
     pub static ref CHUNK_PROCESSING: HistogramVec = HistogramVec::new(
         HistogramOpts::new(
             "cloudbreak_chunk_processing",
@@ -350,6 +363,7 @@ pub fn register_collectors() {
 
         register!(BLOCK_PROCESSING);
         register!(CHUNK_PROCESSING);
+        register!(BLOCK_TX_SECONDS);
         register!(BLOCK_SIZE_HISTOGRAM);
         register!(CHUNK_SIZE_HISTOGRAM);
         register!(FINALIZE_SLOT);

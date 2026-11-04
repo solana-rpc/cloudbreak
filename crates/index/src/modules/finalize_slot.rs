@@ -439,7 +439,8 @@ async fn finalize_slot(
     }
 
     let _ = prune_slot_tx.send(slot);
-    cleanup.enqueue(slot, &derived.items);
+    // The block transaction already replaced or deleted every superseded row, so no cleanup keys.
+    let _ = cleanup;
 }
 
 ///Used to store all accounts that are updated/closed while loading the snapshot, and delete them after the snapshot is processed

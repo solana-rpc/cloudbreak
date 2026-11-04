@@ -45,6 +45,9 @@ pub struct AccountOwnerMap {
     changed_owners: Arc<Mutex<HashMap<u64, Vec<ChangedOwner>>>>,
 }
 
+/// (pubkeys, old owners) of closed and owner-moved accounts, and the closed pubkeys not in the map.
+pub type ClosedPairs = (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>);
+
 #[derive(Clone, Debug)]
 pub struct ChangedOwner {
     /// The pubkey of the account that has changed its owner
@@ -244,6 +247,50 @@ impl AccountOwnerMap {
                     tracing::error!(target: "save_closed_accounts_with_map", "insert_closed_accounts with map timeout ERROR: {}", elapsed);
                     Err(sea_orm::DbErr::RecordNotInserted)
                 })
+    }
+
+    /// Same map bookkeeping as [`Self::save_closed_accounts`], without the mask insert.
+    /// Returns the (pubkeys, old owners) to delete, and the closed pubkeys the map did not know.
+    pub fn take_closed_pairs(&self, closed_accounts: &[Vec<u8>], slot: u64) -> ClosedPairs {
+        let Some(accounts) = self.accounts.as_ref() else {
+            return (Vec::new(), Vec::new(), closed_accounts.to_vec());
+        };
+
+        let (mut pubkeys, mut owners, unknown) = {
+            let mut map = accounts.write().expect("Failed to write accounts");
+            let mut pubkeys = Vec::with_capacity(closed_accounts.len());
+            let mut owners = Vec::with_capacity(closed_accounts.len());
+            let mut unknown = Vec::new();
+
+            for pubkey_bytes in closed_accounts {
+                let pubkey = Pubkey::try_from(pubkey_bytes.as_slice()).unwrap();
+
+                match map.remove(&pubkey) {
+                    Some(item) => {
+                        pubkeys.push(pubkey_bytes.clone());
+                        owners.push(item.owner.to_bytes().to_vec());
+                    }
+                    None => unknown.push(pubkey_bytes.clone()),
+                }
+            }
+
+            (pubkeys, owners, unknown)
+        };
+
+        let changed_owners_for_slot = self
+            .changed_owners
+            .lock()
+            .expect("Failed to lock changed_owners")
+            .remove(&slot);
+
+        if let Some(changed_owners_for_slot) = changed_owners_for_slot {
+            for ChangedOwner { pubkey, owner } in changed_owners_for_slot {
+                pubkeys.push(pubkey.to_bytes().to_vec());
+                owners.push(owner.to_bytes().to_vec());
+            }
+        }
+
+        (pubkeys, owners, unknown)
     }
 
     pub fn get_owner(&self, pubkey: &Pubkey) -> Option<Pubkey> {

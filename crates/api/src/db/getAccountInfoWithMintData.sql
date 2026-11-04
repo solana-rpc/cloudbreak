@@ -18,7 +18,7 @@
 -- requested account is closed, because we'd be throwing the result away.
 --
 -- $1 = requested pubkey (bytea literal)
--- $2 = bound on slot derived from the requested commitment (literal)
+-- $2 = unused: `accounts` holds one row per account, so reads take no slot bound
 
 WITH all_versions AS (
     SELECT
@@ -33,7 +33,6 @@ WITH all_versions AS (
     FROM accounts
     WHERE
         accounts.pubkey = $1
-        AND accounts.slot <= $2
     UNION ALL
     SELECT
         snapshot_accounts.pubkey,
@@ -47,7 +46,6 @@ WITH all_versions AS (
     FROM snapshot_accounts
     WHERE
         snapshot_accounts.pubkey = $1
-        AND snapshot_accounts.slot <= $2
 ),
 
 latest_account AS (
@@ -86,7 +84,6 @@ all_mint_versions AS NOT MATERIALIZED (
         accounts.lamports
     FROM accounts
     INNER JOIN needed_mint ON accounts.pubkey = needed_mint.mint_pubkey
-    WHERE accounts.slot <= $2
     UNION ALL
     SELECT
         snapshot_accounts.pubkey,
@@ -95,7 +92,6 @@ all_mint_versions AS NOT MATERIALIZED (
         snapshot_accounts.lamports
     FROM snapshot_accounts
     INNER JOIN needed_mint ON snapshot_accounts.pubkey = needed_mint.mint_pubkey
-    WHERE snapshot_accounts.slot <= $2
 ),
 
 mint AS (

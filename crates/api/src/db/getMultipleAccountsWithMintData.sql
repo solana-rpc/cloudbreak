@@ -8,7 +8,7 @@
 -- so we look up each distinct mint exactly once.
 --
 -- $1 = ARRAY['\x...'::bytea, ...] input pubkeys (order doesn't matter)
--- $2 = bound on slot from commitment (literal)
+-- $2 = unused: `accounts` holds one row per account, so reads take no slot bound
 
 WITH input AS (
     SELECT DISTINCT pubkey
@@ -48,7 +48,6 @@ latest_account AS (
                 FROM accounts
                 WHERE
                     accounts.pubkey = input.pubkey
-                    AND accounts.slot <= $2
                 ORDER BY accounts.slot DESC
                 LIMIT 1
             )
@@ -65,7 +64,6 @@ latest_account AS (
                 FROM snapshot_accounts
                 WHERE
                     snapshot_accounts.pubkey = input.pubkey
-                    AND snapshot_accounts.slot <= $2
                 ORDER BY snapshot_accounts.slot DESC
                 LIMIT 1
             )
@@ -96,7 +94,6 @@ all_mint_versions AS NOT MATERIALIZED (
         accounts.lamports
     FROM accounts
     INNER JOIN needed_mints ON accounts.pubkey = needed_mints.mint_pubkey
-    WHERE accounts.slot <= $2
     UNION ALL
     SELECT
         snapshot_accounts.pubkey,
@@ -106,7 +103,6 @@ all_mint_versions AS NOT MATERIALIZED (
     FROM snapshot_accounts
     INNER JOIN needed_mints
         ON snapshot_accounts.pubkey = needed_mints.mint_pubkey
-    WHERE snapshot_accounts.slot <= $2
 ),
 
 mint AS (

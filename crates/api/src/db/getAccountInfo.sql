@@ -3,13 +3,12 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
--- getAccountInfo: latest version of the requested pubkey (slot <= $2).
+-- getAccountInfo: the requested pubkey.
 -- Closed accounts (lamports = 0) are filtered AT THE END so that a recent
 -- close shadows any earlier live version (matches getProgramAccounts.sql).
 --
 -- $1 = requested pubkey (bytea literal injected by the caller)
--- $2 = bound on slot derived from the requested commitment (literal
---      injected by the caller)
+-- $2 = unused: `accounts` holds one row per account, so reads take no slot bound
 --
 -- No `WHERE owner = ...` predicate, so partition pruning does not apply;
 -- the cost is dominated by the per-partition (pubkey, slot DESC) B-tree
@@ -28,7 +27,6 @@ WITH all_versions AS (
     FROM accounts
     WHERE
         accounts.pubkey = $1
-        AND accounts.slot <= $2
     UNION ALL
     SELECT
         snapshot_accounts.pubkey,
@@ -41,7 +39,6 @@ WITH all_versions AS (
     FROM snapshot_accounts
     WHERE
         snapshot_accounts.pubkey = $1
-        AND snapshot_accounts.slot <= $2
 ),
 
 latest_account AS (

@@ -110,10 +110,10 @@ async fn load_vote_account_rows(
             SELECT DISTINCT ON (pubkey) pubkey, data, lamports
             FROM (
                 SELECT pubkey, slot, data, lamports FROM accounts
-                    WHERE owner = $1 AND pubkey = $2 AND slot <= $3
+                    WHERE owner = $1 AND pubkey = $2
                 UNION ALL
                 SELECT pubkey, slot, data, lamports FROM snapshot_accounts
-                    WHERE owner = $1 AND pubkey = $2 AND slot <= $3
+                    WHERE owner = $1 AND pubkey = $2
             ) AS u
             ORDER BY pubkey ASC, slot DESC
         )
@@ -125,10 +125,10 @@ async fn load_vote_account_rows(
             SELECT DISTINCT ON (pubkey) pubkey, data, lamports
             FROM (
                 SELECT pubkey, slot, data, lamports FROM accounts
-                    WHERE owner = $1 AND slot <= $2
+                    WHERE owner = $1
                 UNION ALL
                 SELECT pubkey, slot, data, lamports FROM snapshot_accounts
-                    WHERE owner = $1 AND slot <= $2
+                    WHERE owner = $1
             ) AS u
             ORDER BY pubkey ASC, slot DESC
         )
