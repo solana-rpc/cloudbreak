@@ -212,6 +212,56 @@ lazy_static::lazy_static! {
         ),
         &["reason"],
     ).unwrap();
+
+    /// Time to apply one published slot to the gRPC-fed gPA queries, in microseconds.
+    pub static ref CLOUDBREAK_GPA_CACHE_FEED_UPDATE_DURATION_US: HistogramVec = HistogramVec::new(
+        HistogramOpts::new(
+            "cloudbreak_gpa_cache_feed_update_duration_us",
+            "Time to bring the gRPC-fed gPA cache queries to a published slot, in microseconds, by commitment"
+        )
+        .buckets(vec![
+            10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0, 25_000.0,
+            50_000.0, 100_000.0, 250_000.0, 500_000.0, 1_000_000.0,
+        ]),
+        &["commitment"],
+    )
+    .unwrap();
+
+    /// Per-query results of the gRPC feed updates: `updated`, `too_old` (the ring does not reach the query slot), `dropped` (encoding failed).
+    pub static ref CLOUDBREAK_GPA_CACHE_FEED_QUERY_UPDATES_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new(
+            "cloudbreak_gpa_cache_feed_query_updates_total",
+            "gRPC-fed gPA cache query updates, by commitment and result"
+        ),
+        &["commitment", "result"],
+    ).unwrap();
+
+    /// gPAs for a fed owner: `memory` (no Postgres), `not_cached`, `not_fed`, `behind`.
+    pub static ref CLOUDBREAK_GPA_CACHE_FEED_REQUESTS_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new(
+            "cloudbreak_gpa_cache_feed_requests_total",
+            "gPA requests for a gRPC-fed owner, by result"
+        ),
+        &["result"],
+    ).unwrap();
+
+    /// Feed resets: `block_missing` (gRPC gap) or `health_restored` (indexer gap repair).
+    pub static ref CLOUDBREAK_GPA_CACHE_FEED_RESETS_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new(
+            "cloudbreak_gpa_cache_feed_resets_total",
+            "gRPC-fed gPA cache resets, by reason"
+        ),
+        &["reason"],
+    ).unwrap();
+
+    /// Blocks held by the gRPC feed: `buffer` (processed, not confirmed yet) and `ring` (recent confirmed).
+    pub static ref CLOUDBREAK_GPA_CACHE_FEED_BLOCKS: IntGaugeVec = IntGaugeVec::new(
+        Opts::new(
+            "cloudbreak_gpa_cache_feed_blocks",
+            "Blocks held by the gRPC-fed gPA cache, by kind"
+        ),
+        &["kind"],
+    ).unwrap();
 }
 
 /// Tracks a GPA cache insertion while it is queued on, or running on, the
@@ -321,6 +371,11 @@ pub fn setup_metrics(config: &ApiConfig) -> anyhow::Result<()> {
         register!(CLOUDBREAK_GPA_CACHE_FINALIZE_INFLIGHT_BYTES);
         register!(CLOUDBREAK_GPA_CACHE_FINALIZE_SKIPPED_TOTAL);
         register!(CLOUDBREAK_GPA_CACHE_SKIPPED_TOTAL);
+        register!(CLOUDBREAK_GPA_CACHE_FEED_UPDATE_DURATION_US);
+        register!(CLOUDBREAK_GPA_CACHE_FEED_QUERY_UPDATES_TOTAL);
+        register!(CLOUDBREAK_GPA_CACHE_FEED_REQUESTS_TOTAL);
+        register!(CLOUDBREAK_GPA_CACHE_FEED_RESETS_TOTAL);
+        register!(CLOUDBREAK_GPA_CACHE_FEED_BLOCKS);
 
         // Per-client-IP egress bandwidth (peak gauge + throughput histogram).
         // Optional, off by default: registers its collectors and starts the 1s

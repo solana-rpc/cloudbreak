@@ -31,6 +31,11 @@ use crate::methods::get_program_accounts::GpaDbQueryInput;
 use crate::metrics;
 use crate::modules::mint_resolver::MintResolver;
 
+pub mod feed;
+
+/// The accounts of a gRPC-fed query, sorted by pubkey like the Postgres response.
+pub type FedAccounts = Arc<[(Pubkey, Bytes)]>;
+
 /// A query that has been accepted for caching, carrying everything needed to
 /// install it. Built on the request path, executed on the blocking pool by
 /// [`FinalizeJob::run`].
@@ -118,6 +123,7 @@ impl FinalizeJob {
             slot,
             size: query_bytes,
             cache_hits,
+            sorted: None,
         };
 
         // Versions of this query that are no longer reachable from the cache.
@@ -225,6 +231,8 @@ pub struct GpaCache {
     /// larger than `config.max_bytes_query_cleanup`. Tracked incrementally so we
     /// can cap how much space pinned queries are allowed to collectively hold.
     pub pinned_size: u64,
+    /// The gRPC feed cursors, for the debug endpoint. `None` when the feed is disabled.
+    pub feed_status: Option<feed::FeedStatus>,
 }
 
 /// One gPA statement and its values: the filter values, the latest slot, then the cache slot
@@ -326,6 +334,50 @@ impl GpaProcessor {
         } else {
             Self::Standard
         }
+    }
+
+    /// The shared cache, or `None` for `Standard`.
+    pub fn cache(&self) -> Option<&Arc<RwLock<GpaCache>>> {
+        match self {
+            Self::Standard => None,
+            Self::Cached { cache, .. } => Some(cache),
+        }
+    }
+
+    /// For a gRPC-fed owner: the pubkey-sorted accounts of the cached query and their slot, when
+    /// the feed keeps it current at `latest_slot` or newer. The request then needs no Postgres.
+    pub fn fed_query(
+        &self,
+        program: Pubkey,
+        config: &RpcProgramAccountsConfig,
+        latest_slot: u64,
+    ) -> Option<(u64, FedAccounts)> {
+        let Self::Cached { cache, .. } = self else {
+            return None;
+        };
+        if has_value_cmp(config.filters.as_deref().unwrap_or(&[])) {
+            return None;
+        }
+        let cache = cache.read().expect("gpa cache rwlock poisoned");
+        if !cache.config.feed_owners().contains(&program) {
+            return None;
+        }
+        let (_, cached) = cache.get_cached_query(program, config);
+        drop(cache);
+        let (result, fed) = match cached {
+            None => ("not_cached", None),
+            Some(CachedQuery { sorted: None, .. }) => ("not_fed", None),
+            Some(c) if c.slot < latest_slot => ("behind", None),
+            Some(CachedQuery {
+                slot,
+                sorted: Some(sorted),
+                ..
+            }) => ("memory", Some((slot, sorted))),
+        };
+        metrics::CLOUDBREAK_GPA_CACHE_FEED_REQUESTS_TOTAL
+            .with_label_values(&[result])
+            .inc();
+        fed
     }
 
     pub fn get_type(&self) -> &str {
@@ -561,6 +613,8 @@ pub struct CachedQuery {
     pub size: u64,
     /// Number of cache hits for the query
     pub cache_hits: u64,
+    /// Set only by the gRPC feed: the accounts sorted by pubkey, current at `slot`.
+    pub sorted: Option<FedAccounts>,
 }
 
 /// Representation of a gpa query with all the parameters that will affect the response.
@@ -618,6 +672,7 @@ impl GpaCache {
             config,
             size: 0,
             pinned_size: 0,
+            feed_status: None,
         };
         cache.update_size_metrics();
         cache
@@ -783,9 +838,13 @@ impl GpaCache {
     /// inconsistent (an account the DB reported as cached is missing from the
     /// in-memory `CachedQuery`), so a subsequent request re-populates it fresh.
     pub fn remove_query(&mut self, query: &NormalizedQuery) {
-        let Some(removed) = self.queries.remove(query) else {
-            return;
-        };
+        self.take_query(query);
+    }
+
+    /// Removes a query like [`Self::remove_query`] and returns it, so the caller can free it
+    /// after the write lock.
+    pub fn take_query(&mut self, query: &NormalizedQuery) -> Option<CachedQuery> {
+        let removed = self.queries.remove(query)?;
 
         self.size = self.size.saturating_sub(removed.size);
         if self.is_pinned_size(removed.size) {
@@ -800,6 +859,30 @@ impl GpaCache {
         }
 
         self.update_size_metrics();
+        Some(removed)
+    }
+
+    /// Inserts or replaces a query with the size, pinned and per-slot accounting. Returns the
+    /// replaced entry, so the caller can free it after the write lock.
+    pub fn replace_query(
+        &mut self,
+        query: NormalizedQuery,
+        entry: CachedQuery,
+    ) -> Option<CachedQuery> {
+        let (size, slot) = (entry.size, entry.slot);
+        let older = self.queries.insert(query.clone(), entry);
+        self.size += size;
+        if self.is_pinned_size(size) {
+            self.pinned_size += size;
+        }
+        if let Some(older) = &older {
+            self.size = self.size.saturating_sub(older.size);
+            if self.is_pinned_size(older.size) {
+                self.pinned_size = self.pinned_size.saturating_sub(older.size);
+            }
+        }
+        self.insert_query_for_slot(query, slot, older.as_ref().map(|q| q.slot));
+        older
     }
 
     /// it will delete the oldes queries until reach the `bytes_to_free` target.

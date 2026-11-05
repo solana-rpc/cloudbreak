@@ -7,7 +7,7 @@
 //! trigger sends every real change of a `slots` row on [`SLOTS_CHANNEL`]; this task applies it.
 //! A lost connection, a bad payload or [`IDLE_TIMEOUT`] without a notification panics.
 //! With `[processed-accounts]` enabled it also publishes the processed [`Anchor`]. With
-//! `[mint-cache]` it applies each confirmed slot's mint changes before publishing the slot.
+//! `[mint-cache]` or the gPA cache gRPC feed it applies their changes before publishing the slot.
 
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -20,6 +20,8 @@ use sea_orm::sqlx::postgres::PgListener;
 use serde::Deserialize;
 use solana_commitment_config::CommitmentLevel;
 use tokio::{sync::watch, task::JoinHandle};
+
+use crate::modules::cache::feed::GpaFeed;
 
 /// The channel the `slots_notify` trigger sends on.
 pub const SLOTS_CHANNEL: &str = "cloudbreak_slots";
@@ -86,6 +88,7 @@ pub fn start_slot_syncronizer(
     config: &ApiConfig,
     anchor_tx: watch::Sender<Option<Anchor>>,
     mint_cache: MintCache,
+    gpa_feed: GpaFeed,
 ) -> Option<(JoinHandle<()>, Arc<RwLock<SlotSyncronizerData>>)> {
     if !config.slot_syncronizer.enabled {
         return None;
@@ -93,7 +96,7 @@ pub fn start_slot_syncronizer(
 
     let data = Arc::new(RwLock::new(SlotSyncronizerData::default()));
     let anchor_tx = config.processed_accounts_enabled().then_some(anchor_tx);
-    let handle = tokio::spawn(run(db, data.clone(), anchor_tx, mint_cache));
+    let handle = tokio::spawn(run(db, data.clone(), anchor_tx, mint_cache, gpa_feed));
 
     Some((handle, data))
 }
@@ -105,6 +108,7 @@ async fn run(
     data: Arc<RwLock<SlotSyncronizerData>>,
     anchor_tx: Option<watch::Sender<Option<Anchor>>>,
     mint_cache: MintCache,
+    gpa_feed: GpaFeed,
 ) {
     let mut listener = PgListener::connect_with(db.get_postgres_connection_pool())
         .await
@@ -136,6 +140,18 @@ async fn run(
                 .api()
                 .on_confirmed(row.slot as u64, row.blockhash.as_deref(), row.health);
         }
+        // The fed gPA queries must hold a slot before a request can pick that slot.
+        if gpa_feed.is_enabled() && slot_advance(&data, &row) {
+            let (feed, row) = (gpa_feed.clone(), row.clone());
+            tokio::task::spawn_blocking(move || match row.commitment {
+                COMMITMENT_CONFIRMED => {
+                    feed.on_confirmed(row.slot as u64, row.blockhash.as_deref(), row.health)
+                }
+                _ => feed.on_finalized(row.slot as u64),
+            })
+            .await
+            .expect("slot syncronizer: gpa cache feed update panicked");
+        }
         apply(&data, anchor_tx.as_ref(), &row);
     }
 }
@@ -143,6 +159,17 @@ async fn run(
 fn confirmed_advance(data: &RwLock<SlotSyncronizerData>, row: &SlotRow) -> bool {
     row.commitment == COMMITMENT_CONFIRMED
         && row.slot as u64 > data.read().expect("Failed to lock slot data").confirmed_slot.slot
+}
+
+/// True when the row moves its commitment's slot forward.
+fn slot_advance(data: &RwLock<SlotSyncronizerData>, row: &SlotRow) -> bool {
+    let data = data.read().expect("Failed to lock slot data");
+    let current = match row.commitment {
+        COMMITMENT_CONFIRMED => data.confirmed_slot.slot,
+        COMMITMENT_FINALIZED => data.finalized_slot.slot,
+        _ => return false,
+    };
+    row.slot as u64 > current
 }
 
 /// Applies one row. Slots never move backwards. A confirmed advance publishes the anchor.

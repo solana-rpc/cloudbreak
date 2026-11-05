@@ -11,7 +11,7 @@ use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
 use crate::metrics;
 use crate::metrics::GpaMetricsData;
-use crate::modules::cache::{GpaProcessor, KeyedRpcAccount, MaybeJsonAccount};
+use crate::modules::cache::{FedAccounts, GpaProcessor, KeyedRpcAccount, MaybeJsonAccount};
 use crate::modules::mint_resolver::MintResolver;
 use crate::utils::encoding::check_account_data_len_for_encoding;
 use crate::utils::row_account::RowAccount;
@@ -102,6 +102,18 @@ pub async fn get_program_accounts(
 
     let sql_filters = SqlFilters::build(&program, config.filters.as_deref().unwrap_or(&[]), label)?;
     let metrics_data = GpaMetricsData::new(sql_filters.label.clone());
+
+    // A query the gRPC feed keeps current is answered from memory, without Postgres.
+    if let Some((slot, accounts)) = state.gpa_processor.fed_query(program, &config, latest_slot) {
+        return Ok(GpaStreamingResponse {
+            context_slot: context_slot.map(|_| slot),
+            accounts_stream: fed_accounts_stream(accounts, state.gpa_stream_batch_size),
+            metrics_data: Some(metrics_data),
+            gpa_processor: GpaProcessor::Standard,
+            program,
+            encoding,
+        });
+    }
 
     let mut request_processor = state
         .gpa_processor
@@ -284,6 +296,25 @@ fn gpa_db_query(
     tokio::task::spawn_blocking(move || runtime.block_on(fetch));
 
     rx
+}
+
+/// Streams the cached bytes of a fed query in the batch size of the Postgres path.
+fn fed_accounts_stream(
+    accounts: FedAccounts,
+    batch_size: Option<NonZeroUsize>,
+) -> EncodedAccountBatchStream {
+    let batch_size = batch_size.map_or(accounts.len().max(1), NonZeroUsize::get);
+    let batches = (0..accounts.len()).step_by(batch_size).map(move |start| {
+        let end = (start + batch_size).min(accounts.len());
+        Ok(accounts[start..end]
+            .iter()
+            .map(|(pubkey, bytes)| MaybeJsonAccount::Cached {
+                pubkey: *pubkey,
+                bytes: bytes.clone(),
+            })
+            .collect())
+    });
+    Box::pin(futures::stream::iter(batches))
 }
 
 pub struct GpaEncodingInput {

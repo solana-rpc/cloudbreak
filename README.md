@@ -489,6 +489,8 @@ Optional in-memory cache for `getProgramAccounts` responses. Omitting this secti
 | `min-bytes-per-query`    | `usize`  | **required** | Minimum serialized size of a query for it to be cached at all. Smaller queries are skipped so they don't dilute room available for heavier ones.                                                                                                                             |
 | `max-bytes-query-cleanup`| `usize`  | (unset)      | Optional upper bound on the size of a query that is eligible for eviction. Queries **larger** than this are pinned: they are normally skipped by cleanup and stay cached (until replaced by a newer version of the same query). The pin is *soft* — see `max-pinned-bytes-ratio`. Omit to make every cached query evictable. Note: when the oldest slots are mostly pinned (and under the pinned cap), a new insert may fail to free enough room and be skipped. |
 | `max-pinned-bytes-ratio` | `f64`    | (unset)      | Cap on how much space pinned queries may collectively occupy, expressed as a fraction of `max-total-bytes` (e.g. `0.5` = at most half the cache). When pinned usage exceeds `max-total-bytes × ratio`, the **oldest** pinned queries are evicted via the normal cleanup process until usage drops back under the cap — so the pin set can never grow unbounded. **Required** when `max-bytes-query-cleanup` is set (config load fails otherwise); ignored when it is unset (nothing is pinned). Must be in the range `(0.0, 1.0]`. |
+| `grpc-feed-enabled`      | `bool`   | `false`      | Keeps the cached queries of `grpc-feed-owners` current from the `[grpc]` feed, so a request for them needs no Postgres. Requires `[grpc]` and `[slot-syncronizer]`. See [GPA cache gRPC feed](#gpa-cache-grpc-feed). |
+| `grpc-feed-owners`       | `[pubkey]` | `[]`       | The programs the gRPC feed follows. Required when `grpc-feed-enabled` is true. Token programs are rejected. |
 
 The cache is keyed by `(program, sorted filters, encoding, data_slice, commitment)` and holds the **pre-serialized JSON bytes** of each account, ref-counted via `bytes::Bytes`. Concretely:
 
@@ -855,6 +857,19 @@ The API can operate with or without the query tracker. To disable it, remove the
 
 Set `[gpa-cache]` in the API config to enable an in-memory cache for `getProgramAccounts` responses. The cache stores pre-serialized JSON bytes (ref-counted, zero-copy on hits) and changes the SQL to skip re-sending the body of already-cached accounts. See [`[gpa-cache]` (optional)](#gpa-cache-optional) for the config keys and a benefits breakdown. Omit the section to disable.
 
+### GPA Cache gRPC Feed
+
+With `grpc-feed-enabled = true`, the API keeps the cached gPA queries of each program in `grpc-feed-owners` current from its `[grpc]` feed:
+
+- The feed buffers, per processed block, the writes by the fed owners and the pubkeys of every other write (a close, or an account now owned by another program).
+- Before the slot syncronizer publishes a confirmed slot, it applies the confirmed chain to every fed query with `confirmed` or `processed` commitment. Before it publishes a finalized slot, it does the same for the `finalized` queries.
+- An update re-encodes the changed accounts, adds the accounts that now match the filters and removes the accounts that no longer match, were closed or moved. The query then holds the published slot.
+- A gPA for a fed query at that slot is answered from memory. Postgres is not touched.
+- The first request for a query shape still goes to Postgres, and the cache stores it as usual. The next slot catches it up from the last 512 confirmed blocks. `min-bytes-per-query` still decides what is cached.
+- A missing block in the feed resets it: the fed queries go back to Postgres until a refresh. When the indexer reports healthy again after a gap, the fed queries are dropped.
+
+Metrics: `cloudbreak_gpa_cache_feed_update_duration_us` (per published slot, the time the slot waits for the update), `cloudbreak_gpa_cache_feed_requests_total{result}`, `cloudbreak_gpa_cache_feed_query_updates_total`, `cloudbreak_gpa_cache_feed_resets_total` and `cloudbreak_gpa_cache_feed_blocks`. `/debug/modules/gpa_cache` shows `fed` and `commitment` per query, and the feed cursors under `feed`.
+
 ### Mint Cache
 
 `jsonParsed` token responses need each account's mint decimals and the mint's interest-bearing and scaled-UI configs. The mint cache keeps that data in memory. `getTokenAccountsByOwner`, `getTokenAccountsByDelegate`, `getTokenAccountsByMint` and token-program `getProgramAccounts` then read it without a Postgres lookup. Enable `[mint-cache]` on the indexer and on the API.
@@ -982,6 +997,11 @@ All metrics are emitted in the Prometheus text exposition format on each service
 | `cloudbreak_gpa_cache_evictions_total`               | Counter           | `used`                 | GPA cache entries evicted by cleanup to make room for a different query. `used` ∈ {`used`, `unused`} indicating whether the evicted entry had ever served a cache hit. A high rate of `unused` evictions indicates cache churn (e.g. `min-bytes-per-query` set too low). |
 | `cloudbreak_gpa_cache_evicted_bytes_total`           | Counter           | `used`                 | Total bytes evicted from the GPA cache by cleanup, with the same `used` labelling as `cloudbreak_gpa_cache_evictions_total`. |
 | `cloudbreak_gpa_cache_skipped_total`                 | Counter           | `method`, `bytes`, `reason` | Responses large enough to cache (`min-bytes-per-query`) that were not cached. `method` is the request label (`gpa`, `gpa_mint`, `gpa_delegate`, `gpa_token`, `gtabo`, `gtabd`, `gtabm`), `bytes` the response-size bucket. `reason` is `mutable_mint` (a `jsonParsed` token account uses a mint with close authority, interest-bearing or scaled-UI config, or a missing mint) or `dropped_account` (a `jsonParsed` token account did not parse and was left out). |
+| `cloudbreak_gpa_cache_feed_update_duration_us`      | Histogram         | `commitment`           | Time, in microseconds, to bring the gRPC-fed gPA queries to one published slot. The slot syncronizer publishes the slot only after it. |
+| `cloudbreak_gpa_cache_feed_requests_total`          | Counter           | `result`               | gPAs for a fed owner: `memory` (answered without Postgres), `not_cached`, `not_fed`, `behind`. |
+| `cloudbreak_gpa_cache_feed_query_updates_total`     | Counter           | `commitment`, `result` | Per-query feed updates: `updated`, `too_old` (the ring does not reach the query slot), `dropped` (an account failed to encode). |
+| `cloudbreak_gpa_cache_feed_resets_total`            | Counter           | `reason`               | Feed resets: `block_missing` (gap in the gRPC feed) or `health_restored` (indexer gap repair). |
+| `cloudbreak_gpa_cache_feed_blocks`                  | IntGaugeVec       | `kind`                 | Blocks held by the feed: `buffer` (processed, not confirmed yet) and `ring` (recent confirmed). |
 | `cloudbreak_api_processed_requests_total`            | Counter           | `method`, `route`, `reason` | Processed commitment requests for the methods `[processed-accounts]` serves. `route` is `view` when the processed blocks answer, `degraded` when the request reads as confirmed. `reason` is `none`, `no_blocks`, `unhealthy`, `head_behind` or `finalized_above_anchor`. Registered only when `[processed-accounts]` is enabled. |
 | `cloudbreak_api_processed_confirm_latency_ms`         | Histogram         | —                      | Time from receiving a processed block to the Postgres confirmed slot reaching it, in milliseconds. Registered only when `[processed-accounts]` is enabled. |
 | `cloudbreak_mint_cache_entries`                      | IntGaugeVec       | `side`, `map`          | Mint cache entries: `immutable`, `mutable`, `tombstone`. `side` is `api` here and `indexer` on the indexer. Registered only with `[mint-cache]`. |

@@ -964,6 +964,10 @@ pub struct GpaCacheConfig {
     /// back under the cap. Required when `max_bytes_query_cleanup` is set, and
     /// ignored otherwise (no query is pinned without `max_bytes_query_cleanup`).
     pub max_pinned_bytes_ratio: Option<f64>,
+    /// Keeps the cached queries of `grpc_feed_owners` current from the `[grpc]` feed.
+    pub grpc_feed_enabled: bool,
+    /// The programs whose cached queries the gRPC feed keeps current.
+    pub grpc_feed_owners: Vec<Pubkey>,
 }
 
 /// Raw, file-facing shape of [`GpaCacheConfig`]. Deserialized first so we can
@@ -978,6 +982,10 @@ struct GpaCacheConfigRaw {
     max_bytes_query_cleanup: Option<usize>,
     #[serde(rename = "max-pinned-bytes-ratio", default)]
     max_pinned_bytes_ratio: Option<f64>,
+    #[serde(rename = "grpc-feed-enabled", default)]
+    grpc_feed_enabled: bool,
+    #[serde(rename = "grpc-feed-owners", default)]
+    grpc_feed_owners: Vec<PubkeyDef>,
 }
 
 impl TryFrom<GpaCacheConfigRaw> for GpaCacheConfig {
@@ -999,12 +1007,55 @@ impl TryFrom<GpaCacheConfigRaw> for GpaCacheConfig {
             ));
         }
 
+        let grpc_feed_owners: Vec<Pubkey> = raw.grpc_feed_owners.into_iter().map(|o| o.0).collect();
+        if raw.grpc_feed_enabled && grpc_feed_owners.is_empty() {
+            return Err("`grpc-feed-owners` must list at least one program when `grpc-feed-enabled` is true".to_string());
+        }
+        // Token-program `jsonParsed` needs mint data, which the feed does not encode.
+        if let Some(owner) = grpc_feed_owners
+            .iter()
+            .find(|owner| crate::utils::token::is_token_program(owner))
+        {
+            return Err(format!(
+                "`grpc-feed-owners` does not support the token program {owner}"
+            ));
+        }
+
         Ok(Self {
             max_total_bytes: raw.max_total_bytes,
             min_bytes_per_query: raw.min_bytes_per_query,
             max_bytes_query_cleanup: raw.max_bytes_query_cleanup,
             max_pinned_bytes_ratio: raw.max_pinned_bytes_ratio,
+            grpc_feed_enabled: raw.grpc_feed_enabled,
+            grpc_feed_owners,
         })
+    }
+}
+
+impl GpaCacheConfig {
+    /// The owners the gRPC feed keeps current; empty when the feed is disabled.
+    pub fn feed_owners(&self) -> &[Pubkey] {
+        if self.grpc_feed_enabled {
+            &self.grpc_feed_owners
+        } else {
+            &[]
+        }
+    }
+
+    /// The gRPC feed needs `[grpc]` and the slot syncronizer, which applies each slot before publishing it.
+    pub fn check_required_api_modules(&self, config: &ApiConfig) -> Result<()> {
+        if !self.grpc_feed_enabled {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            config.grpc_enabled(),
+            "gpa-cache grpc-feed-enabled requires [grpc] enabled = true"
+        );
+        anyhow::ensure!(
+            config.slot_syncronizer.enabled,
+            "gpa-cache grpc-feed-enabled requires [slot-syncronizer] enabled = true"
+        );
+        Ok(())
     }
 }
 
@@ -1605,6 +1656,10 @@ impl ApiConfig {
     pub fn grpc_enabled(&self) -> bool {
         self.grpc.as_ref().is_some_and(|grpc| grpc.enabled)
     }
+
+    pub fn gpa_cache_feed_enabled(&self) -> bool {
+        self.gpa_cache.as_ref().is_some_and(|c| c.grpc_feed_enabled)
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -1987,5 +2042,44 @@ url = "postgres://localhost/cloudbreak"
         assert!(config.mint_cache_enabled());
         let config = api_config("[mint-cache]\nenabled = false\n").unwrap();
         assert!(!config.mint_cache_enabled());
+    }
+
+    const GPA_CACHE: &str = "[gpa-cache]\nmax-total-bytes = 1000\nmin-bytes-per-query = 10\n";
+    const VOTE: &str = "Vote111111111111111111111111111111111111111";
+
+    #[test]
+    fn gpa_cache_feed_parses_and_is_off_by_default() {
+        let config = api_config(GPA_CACHE).unwrap();
+        assert!(!config.gpa_cache_feed_enabled());
+        assert!(config.gpa_cache.unwrap().feed_owners().is_empty());
+
+        let extra =
+            format!("{GPA_CACHE}grpc-feed-enabled = true\ngrpc-feed-owners = [\"{VOTE}\"]\n");
+        let config = api_config(&extra).unwrap();
+        assert!(config.gpa_cache_feed_enabled());
+        let owners = config.gpa_cache.as_ref().unwrap().feed_owners().to_vec();
+        assert_eq!(owners, vec![Pubkey::from_str(VOTE).unwrap()]);
+    }
+
+    #[test]
+    fn gpa_cache_feed_rejects_no_owners_and_token_programs() {
+        assert!(api_config(&format!("{GPA_CACHE}grpc-feed-enabled = true\n")).is_err());
+        let token = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+        let extra =
+            format!("{GPA_CACHE}grpc-feed-enabled = true\ngrpc-feed-owners = [\"{token}\"]\n");
+        assert!(api_config(&extra).is_err());
+    }
+
+    #[test]
+    fn gpa_cache_feed_requires_grpc_and_the_slot_syncronizer() {
+        let feed =
+            format!("{GPA_CACHE}grpc-feed-enabled = true\ngrpc-feed-owners = [\"{VOTE}\"]\n");
+        let config = api_config(&feed).unwrap();
+        let gpa_cache = config.gpa_cache.as_ref().unwrap();
+        assert!(gpa_cache.check_required_api_modules(&config).is_err());
+
+        let config = api_config(&format!("{feed}[grpc]\nenabled = true\n")).unwrap();
+        let gpa_cache = config.gpa_cache.as_ref().unwrap();
+        assert!(gpa_cache.check_required_api_modules(&config).is_ok());
     }
 }

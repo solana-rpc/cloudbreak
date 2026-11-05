@@ -4,8 +4,8 @@
  */
 
 //! The API gRPC feed: a processed-commitment subscription (`modules::grpc`) whose blocks go to
-//! the processed store and the mint cache. The slot syncronizer anchor goes to the processed
-//! store. The task ends only when the subscription task ends, which is its panic on give-up.
+//! the processed store, the mint cache and the gPA cache feed. The slot syncronizer anchor goes to
+//! the processed store. The task ends only when the subscription task ends, which is its panic on give-up.
 
 use std::sync::{Arc, Mutex, atomic::AtomicBool};
 
@@ -17,19 +17,24 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use yellowstone_grpc_proto::geyser::{CommitmentLevel, subscribe_update::UpdateOneof};
 
-/// Starts the feed when `[grpc]` is enabled and the processed store or the mint cache needs it.
+use crate::modules::cache::feed::GpaFeed;
+
+/// Starts the feed when `[grpc]` is enabled and the processed store, the mint cache or the gPA
+/// cache feed needs it.
 pub fn spawn(
     grpc: Option<&ApiGrpcConfig>,
     processed: &ProcessedAccounts,
     mint_cache: &MintCache,
+    gpa_feed: &GpaFeed,
     mut anchor_rx: watch::Receiver<Option<Anchor>>,
 ) -> Option<JoinHandle<()>> {
     let grpc = grpc.filter(|g| g.enabled)?.to_grpc_config();
     let mut writer = processed.writer();
-    if !writer.is_enabled() && !mint_cache.is_enabled() {
+    if !writer.is_enabled() && !mint_cache.is_enabled() && !gpa_feed.is_enabled() {
         return None;
     }
     let mint_cache = mint_cache.clone();
+    let gpa_feed = gpa_feed.clone();
     let (tx, mut rx) = mpsc::channel(grpc.sources_channel_size);
     let rx_len = Arc::new(Mutex::new(0));
     let last_slot_received = Arc::new(Mutex::new(0));
@@ -62,6 +67,7 @@ pub fn spawn(
                         *last = (*last).max(block.slot);
                     }
                     mint_cache.api().on_block(&block);
+                    gpa_feed.on_block(&block);
                     writer.on_block(block);
                 }
                 changed = anchor_rx.changed(), if anchor_open => {

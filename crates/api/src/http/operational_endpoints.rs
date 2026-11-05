@@ -270,6 +270,8 @@ pub fn mint_cache_handler(
 ///       "cache_hit_percent": 93.75,
 ///       "encoding": "base64",
 ///       "data_slice": null,
+///       "commitment": "confirmed",
+///       "fed": false,               // true when the gRPC feed keeps it current
 ///       "filters": [...],           // only when detail=full
 ///       "account_pubkeys": [...]    // only when with_pubkeys=true & program set
 ///     }
@@ -331,6 +333,7 @@ pub fn gpa_cache_handler(
             config: None,
             stats: None,
             queries: None,
+            feed: None,
         })
         .unwrap_or_default(),
 
@@ -522,6 +525,9 @@ struct GpaCacheResponse {
     stats: Option<GpaCacheStatsInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     queries: Option<Vec<GpaCacheQueryInfo>>,
+    /// The gRPC feed cursors. Omitted when the feed is disabled or has not seen a slot yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    feed: Option<crate::modules::cache::feed::FeedStatus>,
 }
 
 #[derive(Serialize)]
@@ -571,6 +577,9 @@ struct GpaCacheQueryInfo {
     cache_hit_percent: f64,
     encoding: String,
     data_slice: Option<solana_account_decoder::UiDataSliceConfig>,
+    commitment: solana_commitment_config::CommitmentLevel,
+    /// The gRPC feed keeps this query current, so requests at its slot skip Postgres.
+    fed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     filters: Option<Vec<RpcFilterType>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -688,6 +697,8 @@ fn build_gpa_cache_response(
                         cache_hit_percent,
                         encoding: encoding_to_string(nq.encoding),
                         data_slice: nq.data_slice,
+                        commitment: nq.commitment,
+                        fed: cq.sorted.is_some(),
                         filters: include_filters.then(|| nq.filters.clone()),
                         account_pubkeys,
                     }
@@ -708,6 +719,7 @@ fn build_gpa_cache_response(
         config: Some(config),
         stats: Some(stats),
         queries,
+        feed: cache.feed_status.clone(),
     }
 }
 

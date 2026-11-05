@@ -14,7 +14,10 @@ use cloudbreak_core::{ApiConfig, EnvironmentInfo, TryLoadConfig};
 use crate::{
     http::{CloudbreakRpcState, HeaderKeys},
     metrics::setup_metrics,
-    modules::{cache::GpaProcessor, supply_cache, vote_accounts_cache},
+    modules::{
+        cache::{GpaProcessor, feed::GpaFeed},
+        supply_cache, vote_accounts_cache,
+    },
     query_tracker_client::QueryTrackerClient,
 };
 use std::sync::RwLock;
@@ -39,8 +42,14 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
     if let Some(mint_cache) = &config.mint_cache {
         mint_cache.check_required_api_modules(&config)?;
     }
+    if let Some(gpa_cache) = &config.gpa_cache {
+        gpa_cache.check_required_api_modules(&config)?;
+    }
 
-    if config.processed_accounts_enabled() || config.mint_cache_enabled() {
+    if config.processed_accounts_enabled()
+        || config.mint_cache_enabled()
+        || config.gpa_cache_feed_enabled()
+    {
         rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
             .expect("Failed to install rustls crypto provider");
@@ -88,6 +97,9 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
     };
 
     let mint_cache = MintCache::from_api_config(config.mint_cache.as_ref());
+    // Setup optional module cache
+    let gpa_processor = GpaProcessor::new(config.gpa_cache.clone());
+    let gpa_feed = GpaFeed::new(&gpa_processor);
     let (anchor_tx, anchor_rx) = tokio::sync::watch::channel(None);
     let (mut slot_syncronizer_handle, slot_syncronizer_data) =
         match slot_syncronizer::start_slot_syncronizer(
@@ -95,6 +107,7 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
             &config,
             anchor_tx,
             mint_cache.clone(),
+            gpa_feed.clone(),
         ) {
             Some((handle, data)) => (future::Either::Left(handle), Some(data)),
             None => (future::Either::Right(future::pending()), None),
@@ -111,9 +124,6 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
     let gpa_stream_batch_size = config.server.gpa_stream_batch_size;
     let request_timeout = config.server.request_timeout;
     let max_multiple_accounts = config.server.max_multiple_accounts;
-
-    // Setup optional module cache
-    let gpa_processor = GpaProcessor::new(config.gpa_cache.clone());
 
     let simulation_supported = indexer_filter.supports_simulation();
     info!("simulateTransaction: supported: {}", simulation_supported);
@@ -192,13 +202,20 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
     let processed =
         ProcessedAccounts::from_config(config.processed_accounts.as_ref(), indexer_filter.clone());
     let mut grpc_feed_handle =
-        match grpc_feed::spawn(config.grpc.as_ref(), &processed, &mint_cache, anchor_rx) {
+        match grpc_feed::spawn(
+            config.grpc.as_ref(),
+            &processed,
+            &mint_cache,
+            &gpa_feed,
+            anchor_rx,
+        ) {
             Some(handle) => future::Either::Left(handle),
             None => future::Either::Right(future::pending()),
         };
     info!("processed accounts: enabled: {}", processed.is_enabled());
     mint_cache.api().spawn_loader(database.clone());
     info!("mint cache: enabled: {}", mint_cache.is_enabled());
+    info!("gpa cache grpc feed: enabled: {}", gpa_feed.is_enabled());
 
     let state = CloudbreakRpcState::new(
         database,
