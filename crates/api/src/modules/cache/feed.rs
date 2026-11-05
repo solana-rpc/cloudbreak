@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use cloudbreak_core::modules::rpc_filter_type::RpcFilterType;
@@ -279,7 +279,12 @@ impl GpaFeed {
 
         // A finalized slot reported before its confirmed slot catches up here.
         let finalized = (state.finalized > 0).then(|| state.finalized.min(slot));
-        inner.update(&state, Some(slot), finalized);
+        let mut phases = Phases {
+            ring: started.elapsed(),
+            ..Default::default()
+        };
+        inner.update(&state, Some(slot), finalized, &mut phases);
+        phases.observe(Group::Confirmed);
         observe_update(Group::Confirmed, started);
     }
 
@@ -298,7 +303,12 @@ impl GpaFeed {
         let Some(confirmed) = state.confirmed.as_ref().map(|c| c.slot) else {
             return;
         };
-        inner.update(&state, None, Some(slot.min(confirmed)));
+        let mut phases = Phases {
+            ring: started.elapsed(),
+            ..Default::default()
+        };
+        inner.update(&state, None, Some(slot.min(confirmed)), &mut phases);
+        phases.observe(Group::Finalized);
         observe_update(Group::Finalized, started);
     }
 }
@@ -363,11 +373,18 @@ impl Inner {
 
     /// Brings every fed query of each group to its target slot, in three steps: collect under
     /// the read lock, encode without a lock, swap under the write lock.
-    fn update(&self, state: &FeedState, confirmed: Option<u64>, finalized: Option<u64>) {
+    fn update(
+        &self,
+        state: &FeedState,
+        confirmed: Option<u64>,
+        finalized: Option<u64>,
+        phases: &mut Phases,
+    ) {
         let target_of = |query: &NormalizedQuery| match Group::of(query.commitment) {
             Group::Confirmed => confirmed,
             Group::Finalized => finalized,
         };
+        let mut lap = Instant::now();
         let due: Vec<(NormalizedQuery, CachedQuery, u64)> = {
             let cache = self.cache_read();
             cache
@@ -382,6 +399,7 @@ impl Inner {
                 })
                 .collect()
         };
+        phases.collect = lap.elapsed();
 
         let mut results = Vec::with_capacity(due.len());
         for (query, cached, target) in due {
@@ -390,7 +408,7 @@ impl Inner {
                 count_query_update(group, "too_old");
                 continue;
             }
-            let advanced = advance(&query, &cached, target, &state.ring);
+            let advanced = advance(&query, &cached, target, &state.ring, phases);
             count_query_update(
                 group,
                 if advanced.is_some() {
@@ -402,6 +420,7 @@ impl Inner {
             results.push((query, cached, advanced));
         }
 
+        lap = Instant::now();
         let mut freed = Vec::new();
         let mut cache = self.cache_write();
         for (query, old, advanced) in results {
@@ -420,7 +439,10 @@ impl Inner {
         cache.feed_status = Some(state.status(&self.owners));
         cache.update_size_metrics();
         drop(cache);
+        phases.swap = lap.elapsed();
+        lap = Instant::now();
         drop(freed);
+        phases.free = lap.elapsed();
     }
 
     /// Removes every fed query, so the next request rebuilds it from Postgres.
@@ -458,7 +480,10 @@ fn advance(
     cached: &CachedQuery,
     target: u64,
     ring: &VecDeque<(u64, Arc<BlockDelta>)>,
+    phases: &mut Phases,
 ) -> Option<CachedQuery> {
+    let merge_started = Instant::now();
+    let mut encoding = Duration::ZERO;
     // The latest change per pubkey. A `gone` pubkey matters only if the query holds it.
     let mut changes: HashMap<Pubkey, Option<&LiveWrite>> = HashMap::new();
     for (_, delta) in ring
@@ -487,7 +512,9 @@ fn advance(
     for (pubkey, change) in changes {
         match change {
             Some(write) if write.owner == query.program && filters.matches(&write.data) => {
+                let lap = Instant::now();
                 let bytes = encode(&pubkey, write, query.encoding, query.data_slice)?;
+                encoding += lap.elapsed();
                 accounts.insert(pubkey, bytes);
                 encoded += 1;
             }
@@ -496,10 +523,16 @@ fn advance(
             }
         }
     }
+    phases.encode += encoding;
+    phases.merge += merge_started.elapsed() - encoding;
+    phases.encoded += encoded;
+    let sort_started = Instant::now();
     let mut sorted: Vec<(Pubkey, Bytes)> = accounts.iter().map(|(k, v)| (*k, v.clone())).collect();
     sorted.sort_unstable_by_key(|(pubkey, _)| *pubkey);
+    let size = sorted.iter().map(|(_, bytes)| bytes.len() as u64).sum();
+    phases.sort += sort_started.elapsed();
     Some(CachedQuery {
-        size: sorted.iter().map(|(_, bytes)| bytes.len() as u64).sum(),
+        size,
         cache_hits: (accounts.len() as u64).saturating_sub(encoded),
         accounts: Arc::new(accounts),
         slot: target,
@@ -602,6 +635,46 @@ fn count_query_update(group: &str, result: &str) {
     metrics::CLOUDBREAK_GPA_CACHE_FEED_QUERY_UPDATES_TOTAL
         .with_label_values(&[group, result])
         .inc();
+}
+
+/// Where one update spends its time; `merge` excludes `encode`.
+#[derive(Default)]
+struct Phases {
+    ring: Duration,
+    collect: Duration,
+    merge: Duration,
+    encode: Duration,
+    sort: Duration,
+    swap: Duration,
+    free: Duration,
+    encoded: u64,
+}
+
+impl Phases {
+    fn observe(&self, group: Group) {
+        let group = group.label();
+        for (phase, took) in [
+            ("ring", self.ring),
+            ("collect", self.collect),
+            ("merge", self.merge),
+            ("encode", self.encode),
+            ("sort", self.sort),
+            ("swap", self.swap),
+            ("free", self.free),
+        ] {
+            observe_phase(group, phase, took);
+        }
+        metrics::CLOUDBREAK_GPA_CACHE_FEED_ENCODED_ACCOUNTS_TOTAL
+            .with_label_values(&[group])
+            .inc_by(self.encoded);
+    }
+}
+
+/// Also used by the slot syncronizer for the whole wait it adds before publishing a slot.
+pub fn observe_phase(commitment: &str, phase: &str, took: Duration) {
+    metrics::CLOUDBREAK_GPA_CACHE_FEED_UPDATE_PHASE_DURATION_US
+        .with_label_values(&[commitment, phase])
+        .observe(took.as_secs_f64() * 1_000_000.0);
 }
 
 fn observe_update(group: Group, started: Instant) {

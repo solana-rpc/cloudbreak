@@ -143,6 +143,12 @@ async fn run(
         // The fed gPA queries must hold a slot before a request can pick that slot.
         if gpa_feed.is_enabled() && slot_advance(&data, &row) {
             let (feed, row) = (gpa_feed.clone(), row.clone());
+            let commitment = if row.commitment == COMMITMENT_CONFIRMED {
+                "confirmed"
+            } else {
+                "finalized"
+            };
+            let started = std::time::Instant::now();
             tokio::task::spawn_blocking(move || match row.commitment {
                 COMMITMENT_CONFIRMED => {
                     feed.on_confirmed(row.slot as u64, row.blockhash.as_deref(), row.health)
@@ -151,6 +157,7 @@ async fn run(
             })
             .await
             .expect("slot syncronizer: gpa cache feed update panicked");
+            crate::modules::cache::feed::observe_phase(commitment, "gate", started.elapsed());
         }
         apply(&data, anchor_tx.as_ref(), &row);
     }

@@ -227,6 +227,30 @@ lazy_static::lazy_static! {
     )
     .unwrap();
 
+    /// Phases of one feed update, by commitment; `gate` is the whole wait the slot syncronizer adds.
+    pub static ref CLOUDBREAK_GPA_CACHE_FEED_UPDATE_PHASE_DURATION_US: HistogramVec = HistogramVec::new(
+        HistogramOpts::new(
+            "cloudbreak_gpa_cache_feed_update_phase_duration_us",
+            "Time per phase of one gRPC-fed gPA cache update, in microseconds, by commitment and phase"
+        )
+        .buckets(vec![
+            1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0,
+            10_000.0, 25_000.0, 50_000.0, 100_000.0,
+        ]),
+        &["commitment", "phase"],
+    )
+    .unwrap();
+
+    /// Accounts the gRPC feed updates re-encoded, by commitment.
+    pub static ref CLOUDBREAK_GPA_CACHE_FEED_ENCODED_ACCOUNTS_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new(
+            "cloudbreak_gpa_cache_feed_encoded_accounts_total",
+            "Accounts re-encoded by the gRPC-fed gPA cache updates, by commitment"
+        ),
+        &["commitment"],
+    )
+    .unwrap();
+
     /// Per-query results of the gRPC feed updates: `updated`, `too_old` (the ring does not reach the query slot), `dropped` (encoding failed).
     pub static ref CLOUDBREAK_GPA_CACHE_FEED_QUERY_UPDATES_TOTAL: IntCounterVec = IntCounterVec::new(
         Opts::new(
@@ -372,6 +396,8 @@ pub fn setup_metrics(config: &ApiConfig) -> anyhow::Result<()> {
         register!(CLOUDBREAK_GPA_CACHE_FINALIZE_SKIPPED_TOTAL);
         register!(CLOUDBREAK_GPA_CACHE_SKIPPED_TOTAL);
         register!(CLOUDBREAK_GPA_CACHE_FEED_UPDATE_DURATION_US);
+        register!(CLOUDBREAK_GPA_CACHE_FEED_UPDATE_PHASE_DURATION_US);
+        register!(CLOUDBREAK_GPA_CACHE_FEED_ENCODED_ACCOUNTS_TOTAL);
         register!(CLOUDBREAK_GPA_CACHE_FEED_QUERY_UPDATES_TOTAL);
         register!(CLOUDBREAK_GPA_CACHE_FEED_REQUESTS_TOTAL);
         register!(CLOUDBREAK_GPA_CACHE_FEED_RESETS_TOTAL);
