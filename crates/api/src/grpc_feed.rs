@@ -67,10 +67,7 @@ pub fn spawn(
                         *last = (*last).max(block.slot);
                     }
                     mint_cache.api().on_block(&block);
-                    if gpa_feed.on_block(&block) {
-                        let gpa_feed = gpa_feed.clone();
-                        drop(tokio::task::spawn_blocking(move || gpa_feed.on_late_block()));
-                    }
+                    gpa_feed.on_block(&block);
                     writer.on_block(block);
                 }
                 changed = anchor_rx.changed(), if anchor_open => {

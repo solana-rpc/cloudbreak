@@ -12,7 +12,7 @@ use cloudbreak_core::metrics::{
 };
 use hyper::StatusCode;
 use prometheus::{
-    Histogram, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
+    HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
 };
 use sea_orm::DatabaseConnection;
 use std::{
@@ -241,29 +241,6 @@ lazy_static::lazy_static! {
     )
     .unwrap();
 
-    /// Confirmed slots published before the gRPC feed delivered their block: `waiting`, then `applied` when it arrives.
-    pub static ref CLOUDBREAK_GPA_CACHE_FEED_LATE_BLOCKS_TOTAL: IntCounterVec = IntCounterVec::new(
-        Opts::new(
-            "cloudbreak_gpa_cache_feed_late_blocks_total",
-            "Confirmed slots published before the gRPC-fed gPA cache had their block, by result"
-        ),
-        &["result"],
-    )
-    .unwrap();
-
-    /// Time from publishing a late confirmed slot to applying its block, in microseconds.
-    pub static ref CLOUDBREAK_GPA_CACHE_FEED_LATE_BLOCK_WAIT_US: Histogram = Histogram::with_opts(
-        HistogramOpts::new(
-            "cloudbreak_gpa_cache_feed_late_block_wait_us",
-            "Time from publishing a confirmed slot to the gRPC-fed gPA cache applying its late block, in microseconds"
-        )
-        .buckets(vec![
-            100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0, 25_000.0, 50_000.0,
-            100_000.0, 250_000.0, 500_000.0, 1_000_000.0,
-        ]),
-    )
-    .unwrap();
-
     /// Accounts the gRPC feed updates re-encoded, by commitment.
     pub static ref CLOUDBREAK_GPA_CACHE_FEED_ENCODED_ACCOUNTS_TOTAL: IntCounterVec = IntCounterVec::new(
         Opts::new(
@@ -421,8 +398,6 @@ pub fn setup_metrics(config: &ApiConfig) -> anyhow::Result<()> {
         register!(CLOUDBREAK_GPA_CACHE_FEED_UPDATE_DURATION_US);
         register!(CLOUDBREAK_GPA_CACHE_FEED_UPDATE_PHASE_DURATION_US);
         register!(CLOUDBREAK_GPA_CACHE_FEED_ENCODED_ACCOUNTS_TOTAL);
-        register!(CLOUDBREAK_GPA_CACHE_FEED_LATE_BLOCKS_TOTAL);
-        register!(CLOUDBREAK_GPA_CACHE_FEED_LATE_BLOCK_WAIT_US);
         register!(CLOUDBREAK_GPA_CACHE_FEED_QUERY_UPDATES_TOTAL);
         register!(CLOUDBREAK_GPA_CACHE_FEED_REQUESTS_TOTAL);
         register!(CLOUDBREAK_GPA_CACHE_FEED_RESETS_TOTAL);

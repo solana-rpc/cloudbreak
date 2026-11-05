@@ -363,21 +363,11 @@ impl GpaProcessor {
             return None;
         }
         let (_, cached) = cache.get_cached_query(program, config);
-        // While the published confirmed slot waits for its block, the queries serve one block behind.
-        let floor = match &cache.feed_status {
-            Some(feed::FeedStatus {
-                late_slot: Some(late),
-                confirmed_slot,
-                ..
-            }) if latest_slot <= *late => latest_slot.min(*confirmed_slot),
-            _ => latest_slot,
-        };
-        let floor = floor.max(config.account_config.min_context_slot.unwrap_or(0));
         drop(cache);
         let (result, fed) = match cached {
             None => ("not_cached", None),
             Some(CachedQuery { sorted: None, .. }) => ("not_fed", None),
-            Some(c) if c.slot < floor => ("behind", None),
+            Some(c) if c.slot < latest_slot => ("behind", None),
             Some(CachedQuery {
                 slot,
                 sorted: Some(sorted),
