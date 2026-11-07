@@ -14,7 +14,7 @@ use cloudbreak_core::{ApiConfig, EnvironmentInfo, TryLoadConfig};
 use crate::{
     http::{CloudbreakRpcState, HeaderKeys},
     metrics::setup_metrics,
-    modules::{cache::GpaProcessor, supply_cache, vote_accounts_cache},
+    modules::{big_mint_scans::BigMintScans, cache::GpaProcessor, supply_cache, vote_accounts_cache},
     query_tracker_client::QueryTrackerClient,
 };
 use std::sync::RwLock;
@@ -199,6 +199,8 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
     info!("processed accounts: enabled: {}", processed.is_enabled());
     mint_cache.api().spawn_loader(database.clone());
     info!("mint cache: enabled: {}", mint_cache.is_enabled());
+    let big_mint_scans = BigMintScans::from_config(config.big_mint_scans.as_ref());
+    info!("big mint scans: enabled: {}", big_mint_scans.is_enabled());
 
     let state = CloudbreakRpcState::new(
         database,
@@ -223,6 +225,7 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
         token_largest_accounts,
         processed,
         mint_cache,
+        big_mint_scans,
     );
 
     info!("Server is starting...");

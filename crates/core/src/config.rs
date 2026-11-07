@@ -782,6 +782,35 @@ pub struct ApiConfig {
     /// and the indexer's `[mint-cache]`.
     #[serde(rename = "mint-cache", default)]
     pub mint_cache: Option<MintCacheConfig>,
+    /// Bounds how many full scans of the listed big mints run at once. See
+    /// `modules::big_mint_scans` in the API.
+    #[serde(rename = "big-mint-scans", default)]
+    pub big_mint_scans: Option<BigMintScansConfig>,
+}
+
+/// The `[big-mint-scans]` API section. A token gPA on one of `mints` without a 32-byte owner or
+/// delegate filter waits for one of `max-concurrent` slots, then runs with the planner settings.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct BigMintScansConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub mints: Vec<PubkeyDef>,
+    #[serde(rename = "max-concurrent", default = "BigMintScansConfig::default_max_concurrent")]
+    pub max_concurrent: usize,
+    /// `max_parallel_workers_per_gather` for these scans; the server setting when unset.
+    #[serde(rename = "max-parallel-workers", default)]
+    pub max_parallel_workers: Option<u32>,
+    /// Turns plain index scans off for these scans, so the planner uses a bitmap heap scan.
+    #[serde(rename = "bitmap-scan", default)]
+    pub bitmap_scan: bool,
+}
+
+impl BigMintScansConfig {
+    const fn default_max_concurrent() -> usize {
+        2
+    }
 }
 
 /// The Yellowstone gRPC endpoint of the API feed. See `modules::grpc`. The connection knobs

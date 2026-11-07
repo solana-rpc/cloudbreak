@@ -4,6 +4,7 @@
  */
 
 pub mod bandwidth;
+pub mod big_mint_scans;
 pub mod cache;
 pub mod mint_resolver;
 pub mod supply_cache;

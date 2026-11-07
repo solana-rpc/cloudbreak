@@ -7,6 +7,7 @@ use crate::error::RpcError;
 use crate::http::server::HttpHandlerResponse;
 use crate::http::server::ResponseBody;
 use crate::modules::bandwidth;
+use crate::modules::big_mint_scans::BigMintScans;
 use crate::modules::cache::GpaProcessor;
 use crate::modules::supply_cache::SharedSupplySnapshot;
 use crate::modules::vote_accounts_cache::SharedStakesSnapshot;
@@ -128,6 +129,8 @@ pub struct CloudbreakRpcState {
     pub processed: ProcessedAccounts,
     /// The `[mint-cache]` handle. The disabled handle sends every mint lookup to Postgres.
     pub mint_cache: MintCache,
+    /// The `[big-mint-scans]` handle. The disabled handle lets every scan run at once.
+    pub big_mint_scans: BigMintScans,
 }
 
 impl CloudbreakRpcState {
@@ -155,6 +158,7 @@ impl CloudbreakRpcState {
         token_largest_accounts: MethodSection,
         processed: ProcessedAccounts,
         mint_cache: MintCache,
+        big_mint_scans: BigMintScans,
     ) -> Self {
         Self {
             database,
@@ -180,6 +184,7 @@ impl CloudbreakRpcState {
             token_largest_accounts,
             processed,
             mint_cache,
+            big_mint_scans,
         }
     }
 

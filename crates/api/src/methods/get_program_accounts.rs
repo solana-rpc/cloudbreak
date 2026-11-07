@@ -22,8 +22,8 @@ use cloudbreak_core::modules::rpc_filter_type::{
 };
 use futures::{Stream, StreamExt};
 use rust_decimal::prelude::ToPrimitive;
-use sea_orm::sqlx::Row;
-use sea_orm::sqlx::postgres::PgRow;
+use sea_orm::sqlx::postgres::{PgPool, PgRow};
+use sea_orm::sqlx::{self, Postgres, Row, Transaction};
 use solana_account_decoder::parse_account_data::AccountAdditionalDataV3;
 use solana_account_decoder::{UiAccountEncoding, UiDataSliceConfig, encode_ui_account};
 use solana_commitment_config::CommitmentLevel;
@@ -101,6 +101,9 @@ pub async fn get_program_accounts(
         .then_some(latest_slot);
 
     let sql_filters = SqlFilters::build(&program, config.filters.as_deref().unwrap_or(&[]), label)?;
+    let big_mint_scan = state
+        .big_mint_scans
+        .is_big_scan(&program, config.filters.as_deref().unwrap_or(&[]));
     let metrics_data = GpaMetricsData::new(sql_filters.label.clone());
 
     let mut request_processor = state
@@ -116,6 +119,7 @@ pub async fn get_program_accounts(
             latest_slot,
             sql_filters,
             metrics_data: metrics_data.clone(),
+            big_mint_scan,
         },
         &mut request_processor,
     );
@@ -146,6 +150,8 @@ pub struct GpaDbQueryInput {
     pub latest_slot: u64,
     pub sql_filters: SqlFilters,
     pub metrics_data: GpaMetricsData,
+    /// A full scan of a `[big-mint-scans]` mint: it waits for a slot and runs with its settings.
+    pub big_mint_scan: bool,
 }
 
 fn gpa_db_query(
@@ -182,7 +188,33 @@ fn gpa_db_query(
             );
             let mut first_loop_iteration = true;
 
-            let mut rows = gpa_sql.query().fetch(&pool);
+            // A big-mint scan holds a slot for its whole DB phase, waiting inside the query timeout.
+            let big_mint_scans = &input.state.big_mint_scans;
+            let _slot = if input.big_mint_scan {
+                let _waiting = metrics::InFlightRequestGuard::new("big_mint_scan_waiting");
+                big_mint_scans.acquire().await
+            } else {
+                None
+            };
+            let _running = input
+                .big_mint_scan
+                .then(|| metrics::InFlightRequestGuard::new("big_mint_scan_running"));
+            let mut transaction = None;
+            if input.big_mint_scan {
+                match begin_with_settings(&pool, big_mint_scans.planner_settings()).await {
+                    Ok(begun) => transaction = Some(begun),
+                    Err(e) => {
+                        tracing::error!("Database query error: {}", e);
+                        let _ = tx.send(Err(RpcError::InternalError));
+                        return;
+                    }
+                }
+            }
+
+            let mut rows = match transaction.as_mut() {
+                Some(transaction) => gpa_sql.query().fetch(&mut **transaction),
+                None => gpa_sql.query().fetch(&pool),
+            };
             let mut batch: Vec<PgRow> = Vec::with_capacity(gpa_stream_batch_size.unwrap_or(0));
 
             loop {
@@ -284,6 +316,22 @@ fn gpa_db_query(
     tokio::task::spawn_blocking(move || runtime.block_on(fetch));
 
     rx
+}
+
+/// Opens a transaction and applies `settings` to it only (`set_config(.., true)` = `SET LOCAL`).
+async fn begin_with_settings(
+    pool: &PgPool,
+    settings: Vec<(&'static str, String)>,
+) -> Result<Transaction<'static, Postgres>, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    for (name, value) in settings {
+        sqlx::query("SELECT set_config($1, $2, true)")
+            .bind(name)
+            .bind(value)
+            .execute(&mut *transaction)
+            .await?;
+    }
+    Ok(transaction)
 }
 
 pub struct GpaEncodingInput {
