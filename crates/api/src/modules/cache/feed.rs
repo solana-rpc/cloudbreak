@@ -8,6 +8,7 @@
 //! publishes the slot. See the "GPA cache gRPC feed" section of the README.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
@@ -30,6 +31,8 @@ const MAX_BUFFERED_BLOCKS: usize = 1_024;
 /// Confirmed blocks kept to catch up a query Postgres installed at an older slot (> 45 s of slots).
 const MAX_RING_BLOCKS: usize = 512;
 const MAX_RING_BYTES: usize = 512 * 1024 * 1024;
+/// Confirmed slots that may wait for their gRPC blocks (~13 s) before the feed resets.
+const MAX_PENDING_SLOTS: usize = 32;
 
 /// One account write by a fed owner.
 #[derive(Debug)]
@@ -86,12 +89,38 @@ struct BufferedBlock {
     parent_slot: u64,
     parent_blockhash: String,
     delta: Arc<BlockDelta>,
+    received: Instant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Cursor {
     slot: u64,
     blockhash: String,
+}
+
+/// A confirmed slot Postgres reported above the applied cursor.
+struct Pending {
+    cursor: Cursor,
+    since: Instant,
+    /// Its blocks had not all arrived when Postgres reported it.
+    waited: bool,
+}
+
+/// One block of a chain from the applied cursor to a confirmed slot.
+struct ChainBlock {
+    slot: u64,
+    delta: Arc<BlockDelta>,
+    received: Instant,
+}
+
+/// The buffered blocks between the applied cursor and a confirmed slot.
+enum Link {
+    /// Every block, oldest first.
+    Chain(Vec<ChainBlock>),
+    /// A block on the way has not arrived.
+    Missing,
+    /// The blocks do not link to the applied cursor.
+    Broken,
 }
 
 /// Which published slot a query follows: `Finalized`, or the confirmed slot for the others.
@@ -121,6 +150,8 @@ impl Group {
 struct FeedState {
     /// The confirmed block the ring ends at. `None` until the first confirmed slot.
     confirmed: Option<Cursor>,
+    /// Confirmed slots above `confirmed` whose gRPC blocks have not all arrived, oldest first.
+    pending: VecDeque<Pending>,
     /// The latest finalized slot reported.
     finalized: u64,
     /// Every confirmed block above `ring_base`, oldest first.
@@ -139,10 +170,22 @@ impl FeedState {
         self.ring_bytes = 0;
     }
 
-    fn push_ring(&mut self, chain: Vec<(u64, Arc<BlockDelta>)>) {
-        for (slot, delta) in chain {
-            self.ring_bytes += delta.bytes;
-            self.ring.push_back((slot, delta));
+    fn applied_slot(&self) -> Option<u64> {
+        self.confirmed.as_ref().map(|c| c.slot)
+    }
+
+    /// The newest confirmed slot reported, applied or pending.
+    fn newest_slot(&self) -> Option<u64> {
+        self.pending
+            .back()
+            .map(|p| p.cursor.slot)
+            .or(self.applied_slot())
+    }
+
+    fn push_ring(&mut self, chain: Vec<ChainBlock>) {
+        for block in chain {
+            self.ring_bytes += block.delta.bytes;
+            self.ring.push_back((block.slot, block.delta));
         }
         while self.ring.len() > MAX_RING_BLOCKS || self.ring_bytes > MAX_RING_BYTES {
             let Some((slot, delta)) = self.ring.pop_front() else {
@@ -162,6 +205,7 @@ impl FeedState {
         FeedStatus {
             owners,
             confirmed_slot: self.confirmed.as_ref().map_or(0, |c| c.slot),
+            pending_slots: self.pending.iter().map(|p| p.cursor.slot).collect(),
             finalized_slot: self.finalized,
             ring_base: self.ring_base,
             ring_blocks: self.ring.len(),
@@ -174,7 +218,10 @@ impl FeedState {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct FeedStatus {
     pub owners: Vec<String>,
+    /// The slot the fed queries are applied to.
     pub confirmed_slot: u64,
+    /// Confirmed slots published while their gRPC blocks are missing; queries serve `confirmed_slot`.
+    pub pending_slots: Vec<u64>,
     pub finalized_slot: u64,
     /// Queries at this slot or newer can catch up from the ring.
     pub ring_base: u64,
@@ -186,8 +233,10 @@ struct Inner {
     owners: HashSet<Pubkey>,
     cache: Arc<RwLock<GpaCache>>,
     buffer: Mutex<BTreeMap<u64, Vec<BufferedBlock>>>,
-    /// Only the slot syncronizer task takes it, so an update never waits on another.
+    /// Taken by the slot syncronizer and by `on_pending_block`.
     state: Mutex<FeedState>,
+    /// The newest pending slot, or 0; read by the feed thread without the state lock.
+    pending_up_to: AtomicU64,
 }
 
 /// Cheap-clone handle. The default is disabled.
@@ -212,6 +261,7 @@ impl GpaFeed {
             cache: cache.clone(),
             buffer: Mutex::new(BTreeMap::new()),
             state: Mutex::new(FeedState::default()),
+            pending_up_to: AtomicU64::new(0),
         })))
     }
 
@@ -220,15 +270,17 @@ impl GpaFeed {
     }
 
     /// Feed thread: keeps the block's changes for the fed owners until its slot is confirmed.
-    pub fn on_block(&self, block: &SubscribeUpdateBlock) {
+    /// True when a pending confirmed slot may now apply: then call `on_pending_block` off this thread.
+    pub fn on_block(&self, block: &SubscribeUpdateBlock) -> bool {
         let Some(inner) = &self.0 else {
-            return;
+            return false;
         };
         let buffered = BufferedBlock {
             blockhash: block.blockhash.clone(),
             parent_slot: block.parent_slot,
             parent_blockhash: block.parent_blockhash.clone(),
             delta: Arc::new(BlockDelta::from_block(block, &inner.owners)),
+            received: Instant::now(),
         };
         let mut buffer = inner.buffer();
         let slot_blocks = buffer.entry(block.slot).or_default();
@@ -238,10 +290,13 @@ impl GpaFeed {
             buffer.pop_first();
         }
         set_buffer_gauge(buffer.len());
+        drop(buffer);
+        block.slot <= inner.pending_up_to.load(Ordering::SeqCst)
     }
 
     /// Slot syncronizer, before it publishes a confirmed slot: applies the chain of buffered
-    /// blocks up to it and brings the fed queries to it. A missing block resets the ring.
+    /// blocks up to it and brings the fed queries to it. When a block is still missing, the slot
+    /// waits in `pending` and the queries keep serving their slot until `on_pending_block`.
     pub fn on_confirmed(&self, slot: u64, blockhash: Option<&str>, healthy: bool) {
         let Some(inner) = &self.0 else {
             return;
@@ -261,31 +316,45 @@ impl GpaFeed {
             slot,
             blockhash: blockhash.unwrap_or_default().to_string(),
         };
-        match state.confirmed.clone() {
-            Some(applied) if slot <= applied.slot => return,
-            Some(applied) => match inner.chain(&confirmed, &applied) {
-                Some(chain) => state.push_ring(chain),
-                None => {
-                    tracing::warn!(target: "gpa_cache", slot, applied = applied.slot, "gpa feed buffer misses a block; resetting the ring");
-                    count_reset("block_missing");
-                    state.reset_ring(slot);
-                    inner.unfeed_queries();
+        match state.newest_slot() {
+            None => {
+                state.reset_ring(slot);
+                state.confirmed = Some(confirmed);
+            }
+            Some(newest) if slot <= newest => return,
+            Some(_) => {
+                state.pending.push_back(Pending {
+                    cursor: confirmed,
+                    since: started,
+                    waited: false,
+                });
+                // Published before the buffer is read, so a block landing meanwhile triggers `on_pending_block`.
+                inner.sync_pending(&state);
+                inner.advance(&mut state);
+                if state.pending.back().is_some_and(|p| p.cursor.slot == slot) {
+                    inner.pg_first(&mut state);
                 }
-            },
-            None => state.reset_ring(slot),
+            }
         }
-        state.confirmed = Some(confirmed);
-        inner.prune_buffer(slot);
+        inner.catch_up(&state, started);
+    }
 
-        // A finalized slot reported before its confirmed slot catches up here.
-        let finalized = (state.finalized > 0).then(|| state.finalized.min(slot));
-        let mut phases = Phases {
-            ring: started.elapsed(),
-            ..Default::default()
+    /// Blocking pool, after `on_block` returned true: applies the pending confirmed slots whose
+    /// blocks have arrived and brings the fed queries to them.
+    pub fn on_pending_block(&self) {
+        let Some(inner) = &self.0 else {
+            return;
         };
-        inner.update(&state, Some(slot), finalized, &mut phases);
-        phases.observe(Group::Confirmed);
-        observe_update(Group::Confirmed, started);
+        let started = Instant::now();
+        let mut state = inner.state();
+        if state.pending.is_empty() {
+            return;
+        }
+        let applied = state.applied_slot();
+        inner.advance(&mut state);
+        if state.applied_slot() != applied {
+            inner.catch_up(&state, started);
+        }
     }
 
     /// Slot syncronizer, before it publishes a finalized slot: brings the `finalized` queries to
@@ -330,34 +399,127 @@ impl Inner {
         self.cache.write().expect("gpa cache rwlock poisoned")
     }
 
-    /// The buffered blocks from `confirmed` back to `applied` along the parent links, oldest
-    /// first. `None` when a block is missing or the chain does not reach `applied`.
-    fn chain(&self, confirmed: &Cursor, applied: &Cursor) -> Option<Vec<(u64, Arc<BlockDelta>)>> {
+    /// The buffered blocks from `confirmed` back to `applied` along the parent links.
+    fn chain(&self, confirmed: &Cursor, applied: &Cursor) -> Link {
         let buffer = self.buffer();
         let mut chain = Vec::new();
         let (mut slot, mut blockhash) = (confirmed.slot, confirmed.blockhash.as_str());
         loop {
-            let block = buffer
-                .get(&slot)?
-                .iter()
-                .find(|b| blockhash.is_empty() || b.blockhash == blockhash)?;
-            chain.push((slot, block.delta.clone()));
+            let Some(block) = buffer.get(&slot).and_then(|blocks| {
+                blocks
+                    .iter()
+                    .find(|b| blockhash.is_empty() || b.blockhash == blockhash)
+            }) else {
+                return Link::Missing;
+            };
+            chain.push(ChainBlock {
+                slot,
+                delta: block.delta.clone(),
+                received: block.received,
+            });
             if block.parent_slot == applied.slot {
                 let linked = applied.blockhash.is_empty()
                     || block.parent_blockhash.is_empty()
                     || block.parent_blockhash == applied.blockhash;
                 if !linked {
-                    return None;
+                    return Link::Broken;
                 }
                 break;
             }
             if block.parent_slot < applied.slot {
-                return None;
+                return Link::Broken;
             }
             (slot, blockhash) = (block.parent_slot, block.parent_blockhash.as_str());
         }
         chain.reverse();
-        Some(chain)
+        Link::Chain(chain)
+    }
+
+    /// Applies the newest pending slot whose blocks have all arrived, and every pending slot
+    /// below it. A pending slot whose blocks do not link to the cursor resets the feed.
+    fn advance(&self, state: &mut FeedState) {
+        let Some(applied) = state.confirmed.clone() else {
+            return;
+        };
+        for i in (0..state.pending.len()).rev() {
+            match self.chain(&state.pending[i].cursor, &applied) {
+                Link::Missing => continue,
+                Link::Broken => return self.reset(state, "chain_broken"),
+                Link::Chain(chain) => {
+                    let target = state.pending[i].cursor.clone();
+                    for pending in state.pending.drain(..=i) {
+                        if let Some(block) = chain.iter().find(|b| b.slot == pending.cursor.slot) {
+                            observe_gap(&pending, block.received);
+                        }
+                        if pending.waited {
+                            tracing::info!(target: "gpa_cache", slot = pending.cursor.slot, waited_ms = pending.since.elapsed().as_millis() as u64, "gpa feed applied a slot postgres confirmed first");
+                        }
+                    }
+                    state.push_ring(chain);
+                    state.confirmed = Some(target);
+                    self.sync_pending(state);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Postgres confirmed the newest pending slot before the gRPC feed delivered its blocks.
+    fn pg_first(&self, state: &mut FeedState) {
+        let depth = state.pending.len();
+        let applied = state.applied_slot().unwrap_or_default();
+        let Some(newest) = state.pending.back_mut() else {
+            return;
+        };
+        newest.waited = true;
+        let slot = newest.cursor.slot;
+        metrics::CLOUDBREAK_GPA_CACHE_FEED_PG_FIRST_TOTAL.inc();
+        metrics::CLOUDBREAK_GPA_CACHE_FEED_PG_FIRST_DEPTH.observe(depth as f64);
+        tracing::warn!(target: "gpa_cache", slot, applied, depth, slots_behind = slot - applied, "postgres confirmed a slot before the api grpc feed delivered its block");
+        if depth > MAX_PENDING_SLOTS {
+            self.reset(state, "grpc_late");
+        }
+    }
+
+    /// Starts a new ring at the newest confirmed slot: the fed queries go back to Postgres until
+    /// they catch up from it.
+    fn reset(&self, state: &mut FeedState, reason: &str) {
+        let Some(newest) = state.pending.pop_back() else {
+            return;
+        };
+        tracing::warn!(target: "gpa_cache", slot = newest.cursor.slot, applied = state.applied_slot().unwrap_or_default(), pending = state.pending.len() + 1, reason, "gpa feed resets the ring");
+        count_reset(reason);
+        state.pending.clear();
+        state.reset_ring(newest.cursor.slot);
+        state.confirmed = Some(newest.cursor);
+        self.unfeed_queries();
+        self.sync_pending(state);
+    }
+
+    fn sync_pending(&self, state: &FeedState) {
+        let newest = state.pending.back().map_or(0, |p| p.cursor.slot);
+        self.pending_up_to.store(newest, Ordering::SeqCst);
+        metrics::CLOUDBREAK_GPA_CACHE_FEED_BLOCKS
+            .with_label_values(&["pending"])
+            .set(state.pending.len() as i64);
+    }
+
+    /// Drops the buffer below the cursor and brings the fed queries to it; `finalized` ones to
+    /// the finalized slot when it is below.
+    fn catch_up(&self, state: &FeedState, started: Instant) {
+        let Some(applied) = state.applied_slot() else {
+            return;
+        };
+        self.prune_buffer(applied);
+        // A finalized slot reported before its confirmed slot catches up here.
+        let finalized = (state.finalized > 0).then(|| state.finalized.min(applied));
+        let mut phases = Phases {
+            ring: started.elapsed(),
+            ..Default::default()
+        };
+        self.update(state, Some(applied), finalized, &mut phases);
+        phases.observe(Group::Confirmed);
+        observe_update(Group::Confirmed, started);
     }
 
     /// Drops every buffered block at or below `slot`, skipped blocks included.
@@ -631,6 +793,18 @@ fn count_reset(reason: &str) {
         .inc();
 }
 
+/// The time between a confirmed slot's gRPC block and its Postgres confirmation.
+fn observe_gap(pending: &Pending, received: Instant) {
+    let (first, gap) = if pending.waited {
+        ("pg", received.saturating_duration_since(pending.since))
+    } else {
+        ("grpc", pending.since.saturating_duration_since(received))
+    };
+    metrics::CLOUDBREAK_GPA_CACHE_FEED_GRPC_PG_GAP_US
+        .with_label_values(&[first])
+        .observe(gap.as_secs_f64() * 1_000_000.0);
+}
+
 fn count_query_update(group: &str, result: &str) {
     metrics::CLOUDBREAK_GPA_CACHE_FEED_QUERY_UPDATES_TOTAL
         .with_label_values(&[group, result])
@@ -687,7 +861,7 @@ fn observe_update(group: Group, started: Instant) {
 mod tests {
     use super::*;
     use cloudbreak_core::GpaCacheConfig;
-    use cloudbreak_core::modules::rpc_filter_type::Memcmp;
+    use cloudbreak_core::modules::rpc_filter_type::{Memcmp, RpcProgramAccountsConfig};
     use yellowstone_grpc_proto::geyser::SubscribeUpdateAccountInfo;
 
     const VOTE: Pubkey = solana_pubkey::pubkey!("Vote111111111111111111111111111111111111111");
@@ -955,20 +1129,185 @@ mod tests {
         assert_eq!(cached(&feed, &q).unwrap().slot, 102);
     }
 
+    fn processor(feed: &GpaFeed) -> GpaProcessor {
+        GpaProcessor::Cached {
+            cache: inner(feed).cache.clone(),
+            cached_query: None,
+            normalized_query: None,
+            new_accounts_for_query: Default::default(),
+            cache_hits: 0,
+            new_slot: 0,
+            mint_resolver: Default::default(),
+        }
+    }
+
+    fn request(
+        commitment: solana_commitment_config::CommitmentConfig,
+        min_context_slot: Option<u64>,
+    ) -> RpcProgramAccountsConfig {
+        let mut config = RpcProgramAccountsConfig::default();
+        config.account_config.encoding = Some(UiAccountEncoding::Base64);
+        config.account_config.commitment = Some(commitment);
+        config.account_config.min_context_slot = min_context_slot;
+        config
+    }
+
+    fn served_slot(feed: &GpaFeed, config: &RpcProgramAccountsConfig, latest: u64) -> Option<u64> {
+        processor(feed)
+            .fed_query(VOTE, config, latest)
+            .map(|(slot, _)| slot)
+    }
+
+    fn pending(feed: &GpaFeed) -> Vec<u64> {
+        inner(feed)
+            .state()
+            .pending
+            .iter()
+            .map(|p| p.cursor.slot)
+            .collect()
+    }
+
     #[test]
-    fn a_missing_block_resets_the_ring_and_unfeeds_the_queries() {
+    fn postgres_first_serves_the_applied_slot_until_the_block_arrives() {
+        let feed = feed();
+        let q = query(CommitmentLevel::Confirmed, vec![]);
+        let account = Pubkey::new_unique();
+        install(&feed, &q, 100, &[]);
+        confirm(&feed, 100);
+
+        let counted = metrics::CLOUDBREAK_GPA_CACHE_FEED_PG_FIRST_TOTAL.get();
+        let gaps = || {
+            metrics::CLOUDBREAK_GPA_CACHE_FEED_GRPC_PG_GAP_US
+                .with_label_values(&["pg"])
+                .get_sample_count()
+        };
+        let gaps_before = gaps();
+        confirm(&feed, 101);
+        assert!(metrics::CLOUDBREAK_GPA_CACHE_FEED_PG_FIRST_TOTAL.get() > counted);
+        assert_eq!(pending(&feed), vec![101]);
+        let entry = cached(&feed, &q).unwrap();
+        assert_eq!(entry.slot, 100);
+        assert!(entry.sorted.is_some());
+
+        let confirmed = solana_commitment_config::CommitmentConfig::confirmed();
+        assert_eq!(
+            served_slot(&feed, &request(confirmed, None), 101),
+            Some(100)
+        );
+        // A minContextSlot above the applied slot goes to Postgres.
+        assert_eq!(
+            served_slot(&feed, &request(confirmed, Some(101)), 101),
+            None
+        );
+
+        assert!(feed.on_block(&block(101, 100, vec![write(account, VOTE, 1, vec![1])])));
+        feed.on_pending_block();
+        let entry = cached(&feed, &q).unwrap();
+        assert_eq!((entry.slot, sorted_keys(&entry)), (101, vec![account]));
+        assert!(pending(&feed).is_empty());
+        assert!(gaps() > gaps_before);
+        assert_eq!(
+            served_slot(&feed, &request(confirmed, None), 101),
+            Some(101)
+        );
+        // Nothing waits any more: a new block needs no catch-up task.
+        assert!(!feed.on_block(&block(102, 101, vec![])));
+    }
+
+    #[test]
+    fn pending_slots_accumulate_and_apply_as_their_blocks_link() {
+        let feed = feed();
+        let q = query(CommitmentLevel::Confirmed, vec![]);
+        let [a, b, c] = [(); 3].map(|_| Pubkey::new_unique());
+        install(&feed, &q, 100, &[]);
+        confirm(&feed, 100);
+        confirm(&feed, 101);
+        confirm(&feed, 102);
+        assert_eq!(pending(&feed), vec![101, 102]);
+
+        // 102 cannot link while its parent 101 is missing.
+        assert!(feed.on_block(&block(102, 101, vec![write(b, VOTE, 1, vec![2])])));
+        feed.on_pending_block();
+        assert_eq!(cached(&feed, &q).unwrap().slot, 100);
+        assert_eq!(pending(&feed), vec![101, 102]);
+
+        confirm(&feed, 103);
+        assert!(feed.on_block(&block(101, 100, vec![write(a, VOTE, 1, vec![1])])));
+        feed.on_pending_block();
+        let entry = cached(&feed, &q).unwrap();
+        let mut expected = vec![a, b];
+        expected.sort();
+        assert_eq!((entry.slot, sorted_keys(&entry)), (102, expected));
+        assert_eq!(pending(&feed), vec![103]);
+
+        assert!(feed.on_block(&block(103, 102, vec![write(c, VOTE, 1, vec![3])])));
+        feed.on_pending_block();
+        assert_eq!(cached(&feed, &q).unwrap().slot, 103);
+        assert!(pending(&feed).is_empty());
+        assert_eq!(inner(&feed).state().ring.len(), 3);
+    }
+
+    #[test]
+    fn too_many_pending_slots_reset_the_ring_and_unfeed_the_queries() {
         let feed = feed();
         let q = query(CommitmentLevel::Confirmed, vec![]);
         install(&feed, &q, 100, &[]);
         confirm(&feed, 100);
+        let last = 100 + MAX_PENDING_SLOTS as u64;
+        for slot in 101..=last {
+            confirm(&feed, slot);
+        }
+        assert_eq!(pending(&feed).len(), MAX_PENDING_SLOTS);
         assert!(cached(&feed, &q).unwrap().sorted.is_some());
 
-        feed.on_block(&block(102, 101, vec![]));
-        confirm(&feed, 102);
+        confirm(&feed, last + 1);
+        assert!(pending(&feed).is_empty());
         let entry = cached(&feed, &q).unwrap();
         assert_eq!(entry.slot, 100);
         assert!(entry.sorted.is_none());
-        assert_eq!(inner(&feed).state().ring_base, 102);
+        assert_eq!(inner(&feed).state().ring_base, last + 1);
+        assert_eq!(inner(&feed).state().applied_slot(), Some(last + 1));
+    }
+
+    #[test]
+    fn a_block_that_does_not_link_resets_the_ring() {
+        let feed = feed();
+        let q = query(CommitmentLevel::Confirmed, vec![]);
+        install(&feed, &q, 100, &[]);
+        confirm(&feed, 100);
+        let mut fork = block(101, 100, vec![]);
+        fork.parent_blockhash = "other".to_string();
+        feed.on_block(&fork);
+        confirm(&feed, 101);
+
+        assert!(pending(&feed).is_empty());
+        let entry = cached(&feed, &q).unwrap();
+        assert_eq!(entry.slot, 100);
+        assert!(entry.sorted.is_none());
+        assert_eq!(inner(&feed).state().ring_base, 101);
+    }
+
+    #[test]
+    fn finalized_queries_wait_with_the_confirmed_cursor() {
+        let feed = feed();
+        let q = query(CommitmentLevel::Finalized, vec![]);
+        let account = Pubkey::new_unique();
+        install(&feed, &q, 100, &[]);
+        confirm(&feed, 100);
+        feed.on_finalized(100);
+        confirm(&feed, 101);
+        feed.on_finalized(101);
+        assert_eq!(cached(&feed, &q).unwrap().slot, 100);
+        let finalized = solana_commitment_config::CommitmentConfig::finalized();
+        assert_eq!(
+            served_slot(&feed, &request(finalized, None), 101),
+            Some(100)
+        );
+
+        assert!(feed.on_block(&block(101, 100, vec![write(account, VOTE, 1, vec![1])])));
+        feed.on_pending_block();
+        let entry = cached(&feed, &q).unwrap();
+        assert_eq!((entry.slot, sorted_keys(&entry)), (101, vec![account]));
     }
 
     #[test]
@@ -1016,5 +1355,30 @@ mod tests {
                 .fed_query(Pubkey::new_unique(), &config, 100)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn cleanup_never_evicts_fed_queries() {
+        let feed = feed();
+        let fed = query(CommitmentLevel::Confirmed, vec![]);
+        let other = NormalizedQuery::new(
+            Pubkey::new_unique(),
+            vec![],
+            UiAccountEncoding::Base64,
+            None,
+            CommitmentLevel::Confirmed,
+        );
+        install(&feed, &fed, 100, &[(Pubkey::new_unique(), vec![1])]);
+        install(&feed, &other, 101, &[(Pubkey::new_unique(), vec![2])]);
+
+        // Ask for more than the whole cache, as a too-large query does.
+        let mut evicted = Vec::new();
+        inner(&feed)
+            .cache_write()
+            .cleanup_old_queries(1 << 31, &mut evicted);
+
+        assert_eq!(evicted.len(), 1);
+        assert!(cached(&feed, &fed).is_some());
+        assert!(cached(&feed, &other).is_none());
     }
 }

@@ -88,5 +88,16 @@ INNER JOIN LATERAL (
         AND snapshot_accounts.owner = {program}
         AND snapshot_accounts.ctid = latest.row_id
 ) AS fresh ON TRUE
-WHERE latest.lamports > 0
+WHERE
+    latest.lamports > 0
+    -- Drop a winner superseded at or below the query slot by a row the filters skipped: a non-matching
+    -- update or a close/owner-change mask. Live writes and masks only go to `accounts`.
+    AND NOT EXISTS (
+        SELECT 1 FROM accounts AS newer
+        WHERE
+            newer.owner = {program}
+            AND newer.pubkey = latest.pubkey
+            AND newer.slot > latest.slot
+            AND newer.slot <= {latest_slot}
+    )
 ORDER BY latest.pubkey ASC;

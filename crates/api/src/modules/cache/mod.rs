@@ -344,8 +344,8 @@ impl GpaProcessor {
         }
     }
 
-    /// For a gRPC-fed owner: the pubkey-sorted accounts of the cached query and their slot, when
-    /// the feed keeps it current at `latest_slot` or newer. The request then needs no Postgres.
+    /// For a gRPC-fed owner: the pubkey-sorted accounts of the cached query and their slot, when the
+    /// feed keeps it at `latest_slot`, or at the applied slot while gRPC blocks are pending.
     pub fn fed_query(
         &self,
         program: Pubkey,
@@ -363,16 +363,31 @@ impl GpaProcessor {
             return None;
         }
         let (_, cached) = cache.get_cached_query(program, config);
+        // While confirmed slots wait for their gRPC blocks, the fed queries serve the applied slot.
+        let floor = match &cache.feed_status {
+            Some(status) if !status.pending_slots.is_empty() => {
+                latest_slot.min(status.confirmed_slot)
+            }
+            _ => latest_slot,
+        };
+        let floor = floor.max(config.account_config.min_context_slot.unwrap_or(0));
         drop(cache);
         let (result, fed) = match cached {
             None => ("not_cached", None),
             Some(CachedQuery { sorted: None, .. }) => ("not_fed", None),
-            Some(c) if c.slot < latest_slot => ("behind", None),
+            Some(c) if c.slot < floor => ("behind", None),
             Some(CachedQuery {
                 slot,
                 sorted: Some(sorted),
                 ..
-            }) => ("memory", Some((slot, sorted))),
+            }) => (
+                if slot < latest_slot {
+                    "memory_late"
+                } else {
+                    "memory"
+                },
+                Some((slot, sorted)),
+            ),
         };
         metrics::CLOUDBREAK_GPA_CACHE_FEED_REQUESTS_TOTAL
             .with_label_values(&[result])
@@ -899,6 +914,8 @@ impl GpaCache {
     /// less than requested when the oldest slots hold mostly pinned queries that
     /// are within the cap.
     ///
+    /// Queries of gRPC-fed owners are never evicted here: the feed keeps them current.
+    ///
     /// Evicted entries are appended to `evicted` rather than dropped here, so the
     /// caller can deallocate them once the write lock is released.
     pub fn cleanup_old_queries(
@@ -929,6 +946,7 @@ impl GpaCache {
         }
 
         let max_evictable = self.config.max_bytes_query_cleanup.map(|b| b as u64);
+        let feed_owners = self.config.feed_owners();
 
         // Walk slots oldest-first (`BTreeMap::retain` visits in ascending key
         // order), draining queries from each bucket in place. A slot whose
@@ -953,6 +971,9 @@ impl GpaCache {
                 let need_size = bytes_freed < bytes_to_free;
                 let need_pinned = *pinned_size > pinned_threshold;
                 if !need_size && !need_pinned {
+                    return true;
+                }
+                if feed_owners.contains(&q.program) {
                     return true;
                 }
 

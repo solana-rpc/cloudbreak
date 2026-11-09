@@ -12,7 +12,8 @@ use cloudbreak_core::metrics::{
 };
 use hyper::StatusCode;
 use prometheus::{
-    HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
+    Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+    Registry, TextEncoder,
 };
 use sea_orm::DatabaseConnection;
 use std::{
@@ -260,7 +261,7 @@ lazy_static::lazy_static! {
         &["commitment", "result"],
     ).unwrap();
 
-    /// gPAs for a fed owner: `memory` (no Postgres), `not_cached`, `not_fed`, `behind`.
+    /// gPAs for a fed owner: `memory`, `memory_late` (below the published slot), `not_cached`, `not_fed`, `behind`.
     pub static ref CLOUDBREAK_GPA_CACHE_FEED_REQUESTS_TOTAL: IntCounterVec = IntCounterVec::new(
         Opts::new(
             "cloudbreak_gpa_cache_feed_requests_total",
@@ -269,7 +270,7 @@ lazy_static::lazy_static! {
         &["result"],
     ).unwrap();
 
-    /// Feed resets: `block_missing` (gRPC gap) or `health_restored` (indexer gap repair).
+    /// Feed resets: `grpc_late` (too many confirmed slots wait for gRPC), `chain_broken` or `health_restored`.
     pub static ref CLOUDBREAK_GPA_CACHE_FEED_RESETS_TOTAL: IntCounterVec = IntCounterVec::new(
         Opts::new(
             "cloudbreak_gpa_cache_feed_resets_total",
@@ -278,7 +279,37 @@ lazy_static::lazy_static! {
         &["reason"],
     ).unwrap();
 
-    /// Blocks held by the gRPC feed: `buffer` (processed, not confirmed yet) and `ring` (recent confirmed).
+    /// Confirmed slots Postgres reported before the API gRPC feed delivered their blocks.
+    pub static ref CLOUDBREAK_GPA_CACHE_FEED_PG_FIRST_TOTAL: IntCounter = IntCounter::new(
+        "cloudbreak_gpa_cache_feed_pg_first_total",
+        "Confirmed slots Postgres reported before the gRPC-fed gPA cache had their blocks"
+    ).unwrap();
+
+    /// At each `pg_first` slot: the confirmed slots then waiting for gRPC blocks, this one included.
+    pub static ref CLOUDBREAK_GPA_CACHE_FEED_PG_FIRST_DEPTH: Histogram = Histogram::with_opts(
+        HistogramOpts::new(
+            "cloudbreak_gpa_cache_feed_pg_first_depth",
+            "Confirmed slots waiting for their gRPC blocks when Postgres reports one more"
+        )
+        .buckets(vec![1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 16.0, 32.0]),
+    )
+    .unwrap();
+
+    /// Time between a confirmed slot's gRPC block and its Postgres confirmation, by which came `first`.
+    pub static ref CLOUDBREAK_GPA_CACHE_FEED_GRPC_PG_GAP_US: HistogramVec = HistogramVec::new(
+        HistogramOpts::new(
+            "cloudbreak_gpa_cache_feed_grpc_pg_gap_us",
+            "Time between the gRPC block of a confirmed slot and its Postgres confirmation, in microseconds, by which came first"
+        )
+        .buckets(vec![
+            100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0, 25_000.0, 50_000.0,
+            100_000.0, 250_000.0, 500_000.0, 1_000_000.0, 2_500_000.0, 5_000_000.0, 10_000_000.0,
+        ]),
+        &["first"],
+    )
+    .unwrap();
+
+    /// Held by the gRPC feed: `buffer` and `ring` blocks, and `pending` confirmed slots waiting for gRPC.
     pub static ref CLOUDBREAK_GPA_CACHE_FEED_BLOCKS: IntGaugeVec = IntGaugeVec::new(
         Opts::new(
             "cloudbreak_gpa_cache_feed_blocks",
@@ -401,6 +432,9 @@ pub fn setup_metrics(config: &ApiConfig) -> anyhow::Result<()> {
         register!(CLOUDBREAK_GPA_CACHE_FEED_QUERY_UPDATES_TOTAL);
         register!(CLOUDBREAK_GPA_CACHE_FEED_REQUESTS_TOTAL);
         register!(CLOUDBREAK_GPA_CACHE_FEED_RESETS_TOTAL);
+        register!(CLOUDBREAK_GPA_CACHE_FEED_PG_FIRST_TOTAL);
+        register!(CLOUDBREAK_GPA_CACHE_FEED_PG_FIRST_DEPTH);
+        register!(CLOUDBREAK_GPA_CACHE_FEED_GRPC_PG_GAP_US);
         register!(CLOUDBREAK_GPA_CACHE_FEED_BLOCKS);
 
         // Per-client-IP egress bandwidth (peak gauge + throughput histogram).
