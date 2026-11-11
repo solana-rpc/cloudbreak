@@ -182,7 +182,24 @@ fn gpa_db_query(
             );
             let mut first_loop_iteration = true;
 
-            let mut rows = gpa_sql.query().fetch(&pool);
+            // `big_mint_scan` must live until the last row: dropping it returns its permit.
+            // The wait for a permit counts against `queries_timeout`.
+            let filters = input.config.filters.as_deref().unwrap_or(&[]);
+            let big_mint_scans = &input.state.big_mint_scans;
+            let mut big_mint_scan = match big_mint_scans.begin(&pool, &input.program, filters).await
+            {
+                Ok(big_mint_scan) => big_mint_scan,
+                Err(e) => {
+                    tracing::error!("Database query error: {}", e);
+                    let _ = tx.send(Err(RpcError::InternalError));
+                    return;
+                }
+            };
+
+            let mut rows = match big_mint_scan.as_mut() {
+                Some(big_mint_scan) => gpa_sql.query().fetch(big_mint_scan.connection()),
+                None => gpa_sql.query().fetch(&pool),
+            };
             let mut batch: Vec<PgRow> = Vec::with_capacity(gpa_stream_batch_size.unwrap_or(0));
 
             loop {

@@ -782,6 +782,39 @@ pub struct ApiConfig {
     /// and the indexer's `[mint-cache]`.
     #[serde(rename = "mint-cache", default)]
     pub mint_cache: Option<MintCacheConfig>,
+    /// Bounds how many full scans of the listed big mints run at once. See
+    /// `modules::big_mint_scans` in the API.
+    #[serde(rename = "big-mint-scans", default)]
+    pub big_mint_scans: Option<BigMintScansConfig>,
+}
+
+/// The `[big-mint-scans]` API section. A token gPA on one of `mints` without an owner filter or a
+/// 32-byte delegate filter waits while `max-concurrent` of them run, then runs with the planner
+/// settings.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct BigMintScansConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub mints: Vec<PubkeyDef>,
+    #[serde(
+        rename = "max-concurrent",
+        default = "BigMintScansConfig::default_max_concurrent"
+    )]
+    pub max_concurrent: usize,
+    /// `max_parallel_workers_per_gather` for these scans; the server setting when unset.
+    #[serde(rename = "max-parallel-workers", default)]
+    pub max_parallel_workers: Option<u32>,
+    /// Turns plain index scans off for these scans, so the planner uses a bitmap heap scan.
+    #[serde(rename = "bitmap-scan", default)]
+    pub bitmap_scan: bool,
+}
+
+impl BigMintScansConfig {
+    const fn default_max_concurrent() -> usize {
+        2
+    }
 }
 
 /// The Yellowstone gRPC endpoint of the API feed. See `modules::grpc`. The connection knobs
@@ -1976,6 +2009,40 @@ url = "postgres://localhost/cloudbreak"
     #[test]
     fn processed_accounts_no_longer_takes_an_endpoint() {
         let err = api_config("[processed-accounts]\nenabled = true\nendpoint = \"http://grpc\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown field"), "{err}");
+    }
+
+    #[test]
+    fn big_mint_scans_defaults_and_keys() {
+        assert!(api_config("").unwrap().big_mint_scans.is_none());
+        let scans = api_config("[big-mint-scans]\n")
+            .unwrap()
+            .big_mint_scans
+            .unwrap();
+        assert!(!scans.enabled && scans.mints.is_empty() && !scans.bitmap_scan);
+        assert_eq!(
+            (scans.max_concurrent, scans.max_parallel_workers),
+            (2, None)
+        );
+
+        let mint = Pubkey::new_from_array([7; 32]);
+        let scans = api_config(&format!(
+            "[big-mint-scans]\nenabled = true\nmints = [\"{mint}\"]\nmax-concurrent = 4\n\
+             max-parallel-workers = 0\nbitmap-scan = true\n"
+        ))
+        .unwrap()
+        .big_mint_scans
+        .unwrap();
+        assert!(scans.enabled && scans.bitmap_scan);
+        assert_eq!(scans.mints.iter().map(|m| m.0).collect::<Vec<_>>(), [mint]);
+        assert_eq!(
+            (scans.max_concurrent, scans.max_parallel_workers),
+            (4, Some(0))
+        );
+
+        let err = api_config("[big-mint-scans]\nunknown = 2\n")
             .unwrap_err()
             .to_string();
         assert!(err.contains("unknown field"), "{err}");

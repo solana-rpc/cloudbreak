@@ -22,6 +22,9 @@ pub struct SqlFilters {
     /// Values bound to `$1..$n` in the clauses, shared by both tables.
     pub params: Vec<Vec<u8>>,
     pub label: String,
+    /// True for a mint query with an owner-prefix range. The right index depends on the bound
+    /// values, so the statement must be planned with them on every run.
+    pub custom_plan: bool,
 }
 
 /// The indexed key a token-program gPA filters on. The first one present, in this order, names
@@ -38,9 +41,9 @@ impl SqlFilters {
     ///
     /// On a token program the query must filter on an indexed key: a 32-byte memcmp on the mint,
     /// the delegate or the owner. Those memcmps and the delegate tag become the token index
-    /// expressions. A delegate filter without a tag gets the tag (known difference, see the
-    /// README). A `gpa` label gets the key as suffix (`gpa_mint`, `gpa_delegate`, `gpa_token`);
-    /// any other label is kept.
+    /// expressions, and a shorter owner memcmp becomes a range on the owner column. A delegate
+    /// filter without a tag gets the tag (known difference, see the README). A `gpa` label gets
+    /// the key as suffix (`gpa_mint`, `gpa_delegate`, `gpa_token`); any other label is kept.
     pub fn build(
         program: &Pubkey,
         filters: &[RpcFilterType],
@@ -58,6 +61,7 @@ impl SqlFilters {
         let is_token_program = is_token_program(program);
         let mut label = label.to_string();
         let mut add_delegate_tag = false;
+        let mut custom_plan = false;
         if is_token_program {
             let key = is_valid_token_query(filters)?;
             if label == "gpa" {
@@ -69,6 +73,7 @@ impl SqlFilters {
             }
             add_delegate_tag = has_memcmp(filters, TOKEN_ACCOUNT_DELEGATE_OFFSET, Some(32))
                 && !has_memcmp(filters, TOKEN_ACCOUNT_DELEGATE_TAG_OFFSET, None);
+            custom_plan = key == TokenKey::Mint && has_owner_prefix(filters);
         }
 
         let delegate_tag = RpcFilterType::Memcmp(Memcmp::new_raw_bytes(
@@ -83,7 +88,7 @@ impl SqlFilters {
             .chain(add_delegate_tag.then_some(&delegate_tag))
         {
             let param = params.len() + 1;
-            let Some((clause, value)) = filter_sql(filter, "accounts", is_token_program, param)
+            let Some((clause, values)) = filter_sql(filter, "accounts", is_token_program, param)
             else {
                 continue;
             };
@@ -93,7 +98,7 @@ impl SqlFilters {
             {
                 snapshot.push(format!("AND {clause}"));
             }
-            params.extend(value);
+            params.extend(values);
         }
 
         Ok(Self {
@@ -101,6 +106,7 @@ impl SqlFilters {
             snapshot: snapshot.join("\n                    "),
             params,
             label,
+            custom_plan,
         })
     }
 }
@@ -137,34 +143,67 @@ fn has_memcmp(filters: &[RpcFilterType], offset: usize, len: Option<usize>) -> b
     })
 }
 
-/// One filter as a SQL predicate on `table`, and the value it binds to `$param`, if any. Values
-/// that select an index (dataSize, memcmp offset and length, the delegate tag) stay literal SQL.
-/// For a token program, owner, mint and delegate-tag memcmps become the exact expressions the
-/// token indexes are built on.
+/// True when a memcmp at the owner offset holds only the first bytes of an owner.
+fn is_owner_prefix(offset: usize, bytes: &[u8]) -> bool {
+    offset == TOKEN_ACCOUNT_OWNER_OFFSET && !bytes.is_empty() && bytes.len() < 32
+}
+
+fn has_owner_prefix(filters: &[RpcFilterType]) -> bool {
+    filters.iter().any(|filter| {
+        matches!(filter, RpcFilterType::Memcmp(memcmp)
+            if memcmp.bytes().is_some_and(|b| is_owner_prefix(memcmp.offset(), &b)))
+    })
+}
+
+/// The lowest byte string above every string that starts with `prefix`: the prefix without its
+/// trailing 0xff bytes, plus one. `None` for an all-0xff prefix, which has no such string.
+fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let last = prefix.iter().rposition(|byte| *byte != 0xff)?;
+    let mut upper = prefix[..=last].to_vec();
+    upper[last] += 1;
+    Some(upper)
+}
+
+/// One filter as a SQL predicate on `table`, and the values it binds from `$param` on, if any.
+/// Values that select an index (dataSize, memcmp offset and length, the delegate tag) stay literal
+/// SQL. For a token program, owner, mint and delegate-tag memcmps become the exact expressions
+/// the token indexes are built on, and an owner prefix becomes a range on `token_owner`.
 fn filter_sql(
     filter: &RpcFilterType,
     table: &str,
     token_program: bool,
     param: usize,
-) -> Option<(String, Option<Vec<u8>>)> {
+) -> Option<(String, Vec<Vec<u8>>)> {
     match filter {
-        RpcFilterType::DataSize(size) => Some((format!("length({table}.data) = {size}"), None)),
+        RpcFilterType::DataSize(size) => {
+            Some((format!("length({table}.data) = {size}"), Vec::new()))
+        }
         RpcFilterType::Memcmp(memcmp) => {
             let bytes = memcmp.bytes()?.to_vec();
             let offset = memcmp.offset();
 
             if token_program {
                 if offset == TOKEN_ACCOUNT_OWNER_OFFSET && bytes.len() == 32 {
-                    return Some((format!("{table}.token_owner = ${param}"), Some(bytes)));
+                    return Some((format!("{table}.token_owner = ${param}"), vec![bytes]));
+                } else if is_owner_prefix(offset, &bytes) {
+                    // bytea sorts a prefix before its extensions, so the prefix is the lower bound.
+                    let lower = format!("{table}.token_owner >= ${param}");
+                    return Some(match prefix_upper_bound(&bytes) {
+                        Some(upper) => (
+                            format!("{lower} AND {table}.token_owner < ${}", param + 1),
+                            vec![bytes, upper],
+                        ),
+                        None => (lower, vec![bytes]),
+                    });
                 } else if offset == TOKEN_ACCOUNT_MINT_OFFSET && bytes.len() == 32 {
-                    return Some((format!("{table}.token_mint = ${param}"), Some(bytes)));
+                    return Some((format!("{table}.token_mint = ${param}"), vec![bytes]));
                 } else if offset == TOKEN_ACCOUNT_DELEGATE_TAG_OFFSET && bytes == [1, 0, 0, 0] {
                     // The first byte alone is the predicate of the token delegate partial index.
                     return Some((
                         format!(
                             "SUBSTRING({table}.data FROM 73 FOR 1) = '\\x01'::bytea AND SUBSTRING({table}.data FROM 74 FOR 3) = '\\x000000'::bytea"
                         ),
-                        None,
+                        Vec::new(),
                     ));
                 }
             }
@@ -175,7 +214,7 @@ fn filter_sql(
                     offset + 1,
                     bytes.len()
                 ),
-                Some(bytes),
+                vec![bytes],
             ))
         }
         // Agave's `spl_token_2022_interface::state::Account::valid_account_data`: byte 108 is the
@@ -184,7 +223,7 @@ fn filter_sql(
             format!(
                 "(SUBSTRING({table}.data FROM 109 FOR 1) <> '\\x00'::bytea AND (length({table}.data) = 165 OR (length({table}.data) > 165 AND length({table}.data) <> 355 AND SUBSTRING({table}.data FROM 166 FOR 1) = '\\x02'::bytea)))"
             ),
-            None,
+            Vec::new(),
         )),
         RpcFilterType::ValueCmp(_) => None,
     }
@@ -199,7 +238,7 @@ mod tests {
         filter_sql(&filter, "accounts", token_program, 1).unwrap().0
     }
 
-    fn bound(filter: RpcFilterType, token_program: bool) -> Option<Vec<u8>> {
+    fn bound(filter: RpcFilterType, token_program: bool) -> Vec<Vec<u8>> {
         filter_sql(&filter, "accounts", token_program, 1).unwrap().1
     }
 
@@ -212,8 +251,124 @@ mod tests {
         let key = [7u8; 32];
         assert_eq!(sql(memcmp(32, &key), true), "accounts.token_owner = $1");
         assert_eq!(sql(memcmp(0, &key), true), "accounts.token_mint = $1");
-        assert_eq!(bound(memcmp(32, &key), true), Some(key.to_vec()));
-        assert_eq!(bound(memcmp(0, &key), true), Some(key.to_vec()));
+        assert_eq!(bound(memcmp(32, &key), true), vec![key.to_vec()]);
+        assert_eq!(bound(memcmp(0, &key), true), vec![key.to_vec()]);
+    }
+
+    #[test]
+    fn a_token_owner_prefix_is_a_range_on_the_indexed_column() {
+        let range = "accounts.token_owner >= $1 AND accounts.token_owner < $2";
+        // One byte.
+        assert_eq!(sql(memcmp(32, &[0x00]), true), range);
+        assert_eq!(
+            bound(memcmp(32, &[0x00]), true),
+            vec![vec![0x00], vec![0x01]]
+        );
+        // Several bytes: only the last one moves.
+        assert_eq!(sql(memcmp(32, &[0x06, 0x01]), true), range);
+        assert_eq!(
+            bound(memcmp(32, &[0x06, 0x01]), true),
+            vec![vec![0x06, 0x01], vec![0x06, 0x02]]
+        );
+        assert_eq!(sql(memcmp(32, &[7; 31]), true), range);
+        let mut upper = [7u8; 31];
+        upper[30] = 8;
+        assert_eq!(
+            bound(memcmp(32, &[7; 31]), true),
+            vec![vec![7; 31], upper.to_vec()]
+        );
+        // Carry: the trailing 0xff bytes drop and the byte before them moves.
+        assert_eq!(sql(memcmp(32, &[0x01, 0xff]), true), range);
+        assert_eq!(
+            bound(memcmp(32, &[0x01, 0xff]), true),
+            vec![vec![0x01, 0xff], vec![0x02]]
+        );
+        assert_eq!(
+            bound(memcmp(32, &[0xfe, 0xff, 0xff]), true),
+            vec![vec![0xfe, 0xff, 0xff], vec![0xff]]
+        );
+    }
+
+    #[test]
+    fn an_all_ff_token_owner_prefix_has_no_upper_bound() {
+        for prefix in [vec![0xff], vec![0xff; 3], vec![0xff; 31]] {
+            assert_eq!(sql(memcmp(32, &prefix), true), "accounts.token_owner >= $1");
+            assert_eq!(bound(memcmp(32, &prefix), true), vec![prefix]);
+        }
+    }
+
+    #[test]
+    fn only_a_token_owner_prefix_becomes_a_range() {
+        // Other programs, other offsets and longer values stay plain byte comparisons.
+        assert_eq!(
+            sql(memcmp(32, &[1, 2]), false),
+            "SUBSTRING(accounts.data FROM 33 FOR 2) = $1"
+        );
+        assert_eq!(
+            sql(memcmp(33, &[1, 2]), true),
+            "SUBSTRING(accounts.data FROM 34 FOR 2) = $1"
+        );
+        assert_eq!(
+            sql(memcmp(32, &[7; 40]), true),
+            "SUBSTRING(accounts.data FROM 33 FOR 40) = $1"
+        );
+        assert_eq!(bound(memcmp(32, &[1, 2]), false), vec![vec![1, 2]]);
+    }
+
+    #[test]
+    fn a_range_takes_two_parameter_numbers_in_both_tables() {
+        let mint = [7u8; 32];
+        let filters = [
+            memcmp(0, &mint),
+            memcmp(32, &[0x01, 0xff]),
+            memcmp(64, &[9]),
+        ];
+        let sql = SqlFilters::build(&LEGACY_TOKEN_PROGRAM_ID, &filters, "gpa").unwrap();
+        assert_eq!(
+            sql.accounts,
+            "AND accounts.token_mint = $1\n                    \
+             AND accounts.token_owner >= $2 AND accounts.token_owner < $3\n                    \
+             AND SUBSTRING(accounts.data FROM 65 FOR 1) = $4"
+        );
+        assert_eq!(
+            sql.snapshot,
+            sql.accounts.replace("accounts.", "snapshot_accounts.")
+        );
+        assert_eq!(
+            sql.params,
+            vec![mint.to_vec(), vec![0x01, 0xff], vec![0x02], vec![9]]
+        );
+        assert_eq!(sql.label, "gpa_mint");
+
+        // Without an upper bound the next filter takes the next number.
+        let filters = [memcmp(0, &mint), memcmp(32, &[0xff]), memcmp(64, &[9])];
+        let sql = SqlFilters::build(&LEGACY_TOKEN_PROGRAM_ID, &filters, "gpa").unwrap();
+        assert_eq!(
+            sql.accounts,
+            "AND accounts.token_mint = $1\n                    \
+             AND accounts.token_owner >= $2\n                    \
+             AND SUBSTRING(accounts.data FROM 65 FOR 1) = $3"
+        );
+        assert_eq!(sql.params, vec![mint.to_vec(), vec![0xff], vec![9]]);
+    }
+
+    #[test]
+    fn only_a_mint_query_with_an_owner_prefix_asks_for_a_custom_plan() {
+        let key = [7u8; 32];
+        let custom_plan = |program: &Pubkey, filters: &[RpcFilterType]| {
+            SqlFilters::build(program, filters, "gpa")
+                .unwrap()
+                .custom_plan
+        };
+        let token = &LEGACY_TOKEN_PROGRAM_ID;
+        assert!(custom_plan(token, &[memcmp(0, &key), memcmp(32, &[1])]));
+        assert!(!custom_plan(token, &[memcmp(0, &key)]));
+        assert!(!custom_plan(token, &[memcmp(0, &key), memcmp(32, &key)]));
+        assert!(!custom_plan(token, &[memcmp(76, &key), memcmp(32, &[1])]));
+        assert!(!custom_plan(
+            &Pubkey::new_unique(),
+            &[memcmp(0, &key), memcmp(32, &[1])]
+        ));
     }
 
     #[test]
@@ -222,13 +377,13 @@ mod tests {
             sql(memcmp(72, &[1, 0, 0, 0]), true),
             "SUBSTRING(accounts.data FROM 73 FOR 1) = '\\x01'::bytea AND SUBSTRING(accounts.data FROM 74 FOR 3) = '\\x000000'::bytea"
         );
-        assert_eq!(bound(memcmp(72, &[1, 0, 0, 0]), true), None);
+        assert!(bound(memcmp(72, &[1, 0, 0, 0]), true).is_empty());
         // Any other shape at 72 stays a plain byte comparison.
         assert_eq!(
             sql(memcmp(72, &[1]), true),
             "SUBSTRING(accounts.data FROM 73 FOR 1) = $1"
         );
-        assert_eq!(bound(memcmp(72, &[1]), true), Some(vec![1]));
+        assert_eq!(bound(memcmp(72, &[1]), true), vec![vec![1]]);
     }
 
     #[test]
@@ -238,7 +393,7 @@ mod tests {
             sql(memcmp(76, &key), true),
             "SUBSTRING(accounts.data FROM 77 FOR 32) = $1"
         );
-        assert_eq!(bound(memcmp(76, &key), true), Some(key.to_vec()));
+        assert_eq!(bound(memcmp(76, &key), true), vec![key.to_vec()]);
     }
 
     #[test]
@@ -254,7 +409,7 @@ mod tests {
         );
         assert_eq!(
             bound(memcmp(72, &[1, 0, 0, 0]), false),
-            Some(vec![1, 0, 0, 0])
+            vec![vec![1, 0, 0, 0]]
         );
     }
 
