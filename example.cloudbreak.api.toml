@@ -110,6 +110,16 @@ enabled = false
 # [mint-cache]
 # enabled = false
 
+# Limits how many full scans of the listed mints run at once. A token gPA on a
+# listed mint with no owner filter and no delegate filter waits while
+# `max-concurrent` of them run.
+# [big-mint-scans]
+# enabled = false
+# mints = ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"]
+# max-concurrent = 2
+# max-parallel-workers = 0
+# bitmap-scan = true
+
 # The API gRPC feed used by [processed-accounts] and [mint-cache]. The connection
 # fields default to the indexer values; the API panics after reconnect-give-up.
 # [grpc]

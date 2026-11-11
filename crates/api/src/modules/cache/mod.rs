@@ -232,7 +232,7 @@ pub struct GpaCache {
 pub struct GpaSql {
     sql: String,
     /// False for a traced request: its SQL text is unique, so it runs as an unnamed statement
-    /// and stays out of the statement cache.
+    /// and stays out of the statement cache. Also false when the filters ask for a custom plan.
     persistent: bool,
     filter_params: Vec<Vec<u8>>,
     latest_slot: u64,
@@ -259,7 +259,7 @@ impl GpaSql {
 
         let traceparent = db_query::traceparent_comment();
         Self {
-            persistent: traceparent.is_none(),
+            persistent: traceparent.is_none() && !filters.custom_plan,
             sql: match traceparent {
                 Some(comment) => format!("{comment} {sql}"),
                 None => sql,
