@@ -652,6 +652,18 @@ pub struct ServerConfig {
         default = "ServerConfig::default_max_multiple_accounts"
     )]
     pub max_multiple_accounts: usize,
+    /// Largest accepted request body in bytes. A larger body gets HTTP 413.
+    #[serde(
+        rename = "max-request-body-size",
+        default = "ServerConfig::default_max_request_body_size"
+    )]
+    pub max_request_body_size: usize,
+    /// Most requests accepted in one JSON-RPC batch.
+    #[serde(
+        rename = "max-batch-requests",
+        default = "ServerConfig::default_max_batch_requests"
+    )]
+    pub max_batch_requests: usize,
 }
 
 impl ServerConfig {
@@ -668,6 +680,15 @@ impl ServerConfig {
     }
 
     pub const fn default_max_multiple_accounts() -> usize {
+        100
+    }
+
+    /// Agave's `MAX_REQUEST_BODY_SIZE`.
+    pub const fn default_max_request_body_size() -> usize {
+        50 * 1024
+    }
+
+    pub const fn default_max_batch_requests() -> usize {
         100
     }
 }

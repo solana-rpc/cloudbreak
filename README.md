@@ -442,6 +442,8 @@ The last three keys only take effect in the API server.
 | `gpa-stream-batch-size`          | `usize` (non-zero) | (unset) | Unset (default): `getProgramAccounts`, `getTokenAccountsByOwner`, `getTokenAccountsByDelegate` and `getTokenAccountsByMint` fetch and encode every account as one batch before the response starts, so every failure is a JSON-RPC error. Set it to opt in to streaming in batches of this size, which lowers peak memory and time to first byte but aborts the connection on a mid-stream failure. See [Streamed Responses](#streamed-responses). |
 | `request-timeout`                | `Duration` | `"60s"`     | Total per-request wall-clock budget (handler + body transport). When exceeded, the response stream is truncated and the request is counted under the `timeout` status. See [Streamed Responses](#streamed-responses). |
 | `max-multiple-accounts`          | `usize`    | `100`       | Maximum number of pubkeys accepted per `getMultipleAccounts` request. Requests exceeding this limit are rejected with an `InvalidParams` error.                                                          |
+| `max-request-body-size`          | `usize`    | `51200`     | Largest accepted request body in bytes, Agave's default. A larger body gets HTTP 413.                                                                                                                    |
+| `max-batch-requests`             | `usize`    | `100`       | Maximum number of requests in one batch JSON-RPC call. A larger batch gets one `-32600` error.                                                                                                           |
 
 #### Streamed Responses
 

@@ -38,8 +38,16 @@ pub async fn handle_rpc_request(
     state: Arc<CloudbreakRpcState>,
     ctx: &Arc<RequestContext>,
 ) -> HttpHandlerResponse {
-    let body = match http_body_util::BodyExt::collect(req.into_body()).await {
+    let body = http_body_util::Limited::new(req.into_body(), state.max_request_body_size);
+    let body = match http_body_util::BodyExt::collect(body).await {
         Ok(collected) => collected.to_bytes(),
+        // Same status and text as Agave.
+        Err(e) if e.is::<http_body_util::LengthLimitError>() => {
+            return HttpHandlerResponse {
+                status: StatusCode::PAYLOAD_TOO_LARGE,
+                body: ResponseBody::Buffered(b"request body size exceeds allowed maximum".to_vec()),
+            };
+        }
         Err(e) => {
             tracing::debug!("Failed to read request body: {e}");
             return make_rpc_error_response(serde_json::Value::Null, &RpcError::ParseError);
@@ -69,6 +77,16 @@ async fn process_batch(
     metrics::CLOUDBREAK_API_BATCH_REQUESTS
         .with_label_values(&[metrics::batch_size_bucket(batch_size)])
         .inc();
+    if batch_size > state.max_batch_requests {
+        return make_error_response(
+            serde_json::Value::Null,
+            -32600,
+            format!(
+                "Invalid request: batch of {batch_size} exceeds the maximum of {}",
+                state.max_batch_requests
+            ),
+        );
+    }
 
     let semaphore = Arc::new(tokio::sync::Semaphore::new(
         state.batch_handling_max_concurrency,
@@ -79,15 +97,21 @@ async fn process_batch(
         let state = state.clone();
         let ctx = ctx.clone();
         let sem = semaphore.clone();
-        handles.push(tokio::spawn(async move {
+        let id = req.id.clone();
+        let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
             process_single_request(req, &state, &ctx, true).await
-        }));
+        });
+        handles.push((id, handle));
     }
 
+    // A failed entry task answers its own entry with an internal error, not the whole batch.
     let mut all_results = Vec::with_capacity(batch_size);
-    for handle in handles {
-        all_results.push(handle.await.unwrap());
+    for (id, handle) in handles {
+        all_results.push(handle.await.unwrap_or_else(|e| {
+            tracing::error!("batch entry task failed: {e}");
+            make_rpc_error_response(id, &RpcError::InternalError)
+        }));
     }
 
     let responses: Vec<serde_json::Value> = all_results

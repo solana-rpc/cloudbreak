@@ -51,7 +51,17 @@ impl RpcFilterType {
 }
 
 /// The largest account data size, the system program's `MAX_PERMITTED_DATA_LENGTH`.
-const MAX_ACCOUNT_DATA_LEN: usize = 10 * 1024 * 1024;
+pub const MAX_ACCOUNT_DATA_LEN: usize = 10 * 1024 * 1024;
+
+/// True when `memcmp` ends within the largest account data size, so an account can match it.
+pub fn memcmp_fits_account(memcmp: &Memcmp) -> bool {
+    memcmp.bytes().is_some_and(|bytes| {
+        memcmp
+            .offset()
+            .checked_add(bytes.len())
+            .is_some_and(|end| end <= MAX_ACCOUNT_DATA_LEN)
+    })
+}
 
 /// Returns `true` if any of the filters is a [`RpcFilterType::ValueCmp`]. Used
 /// to cheaply skip the post-filter pass when no ValueCmp filters are present.
