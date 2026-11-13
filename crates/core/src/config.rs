@@ -1447,9 +1447,23 @@ pub struct QueryTrackerConfig {
         deserialize_with = "deserialize_duration_required"
     )]
     pub explain_interval: Duration,
+
+    // ---- ingest -----------------------------------------------------------
+    /// Largest accepted `POST /track` body in bytes. A larger body gets HTTP 413.
+    #[serde(
+        rename = "max-track-body-size",
+        default = "QueryTrackerConfig::default_max_track_body_size"
+    )]
+    pub max_track_body_size: usize,
 }
 
 impl QueryTrackerConfig {
+    /// Each observation carries one gPA config of at most `max-request-body-size` and 256 fingerprints.
+    /// 64 MiB holds a default batch of 1000 such observations.
+    pub const fn default_max_track_body_size() -> usize {
+        64 * 1024 * 1024
+    }
+
     fn default_index_min_age_grace() -> Duration {
         Duration::from_secs(3600)
     }
@@ -1588,6 +1602,7 @@ impl Default for QueryTrackerConfig {
             discrepancy_delta: Self::default_discrepancy_delta(),
             explain_enabled: Self::default_explain_enabled(),
             explain_interval: Self::default_explain_interval(),
+            max_track_body_size: Self::default_max_track_body_size(),
         }
     }
 }

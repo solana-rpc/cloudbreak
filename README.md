@@ -675,6 +675,7 @@ the previous behavior.
 | `discrepancy-delta`             | `f64`         | `0.10`       | Relative gap between demand and supply beyond which a pattern is flagged.                                                                |
 | `explain-enabled`               | `bool`        | `false`      | Optional third signal: periodic `EXPLAIN` (plan only) sampling of each index, on both tables, using the stored `example_request` values. |
 | `explain-interval`              | `Duration`    | `"6h"`       | How often the EXPLAIN sampling pass runs when enabled.                                                                                   |
+| `max-track-body-size`           | `usize`       | `67108864`   | Largest accepted `POST /track` body in bytes (64 MiB). A larger body gets HTTP 413. The API client re-sends a rejected batch, so keep this above its largest batch. |
 
 ### Snapshot Processor (`cloudbreak.snapshot.toml`)
 
