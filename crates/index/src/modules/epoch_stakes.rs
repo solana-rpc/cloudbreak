@@ -65,7 +65,7 @@ pub fn spawn_epoch_stakes_recomputer(
     tokio::spawn(async move {
         let _guard = metrics::TokioTaskCounterGuard::new("epoch_stakes_recomputer");
 
-        if !config.programs.supports_vote_accounts() {
+        if !config.vote_accounts_enabled() {
             return;
         }
 

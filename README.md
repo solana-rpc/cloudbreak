@@ -22,7 +22,7 @@ The API server exposes the following JSON-RPC methods:
 | `getHealth`                  | Returns the health status of the service.                                                                                                                  |
 | `getVersion`                 | Returns the cluster version, Agave-compatible (`{"solana-core": "<string>"}`). See note below for the composite-string format Cloudbreak uses.              |
 | `getGenesisHash`             | Returns the cluster genesis hash as a base58 string.                                                                                                       |
-| `getVoteAccounts`            | Returns the cluster's `current` and `delinquent` vote accounts with per-voter activated stake, commission, last vote, and recent epoch credits. Optional; only available when the Vote and Stake programs are indexed. See [Vote Accounts](#vote-accounts-getvoteaccounts). |
+| `getVoteAccounts`            | Returns the cluster's `current` and `delinquent` vote accounts with per-voter activated stake, commission, last vote, and recent epoch credits. Optional; requires `[vote-accounts]` on both indexer and API, and the Vote and Stake programs indexed. See [Vote Accounts](#vote-accounts-getvoteaccounts). |
 | `simulateTransaction`        | Simulates a transaction against indexed account state at the requested slot and returns logs, compute units, return data, requested account state, and balance changes. Supports `sigVerify`, `replaceRecentBlockhash`, `accounts`, `innerInstructions`, and `minContextSlot`. Optional; only available on a full unfiltered index. See [Simulate Transaction](#simulate-transaction-simulatetransaction). |
 | `getLargestAccounts`         | Returns the 20 largest accounts by lamport balance, with `filter: circulating\|nonCirculating` support. Optional; requires `[largest-accounts]` on both indexer and API. See [Largest Accounts](#largest-accounts-getlargestaccounts-gettokenlargestaccounts). |
 | `getSupply`                  | Returns the total and circulating supply in lamports plus the non-circulating account list. Optional; requires the `[supply]` section on the indexer and the `[supply]` section on the API. See [Supply](#supply-getsupply). |
@@ -348,6 +348,14 @@ Fills and maintains the `mints` table that the API `[mint-cache]` loads. See [Mi
 | `enabled`        | `bool`  | `false`       | Enable the indexer half of the mint cache.                                                |
 | `db-write-interval-slots` | `u64` | `1000` | Slots between two writes of the changed mints to `mints`. A larger value keeps the API reading mutable mints from Postgres longer after a gap. |
 
+#### `[vote-accounts]` (optional)
+
+Seeds `epoch_stakes` from each loaded snapshot and runs the epoch-stakes recomputer for `getVoteAccounts`. Requires the Vote and Stake programs in `[programs]`; the indexer refuses to start otherwise. Set it together with the API `[vote-accounts]` section. See [Vote Accounts](#vote-accounts-getvoteaccounts).
+
+| Key       | Type   | Default | Description                                           |
+| --------- | ------ | ------- | ----------------------------------------------------- |
+| `enabled` | `bool` | `false` | Enables the `epoch_stakes` seed and the recomputer.   |
+
 #### `[snapshot]` (optional)
 
 When this section is present, the indexer downloads and processes snapshots on startup for fast bootstrapping.
@@ -632,6 +640,10 @@ Example:
 unhealthy-response = "http-unavailable"
 ```
 
+#### `[vote-accounts]` (optional)
+
+Serves `getVoteAccounts` from `epoch_stakes`. The section carries only `enabled` (default `false`). Set it together with the indexer's `[vote-accounts]` section. A node with the section absent or disabled, or whose indexer does not index both the Vote and Stake programs, answers `getVoteAccounts` with method-not-found and does not poll `epoch_stakes`. See [Vote Accounts](#vote-accounts-getvoteaccounts).
+
 #### `[supply]` (optional)
 
 Serves `getSupply` from the supply ring the indexer maintains. The section carries only `enabled` (default `false`). Set it together with the indexer's `[supply]` section; a node with the section absent or disabled answers `getSupply` with method-not-found. See [Supply](#supply-getsupply).
@@ -727,6 +739,10 @@ Same as other services. The `partition-clustering-threshold` is particularly rel
 
 Same include/exclude program filter as the indexer.
 
+#### `[vote-accounts]` (optional)
+
+Same as the indexer section: `enabled = true` seeds `epoch_stakes` from the snapshot.
+
 #### `[metrics]`
 
 Same as other services.
@@ -816,7 +832,7 @@ These two are independent but related: the indexer `[programs]` determines what 
 
 ### Vote Accounts (`getVoteAccounts`)
 
-`getVoteAccounts` is optional and only served when the indexer's `[programs]` filter includes both the Vote (`Vote111111111111111111111111111111111111111`) and Stake (`Stake11111111111111111111111111111111111111`) programs. Cloudbreak checks this at startup; if either is missing, the method returns JSON-RPC `-32601 Method not found` and the supporting background tasks are not started.
+`getVoteAccounts` is optional. Enable the `[vote-accounts]` section on the indexer and on the API; the indexer's `[programs]` filter must also include both the Vote (`Vote111111111111111111111111111111111111111`) and Stake (`Stake11111111111111111111111111111111111111`) programs. The indexer refuses to start when the section is enabled and either program is missing. With the section absent or disabled, the indexer does not seed `epoch_stakes` and does not start the recomputer, the API does not poll `epoch_stakes`, and the method returns JSON-RPC `-32601 Method not found`. The API also returns that error when its section is enabled but the indexer does not index both programs.
 
 `commitment` selects the slot the Vote accounts are read at, and the same slot is the reference for `delinquentSlotDistance`. Activated stake comes from the epoch cache below, which is per epoch, so `commitment` does not change it. `processed` follows the `processed-commitment` option; this method has no native processed support.
 
@@ -827,6 +843,8 @@ The `epoch_stakes` table is seeded from snapshot metadata. When the indexer load
 A snapshot captures stake at a single point in time, but activated stake drifts within an epoch as stake warms up or cools down and as rewards are distributed at the epoch boundary. To track this, the indexer runs a background recomputer that recalculates each voter's effective stake for the current epoch from the indexed Stake accounts (using the same warmup/cooldown rules as the runtime), upserts the result into `epoch_stakes`, and keeps only the two most recent epochs.
 
 The recomputer detects drift by comparing the total activated stake across runs. It recomputes every 60 s and treats an epoch as converged once the total is unchanged for three consecutive polls and the indexed `EpochRewards` sysvar reports that reward distribution has finished. If that sysvar is not indexed, it converges on stability alone after roughly 30 minutes. After converging it keeps recomputing on a slower 600 s heartbeat, returning to the 60 s cadence if a late reward write or a healed ingestion gap moves the total again.
+
+Each recompute reads every Vote and Stake account in `accounts` and `snapshot_accounts` by `owner`. Without an owner index or owner partitioning (for example the token node layout), each of the two reads is a sequential scan of the whole `snapshot_accounts` table. Keep `[vote-accounts]` off on nodes that do not serve `getVoteAccounts`.
 
 ### Simulate Transaction (`simulateTransaction`)
 

@@ -85,6 +85,7 @@ pub async fn process_snapshot_if_needed(
                 metrics: config.metrics,
                 programs: config.programs,
                 pg_indexes: snapshot_config.pg_indexes,
+                vote_accounts: config.vote_accounts,
             },
             Some(slot),
             Some(metrics::METRICS_REGISTRY.clone()),
