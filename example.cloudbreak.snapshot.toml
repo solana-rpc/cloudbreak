@@ -21,6 +21,10 @@ include = [
 host = "0.0.0.0"
 port = 8875
 
+# Seeds epoch_stakes from the snapshot for getVoteAccounts.
+# [vote-accounts]
+# enabled = true
+
 # Indexes created on `snapshot_accounts` after ingest by the snapshot crate (not by migrations).
 # Each entry toggles one CREATE INDEX statement. The key is the exact PostgreSQL index name.
 [pg-indexes]
