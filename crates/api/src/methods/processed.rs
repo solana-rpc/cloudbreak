@@ -45,7 +45,6 @@ use solana_pubkey::Pubkey;
 use tokio::time::timeout;
 use tracing::Instrument;
 
-use crate::db_query::{bytea_array_literal, bytea_literal};
 use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
 use crate::methods::resolve_commitment;
@@ -210,7 +209,7 @@ impl Account {
 /// Reads `keys` in order, `None` for an absent or closed key. Without blocks
 /// every key reads Postgres with `sql_template` at `latest_slot`. With blocks,
 /// a live key comes from memory and an unknown key reads Postgres at the anchor.
-/// `$1` in the template takes one bytea literal, or an array when the template
+/// `$1` in the template binds one bytea, or a bytea array when the template
 /// unnests it. `what` names the method in logs.
 pub(crate) async fn read_accounts(
     state: &CloudbreakRpcState,
@@ -331,21 +330,31 @@ async fn fetch_accounts(
     slot: u64,
     what: &str,
 ) -> Result<Vec<PgRow>, RpcError> {
-    let keys_literal = if sql_template.contains("unnest($1)") {
-        bytea_array_literal(keys)
-    } else {
-        bytea_literal(&keys[0])
+    let traceparent = db_query::traceparent_comment();
+    let sql = match &traceparent {
+        Some(comment) => format!("{comment} {sql_template}"),
+        None => sql_template.to_string(),
     };
-    let sql = sql_template.replace("$1", &keys_literal);
-    let sql = sql.replace("$2", &slot.to_string());
-    let sql = db_query::add_trace_traceparent_to_query(&sql);
 
     tracing::debug!(target: "account_sql", "## {what} sql: {}", sql);
+
+    // A traced query has unique text, so caching its statement would only evict others.
+    let query = sqlx::query(&sql).persistent(traceparent.is_none());
+    let query = if sql_template.contains("unnest($1)") {
+        query.bind(
+            keys.iter()
+                .map(|key| key.to_bytes().to_vec())
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        query.bind(keys[0].to_bytes().to_vec())
+    };
+    let query = query.bind(slot as i64);
 
     let pool = state.database.get_postgres_connection_pool();
     timeout(state.queries_timeout, async {
         let span = tracing::info_span!("account_db", method = what);
-        sqlx::raw_sql(&sql).fetch_all(pool).instrument(span).await
+        query.fetch_all(pool).instrument(span).await
     })
     .await
     .map_err(|_elapsed| {
