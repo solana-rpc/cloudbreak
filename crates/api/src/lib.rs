@@ -207,6 +207,8 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
         query_tracker_client,
         indexer_filter,
         batch_handling_max_concurrency,
+        config.server.max_request_body_size,
+        config.server.max_batch_requests,
         gpa_stream_batch_size,
         request_timeout,
         config.processed_commitment,

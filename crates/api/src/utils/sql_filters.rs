@@ -5,7 +5,7 @@
 
 //! Translates gPA filters into SQL predicates on `accounts` and `snapshot_accounts`.
 
-use cloudbreak_core::modules::rpc_filter_type::{Memcmp, RpcFilterType};
+use cloudbreak_core::modules::rpc_filter_type::{Memcmp, RpcFilterType, memcmp_fits_account};
 use solana_pubkey::Pubkey;
 
 use crate::error::RpcError;
@@ -13,6 +13,9 @@ use cloudbreak_core::utils::token::{
     TOKEN_ACCOUNT_DELEGATE_OFFSET, TOKEN_ACCOUNT_DELEGATE_TAG_OFFSET, TOKEN_ACCOUNT_MINT_OFFSET,
     TOKEN_ACCOUNT_OWNER_OFFSET, is_token_program,
 };
+
+/// Agave's limit on the filters of one gPA.
+const MAX_GET_PROGRAM_ACCOUNT_FILTERS: usize = 4;
 
 /// The SQL filter clauses of one gPA, for both tables, and its metric label.
 #[derive(Debug, PartialEq, Eq)]
@@ -46,6 +49,11 @@ impl SqlFilters {
         filters: &[RpcFilterType],
         label: &str,
     ) -> Result<Self, RpcError> {
+        if filters.len() > MAX_GET_PROGRAM_ACCOUNT_FILTERS {
+            return Err(RpcError::InvalidParamsWithMessage(format!(
+                "Too many filters provided; max {MAX_GET_PROGRAM_ACCOUNT_FILTERS}"
+            )));
+        }
         for filter in filters {
             filter.verify().map_err(|e| {
                 RpcError::InvalidParamsWithMessage(format!(
@@ -167,6 +175,11 @@ fn filter_sql(
                         None,
                     ));
                 }
+            }
+
+            // No account is larger than the limit, so Agave returns no match for this memcmp.
+            if !memcmp_fits_account(memcmp) {
+                return Some(("FALSE".to_string(), None));
             }
 
             Some((
@@ -365,5 +378,41 @@ mod tests {
             sql.accounts.replace("accounts.", "snapshot_accounts.")
         );
         assert_eq!(sql.params, vec![vec![1, 2, 3], vec![9]]);
+    }
+
+    #[test]
+    fn a_memcmp_past_the_largest_account_matches_nothing() {
+        use cloudbreak_core::modules::rpc_filter_type::MAX_ACCOUNT_DATA_LEN;
+        let last = MAX_ACCOUNT_DATA_LEN - 4;
+        assert_eq!(
+            sql(memcmp(last, &[1; 4]), false),
+            format!("SUBSTRING(accounts.data FROM {} FOR 4) = $1", last + 1)
+        );
+        for offset in [last + 1, 1 << 31, 1 << 63, usize::MAX - 3, usize::MAX] {
+            assert_eq!(sql(memcmp(offset, &[1; 4]), false), "FALSE");
+            assert_eq!(bound(memcmp(offset, &[1; 4]), false), None);
+        }
+        let built = SqlFilters::build(
+            &Pubkey::new_unique(),
+            &[memcmp(usize::MAX, &[1]), memcmp(0, &[2])],
+            "gpa",
+        )
+        .unwrap();
+        assert_eq!(built.params, vec![vec![2]]);
+        assert!(built.accounts.contains("FALSE"));
+        assert!(built.accounts.contains("= $1"));
+    }
+
+    #[test]
+    fn more_than_four_filters_is_invalid_params() {
+        let program = Pubkey::new_unique();
+        let four = vec![RpcFilterType::DataSize(165); 4];
+        assert!(SqlFilters::build(&program, &four, "gpa").is_ok());
+        let five = vec![RpcFilterType::DataSize(165); 5];
+        let err = SqlFilters::build(&program, &five, "gpa").unwrap_err();
+        assert!(matches!(
+            err,
+            RpcError::InvalidParamsWithMessage(ref m) if m == "Too many filters provided; max 4"
+        ));
     }
 }

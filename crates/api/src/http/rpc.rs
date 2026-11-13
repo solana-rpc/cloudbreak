@@ -38,8 +38,16 @@ pub async fn handle_rpc_request(
     state: Arc<CloudbreakRpcState>,
     ctx: &Arc<RequestContext>,
 ) -> HttpHandlerResponse {
-    let body = match http_body_util::BodyExt::collect(req.into_body()).await {
+    let body = http_body_util::Limited::new(req.into_body(), state.max_request_body_size);
+    let body = match http_body_util::BodyExt::collect(body).await {
         Ok(collected) => collected.to_bytes(),
+        // Same status and text as Agave.
+        Err(e) if e.is::<http_body_util::LengthLimitError>() => {
+            return HttpHandlerResponse {
+                status: StatusCode::PAYLOAD_TOO_LARGE,
+                body: ResponseBody::Buffered(b"request body size exceeds allowed maximum".to_vec()),
+            };
+        }
         Err(e) => {
             tracing::debug!("Failed to read request body: {e}");
             return make_rpc_error_response(serde_json::Value::Null, &RpcError::ParseError);
@@ -69,6 +77,16 @@ async fn process_batch(
     metrics::CLOUDBREAK_API_BATCH_REQUESTS
         .with_label_values(&[metrics::batch_size_bucket(batch_size)])
         .inc();
+    if batch_size > state.max_batch_requests {
+        return make_error_response(
+            serde_json::Value::Null,
+            -32600,
+            format!(
+                "Invalid request: batch of {batch_size} exceeds the maximum of {}",
+                state.max_batch_requests
+            ),
+        );
+    }
 
     let semaphore = Arc::new(tokio::sync::Semaphore::new(
         state.batch_handling_max_concurrency,
@@ -79,15 +97,21 @@ async fn process_batch(
         let state = state.clone();
         let ctx = ctx.clone();
         let sem = semaphore.clone();
-        handles.push(tokio::spawn(async move {
+        let id = req.id.clone();
+        let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
             process_single_request(req, &state, &ctx, true).await
-        }));
+        });
+        handles.push((id, handle));
     }
 
+    // A failed entry task answers its own entry with an internal error, not the whole batch.
     let mut all_results = Vec::with_capacity(batch_size);
-    for handle in handles {
-        all_results.push(handle.await.unwrap());
+    for (id, handle) in handles {
+        all_results.push(handle.await.unwrap_or_else(|e| {
+            tracing::error!("batch entry task failed: {e}");
+            make_rpc_error_response(id, &RpcError::InternalError)
+        }));
     }
 
     let responses: Vec<serde_json::Value> = all_results
@@ -134,7 +158,10 @@ async fn process_single_request(
         }
         "getSlot" => {
             let config: Option<RpcGetSlotConfig> =
-                extract_param(&rpc_request.params, 0).ok().flatten();
+                match extract_optional_param(&rpc_request.params, 0) {
+                    Ok(config) => config,
+                    Err(e) => return make_error_response(id, -32602, e),
+                };
             let slot = methods::slot::get_slot(state, config).await;
 
             json_serialize_response(id, slot, ctx).await
@@ -152,13 +179,19 @@ async fn process_single_request(
         // Unsupported or disabled optional methods fall through to the method-not-found arm.
         "getVoteAccounts" if state.vote_accounts_supported => {
             let config: Option<methods::vote_accounts::GetVoteAccountsConfig> =
-                extract_param(&rpc_request.params, 0).ok().flatten();
+                match extract_optional_param(&rpc_request.params, 0) {
+                    Ok(config) => config,
+                    Err(e) => return make_error_response(id, -32602, e),
+                };
             let result = methods::vote_accounts::get_vote_accounts(state, config).await;
             json_serialize_response(id, result, ctx).await
         }
         "getSupply" if state.supply_enabled => {
             let config: Option<RpcSupplyConfig> =
-                extract_param(&rpc_request.params, 0).ok().flatten();
+                match extract_optional_param(&rpc_request.params, 0) {
+                    Ok(config) => config,
+                    Err(e) => return make_error_response(id, -32602, e),
+                };
             let result = methods::get_supply::get_supply(state, config).await;
             json_serialize_response(id, result, ctx).await
         }
@@ -168,7 +201,10 @@ async fn process_single_request(
                 Err(e) => return make_error_response(id, -32602, e),
             };
             let config: Option<RpcSimulateTransactionConfig> =
-                extract_param(&rpc_request.params, 1).ok().flatten();
+                match extract_optional_param(&rpc_request.params, 1) {
+                    Ok(config) => config,
+                    Err(e) => return make_error_response(id, -32602, e),
+                };
             let result =
                 methods::simulate_transaction::simulate_transaction(state, transaction, config)
                     .await;
@@ -182,7 +218,10 @@ async fn process_single_request(
                 Err(e) => return make_error_response(id, -32602, e),
             };
             let config: Option<RpcAccountInfoConfig> =
-                extract_param(&rpc_request.params, 1).ok().flatten();
+                match extract_optional_param(&rpc_request.params, 1) {
+                    Ok(config) => config,
+                    Err(e) => return make_error_response(id, -32602, e),
+                };
 
             let result = methods::get_account_info::get_account_info(state, pubkey, config).await;
 
@@ -212,7 +251,10 @@ async fn process_single_request(
                 Err(e) => return make_error_response(id, -32602, e),
             };
             let config: Option<RpcContextConfig> =
-                extract_param(&rpc_request.params, 1).ok().flatten();
+                match extract_optional_param(&rpc_request.params, 1) {
+                    Ok(config) => config,
+                    Err(e) => return make_error_response(id, -32602, e),
+                };
 
             let result = methods::get_balance::get_balance(state, pubkey, config).await;
 
@@ -245,7 +287,10 @@ async fn process_single_request(
                 Err(e) => return make_error_response(id, -32602, e),
             };
             let config: Option<RpcAccountInfoConfig> =
-                extract_param(&rpc_request.params, 1).ok().flatten();
+                match extract_optional_param(&rpc_request.params, 1) {
+                    Ok(config) => config,
+                    Err(e) => return make_error_response(id, -32602, e),
+                };
 
             let result =
                 methods::get_multiple_accounts::get_multiple_accounts(state, pubkeys, config).await;
@@ -283,7 +328,10 @@ async fn process_single_request(
                 Err(e) => return make_error_response(id, -32602, e),
             };
             let config: Option<RpcProgramAccountsConfig> =
-                extract_param(&rpc_request.params, 1).ok().flatten();
+                match extract_optional_param(&rpc_request.params, 1) {
+                    Ok(config) => config,
+                    Err(e) => return make_error_response(id, -32602, e),
+                };
             let mint_resolver = MintResolver::new(
                 state,
                 &program,
@@ -345,7 +393,10 @@ async fn process_single_request(
                 Err(e) => return make_error_response(id, -32602, e),
             };
             let config: Option<get_token_accounts_by_mint::GetTokenAccountsByMintConfig> =
-                extract_param(&rpc_request.params, 1).ok().flatten();
+                match extract_optional_param(&rpc_request.params, 1) {
+                    Ok(config) => config,
+                    Err(e) => return make_error_response(id, -32602, e),
+                };
 
             let gpa_response = match get_token_accounts_by_mint::get_token_accounts_by_mint(
                 state, mint, config,
@@ -398,7 +449,10 @@ async fn process_single_request(
             };
             // Agave: only a CommitmentConfig is accepted here (no minContextSlot).
             let commitment: Option<CommitmentConfig> =
-                extract_param(&rpc_request.params, 1).ok().flatten();
+                match extract_optional_param(&rpc_request.params, 1) {
+                    Ok(config) => config,
+                    Err(e) => return make_error_response(id, -32602, e),
+                };
 
             let result = methods::get_token_account_balance::get_token_account_balance(
                 state, pubkey, commitment,
@@ -439,7 +493,10 @@ async fn process_single_request(
             };
 
             let commitment: Option<CommitmentConfig> =
-                extract_param(&rpc_request.params, 1).ok().flatten();
+                match extract_optional_param(&rpc_request.params, 1) {
+                    Ok(config) => config,
+                    Err(e) => return make_error_response(id, -32602, e),
+                };
 
             let result =
                 methods::get_token_supply::get_token_supply(state, pubkey, commitment).await;
@@ -524,7 +581,10 @@ async fn process_single_request(
                 Err(e) => return make_error_response(id, -32602, e),
             };
             let commitment: Option<CommitmentConfig> =
-                extract_param(&rpc_request.params, 1).ok().flatten();
+                match extract_optional_param(&rpc_request.params, 1) {
+                    Ok(config) => config,
+                    Err(e) => return make_error_response(id, -32602, e),
+                };
 
             let result = methods::get_token_largest_accounts::get_token_largest_accounts(
                 state, pubkey, commitment,
@@ -568,7 +628,10 @@ async fn process_single_request(
                 Err(e) => return make_error_response(id, -32602, e),
             };
             let config: Option<RpcAccountInfoConfig> =
-                extract_param(&rpc_request.params, 2).ok().flatten();
+                match extract_optional_param(&rpc_request.params, 2) {
+                    Ok(config) => config,
+                    Err(e) => return make_error_response(id, -32602, e),
+                };
 
             let gpa_response = match get_token_accounts_by_owner::get_token_accounts_by_owner(
                 state, owner, filter, config,
@@ -624,7 +687,10 @@ async fn process_single_request(
                 Err(e) => return make_error_response(id, -32602, e),
             };
             let config: Option<RpcAccountInfoConfig> =
-                extract_param(&rpc_request.params, 2).ok().flatten();
+                match extract_optional_param(&rpc_request.params, 2) {
+                    Ok(config) => config,
+                    Err(e) => return make_error_response(id, -32602, e),
+                };
 
             let gpa_response = match get_token_accounts_by_delegate::get_token_accounts_by_delegate(
                 state, delegate, filter, config,

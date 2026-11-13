@@ -8,6 +8,8 @@ max-connections = 100
 # gpa-stream-batch-size = 1000
 request-timeout = "60s"
 max-multiple-accounts = 100
+# max-request-body-size = 51200
+# max-batch-requests = 100
 
 [database]
 url = "postgres://cloudbreak:cloudbreak@localhost:5432/cloudbreak"

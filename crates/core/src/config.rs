@@ -652,6 +652,18 @@ pub struct ServerConfig {
         default = "ServerConfig::default_max_multiple_accounts"
     )]
     pub max_multiple_accounts: usize,
+    /// Largest accepted request body in bytes. A larger body gets HTTP 413.
+    #[serde(
+        rename = "max-request-body-size",
+        default = "ServerConfig::default_max_request_body_size"
+    )]
+    pub max_request_body_size: usize,
+    /// Most requests accepted in one JSON-RPC batch.
+    #[serde(
+        rename = "max-batch-requests",
+        default = "ServerConfig::default_max_batch_requests"
+    )]
+    pub max_batch_requests: usize,
 }
 
 impl ServerConfig {
@@ -668,6 +680,15 @@ impl ServerConfig {
     }
 
     pub const fn default_max_multiple_accounts() -> usize {
+        100
+    }
+
+    /// Agave's `MAX_REQUEST_BODY_SIZE`.
+    pub const fn default_max_request_body_size() -> usize {
+        50 * 1024
+    }
+
+    pub const fn default_max_batch_requests() -> usize {
         100
     }
 }
@@ -1426,9 +1447,23 @@ pub struct QueryTrackerConfig {
         deserialize_with = "deserialize_duration_required"
     )]
     pub explain_interval: Duration,
+
+    // ---- ingest -----------------------------------------------------------
+    /// Largest accepted `POST /track` body in bytes. A larger body gets HTTP 413.
+    #[serde(
+        rename = "max-track-body-size",
+        default = "QueryTrackerConfig::default_max_track_body_size"
+    )]
+    pub max_track_body_size: usize,
 }
 
 impl QueryTrackerConfig {
+    /// Each observation carries one gPA config of at most `max-request-body-size` and 256 fingerprints.
+    /// 64 MiB holds a default batch of 1000 such observations.
+    pub const fn default_max_track_body_size() -> usize {
+        64 * 1024 * 1024
+    }
+
     fn default_index_min_age_grace() -> Duration {
         Duration::from_secs(3600)
     }
@@ -1567,6 +1602,7 @@ impl Default for QueryTrackerConfig {
             discrepancy_delta: Self::default_discrepancy_delta(),
             explain_enabled: Self::default_explain_enabled(),
             explain_interval: Self::default_explain_interval(),
+            max_track_body_size: Self::default_max_track_body_size(),
         }
     }
 }

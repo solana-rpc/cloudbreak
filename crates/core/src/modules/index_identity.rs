@@ -22,7 +22,9 @@
 //! approximately (see the query tracker's `variety` module); the fingerprint for
 //! that is produced by [`IndexIdentity::value_fingerprint`].
 
-use crate::modules::rpc_filter_type::{RpcFilterType, RpcProgramAccountsConfig};
+use crate::modules::rpc_filter_type::{
+    RpcFilterType, RpcProgramAccountsConfig, memcmp_fits_account,
+};
 use serde::{Deserialize, Serialize};
 use solana_pubkey::Pubkey;
 
@@ -81,6 +83,10 @@ impl IndexIdentity {
             match filter {
                 RpcFilterType::DataSize(size) => datasize = Some(*size),
                 RpcFilterType::Memcmp(memcmp) => {
+                    // A memcmp past the largest account matches nothing, so no index serves it.
+                    if !memcmp_fits_account(memcmp) {
+                        return None;
+                    }
                     let bytes = memcmp.bytes()?;
                     offsets_lengths.push((memcmp.offset() as u64, bytes.len() as u64));
                 }
@@ -241,6 +247,18 @@ mod tests {
         RpcProgramAccountsConfig {
             filters: Some(filters),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn memcmp_past_the_largest_account_is_not_indexable() {
+        use crate::modules::rpc_filter_type::MAX_ACCOUNT_DATA_LEN;
+        let memcmp = |offset| RpcFilterType::Memcmp(Memcmp::new_raw_bytes(offset, vec![1; 4]));
+        let last = MAX_ACCOUNT_DATA_LEN - 4;
+        assert!(IndexIdentity::parse(program(), Some(&cfg(vec![memcmp(last)]))).is_some());
+        for offset in [last + 1, usize::MAX] {
+            let id = IndexIdentity::parse(program(), Some(&cfg(vec![memcmp(offset)])));
+            assert!(id.is_none(), "offset {offset}");
         }
     }
 
