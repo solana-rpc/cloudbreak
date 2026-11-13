@@ -267,6 +267,7 @@ impl SelfHealingState {
                     metrics: config.metrics.clone(),
                     programs: config.programs.clone(),
                     pg_indexes: snapshot_config.pg_indexes.clone(),
+                    vote_accounts: config.vote_accounts.clone(),
                 };
 
                 let snapshot_pair = match fetch_snapshot_pair_for_gap_filling(

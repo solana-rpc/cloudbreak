@@ -214,7 +214,9 @@ async fn process_downloaded_snapshot(
         bank_info,
     } = sidecar::unpack_compressed_snapshot(path, &base_dir, snapshot_data.slot)?;
 
-    if let Err(e) = db_queries::persist_epoch_stakes(database, &stake_data).await {
+    if config.vote_accounts_enabled()
+        && let Err(e) = db_queries::persist_epoch_stakes(database, &stake_data).await
+    {
         tracing::error!("Failed to persist epoch stakes from snapshot: {:?}", e);
     }
 

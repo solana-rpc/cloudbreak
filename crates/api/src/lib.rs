@@ -129,7 +129,9 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
         token_largest_accounts.enabled
     );
 
-    let vote_accounts_supported = indexer_filter.supports_vote_accounts();
+    // Needs the section on and the Vote and Stake accounts in the index.
+    let vote_accounts_supported =
+        config.vote_accounts_enabled() && indexer_filter.supports_vote_accounts();
     let stakes_cache: vote_accounts_cache::SharedStakesSnapshot = Arc::new(RwLock::new(Arc::new(
         vote_accounts_cache::StakesSnapshot::empty(),
     )));
@@ -155,11 +157,13 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
         }
         vote_accounts_cache::spawn_poll_task(database.clone(), stakes_cache.clone());
         info!("getVoteAccounts: supported=true (Vote+Stake programs are indexed)");
-    } else {
-        info!(
-            "getVoteAccounts: supported=false (Vote and/or Stake programs are not in the \
-             indexer's filter set)"
+    } else if config.vote_accounts_enabled() {
+        tracing::warn!(
+            "getVoteAccounts: supported=false ([vote-accounts] is on, but the Vote and/or \
+             Stake programs are not in the indexer's filter set)"
         );
+    } else {
+        info!("getVoteAccounts: supported=false ([vote-accounts] is off)");
     }
 
     let supply_enabled = config.supply_enabled();

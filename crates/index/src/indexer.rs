@@ -120,6 +120,10 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
     if let Some(mint_cache) = &config.mint_cache {
         mint_cache.check_required_indexer_modules(&config)?;
     }
+    // The epoch-stakes recomputer for getVoteAccounts reads every Vote and Stake account.
+    if let Some(vote_accounts) = &config.vote_accounts {
+        vote_accounts.check_required_indexer_modules(&config)?;
+    }
     let mint_cache = MintCache::from_indexer_config(config.mint_cache.as_ref());
 
     // Service health is tracked as a set of reasons (Startup is set until the startup snapshot is

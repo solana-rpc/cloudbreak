@@ -440,6 +440,33 @@ pub struct IndexConfig {
     /// with `enabled = true`. Requires `[snapshot]` and both token programs indexed.
     #[serde(rename = "mint-cache")]
     pub mint_cache: Option<MintCacheConfig>,
+    /// The indexer seeds `epoch_stakes` from the snapshot and runs the epoch-stakes recomputer
+    /// when this section is present with `enabled = true`. Requires Vote and Stake indexed.
+    #[serde(rename = "vote-accounts", default)]
+    pub vote_accounts: Option<VoteAccountsConfig>,
+}
+
+/// The `[vote-accounts]` section of the indexer, the snapshot processor and the API
+/// (`getVoteAccounts`). Off unless it is present with `enabled = true`.
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct VoteAccountsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl VoteAccountsConfig {
+    /// On the indexer, the recomputer reads every indexed Vote and Stake account.
+    pub fn check_required_indexer_modules(&self, config: &IndexConfig) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            config.programs.supports_vote_accounts(),
+            "vote-accounts requires the Vote and Stake programs in the [programs] filter"
+        );
+        Ok(())
+    }
 }
 
 /// The `[supply]` section. Enabled by presence with `enabled = true`.
@@ -576,6 +603,10 @@ impl IndexConfig {
     pub fn mint_cache_enabled(&self) -> bool {
         self.mint_cache.as_ref().is_some_and(|mints| mints.enabled)
     }
+
+    pub fn vote_accounts_enabled(&self) -> bool {
+        self.vote_accounts.as_ref().is_some_and(|vote| vote.enabled)
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -619,9 +650,18 @@ pub struct SnapshotConfig {
     /// Enable/disable flags for indexes created on `snapshot_accounts` after ingest.
     #[serde(rename = "pg-indexes", default)]
     pub pg_indexes: SnapshotPgIndexesConfig,
+    /// Seeds `epoch_stakes` from the snapshot when present with `enabled = true`.
+    #[serde(rename = "vote-accounts", default)]
+    pub vote_accounts: Option<VoteAccountsConfig>,
 }
 
 impl TryLoadConfig for SnapshotConfig {}
+
+impl SnapshotConfig {
+    pub fn vote_accounts_enabled(&self) -> bool {
+        self.vote_accounts.as_ref().is_some_and(|vote| vote.enabled)
+    }
+}
 
 #[derive(Deserialize, Debug)]
 pub struct ServerConfig {
@@ -782,6 +822,10 @@ pub struct ApiConfig {
     /// and the indexer's `[mint-cache]`.
     #[serde(rename = "mint-cache", default)]
     pub mint_cache: Option<MintCacheConfig>,
+    /// Serves getVoteAccounts from `epoch_stakes`. Set it together with the indexer's
+    /// `[vote-accounts]` section.
+    #[serde(rename = "vote-accounts", default)]
+    pub vote_accounts: Option<VoteAccountsConfig>,
 }
 
 /// The Yellowstone gRPC endpoint of the API feed. See `modules::grpc`. The connection knobs
@@ -1592,6 +1636,10 @@ impl ApiConfig {
         self.supply.as_ref().is_some_and(|supply| supply.enabled)
     }
 
+    pub fn vote_accounts_enabled(&self) -> bool {
+        self.vote_accounts.as_ref().is_some_and(|vote| vote.enabled)
+    }
+
     pub fn processed_accounts_enabled(&self) -> bool {
         self.processed_accounts
             .as_ref()
@@ -1987,5 +2035,46 @@ url = "postgres://localhost/cloudbreak"
         assert!(config.mint_cache_enabled());
         let config = api_config("[mint-cache]\nenabled = false\n").unwrap();
         assert!(!config.mint_cache_enabled());
+    }
+
+    #[test]
+    fn vote_accounts_is_off_unless_enabled() {
+        assert!(!api_config("").unwrap().vote_accounts_enabled());
+        assert!(
+            !api_config("[vote-accounts]\nenabled = false\n")
+                .unwrap()
+                .vote_accounts_enabled()
+        );
+        assert!(
+            api_config("[vote-accounts]\nenabled = true\n")
+                .unwrap()
+                .vote_accounts_enabled()
+        );
+        let err = api_config("[vote-accounts]\nenabled = true\ninterval = 1\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown field"), "{err}");
+    }
+
+    #[test]
+    fn indexer_vote_accounts_requires_vote_and_stake_indexed() {
+        let mut config: IndexConfig = toml::from_str(&format!(
+            "{}\n[vote-accounts]\nenabled = true\n",
+            include_str!("../../../example.cloudbreak.index.toml")
+        ))
+        .unwrap();
+        assert!(config.vote_accounts_enabled());
+        let vote = config.vote_accounts.clone().unwrap();
+        // The example filters [programs] to Stake.
+        let err = vote
+            .check_required_indexer_modules(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Vote and Stake"), "{err}");
+        config.programs = AccountSelectorConfig::default();
+        vote.check_required_indexer_modules(&config).unwrap();
+        let off = VoteAccountsConfig { enabled: false };
+        config.programs.include = vec![PubkeyDef(STAKE_PROGRAM_ID)];
+        off.check_required_indexer_modules(&config).unwrap();
     }
 }

@@ -90,6 +90,12 @@ span-filter = [
 # [supply]
 # enabled = false
 
+# Serves getVoteAccounts from epoch_stakes. Set it together with the indexer's
+# [vote-accounts] section; a disabled node answers getVoteAccounts with
+# method-not-found.
+# [vote-accounts]
+# enabled = false
+
 # Slots arrive by Postgres LISTEN/NOTIFY on `cloudbreak_slots`.
 [slot-syncronizer]
 enabled = false
