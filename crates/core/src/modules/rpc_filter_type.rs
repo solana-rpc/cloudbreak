@@ -45,9 +45,22 @@ impl RpcFilterType {
                 solana_rpc_client_api::filter::RpcFilterType::Memcmp(memcmp.clone()).verify()?,
             ),
             RpcFilterType::TokenAccountState => Ok(()),
-            RpcFilterType::ValueCmp(_) => Ok(()),
+            RpcFilterType::ValueCmp(cmp) => cmp.verify(),
         }
     }
+}
+
+/// The largest account data size, the system program's `MAX_PERMITTED_DATA_LENGTH`.
+pub const MAX_ACCOUNT_DATA_LEN: usize = 10 * 1024 * 1024;
+
+/// True when `memcmp` ends within the largest account data size, so an account can match it.
+pub fn memcmp_fits_account(memcmp: &Memcmp) -> bool {
+    memcmp.bytes().is_some_and(|bytes| {
+        memcmp
+            .offset()
+            .checked_add(bytes.len())
+            .is_some_and(|end| end <= MAX_ACCOUNT_DATA_LEN)
+    })
 }
 
 /// Returns `true` if any of the filters is a [`RpcFilterType::ValueCmp`]. Used
@@ -114,12 +127,33 @@ pub enum ValueType {
     U128,
 }
 
+impl ValueType {
+    fn size(&self) -> usize {
+        match self {
+            ValueType::U8 => 1,
+            ValueType::U16 => 2,
+            ValueType::U32 => 4,
+            ValueType::U64 => 8,
+            ValueType::U128 => 16,
+        }
+    }
+}
+
 enum WrappedValueType {
     U8(u8),
     U16(u16),
     U32(u32),
     U64(u64),
     U128(u128),
+}
+
+/// The `N` bytes of `data` at `offset`, or `InvalidValueCmp` when they are out of bounds.
+fn read_bytes<const N: usize>(data: &[u8], offset: usize) -> Result<[u8; N], RpcFilterError> {
+    offset
+        .checked_add(N)
+        .and_then(|end| data.get(offset..end))
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or(RpcFilterError::InvalidValueCmp)
 }
 
 impl ValueCmp {
@@ -131,52 +165,41 @@ impl ValueCmp {
         }
     }
 
+    /// Rejects a memory operand that ends past the largest account data size.
+    fn verify(&self) -> Result<(), RpcFilterError> {
+        for operand in [&self.left, &self.right] {
+            if let Operand::Mem { offset, value_type } = operand {
+                offset
+                    .checked_add(value_type.size())
+                    .filter(|end| *end <= MAX_ACCOUNT_DATA_LEN)
+                    .ok_or(RpcFilterError::InvalidValueCmp)?;
+            }
+        }
+        Ok(())
+    }
+
     fn parse_mem_into_value_type(
         o: &Operand,
         data: &[u8],
     ) -> Result<WrappedValueType, RpcFilterError> {
         match o {
-            Operand::Mem { offset, value_type } => match value_type {
+            Operand::Mem { offset, value_type } => Ok(match value_type {
                 ValueType::U8 => {
-                    if *offset >= data.len() {
-                        return Err(RpcFilterError::InvalidValueCmp);
-                    }
-
-                    Ok(WrappedValueType::U8(data[*offset]))
+                    WrappedValueType::U8(u8::from_le_bytes(read_bytes(data, *offset)?))
                 }
                 ValueType::U16 => {
-                    if *offset + 1 >= data.len() {
-                        return Err(RpcFilterError::InvalidValueCmp);
-                    }
-                    Ok(WrappedValueType::U16(u16::from_le_bytes(
-                        data[*offset..*offset + 2].try_into().unwrap(),
-                    )))
+                    WrappedValueType::U16(u16::from_le_bytes(read_bytes(data, *offset)?))
                 }
                 ValueType::U32 => {
-                    if *offset + 3 >= data.len() {
-                        return Err(RpcFilterError::InvalidValueCmp);
-                    }
-                    Ok(WrappedValueType::U32(u32::from_le_bytes(
-                        data[*offset..*offset + 4].try_into().unwrap(),
-                    )))
+                    WrappedValueType::U32(u32::from_le_bytes(read_bytes(data, *offset)?))
                 }
                 ValueType::U64 => {
-                    if *offset + 7 >= data.len() {
-                        return Err(RpcFilterError::InvalidValueCmp);
-                    }
-                    Ok(WrappedValueType::U64(u64::from_le_bytes(
-                        data[*offset..*offset + 8].try_into().unwrap(),
-                    )))
+                    WrappedValueType::U64(u64::from_le_bytes(read_bytes(data, *offset)?))
                 }
                 ValueType::U128 => {
-                    if *offset + 15 >= data.len() {
-                        return Err(RpcFilterError::InvalidValueCmp);
-                    }
-                    Ok(WrappedValueType::U128(u128::from_le_bytes(
-                        data[*offset..*offset + 16].try_into().unwrap(),
-                    )))
+                    WrappedValueType::U128(u128::from_le_bytes(read_bytes(data, *offset)?))
                 }
-            },
+            }),
             _ => Err(RpcFilterError::InvalidValueCmp),
         }
     }
@@ -362,6 +385,108 @@ mod tests {
             Operand::Constant("0".to_string()),
         );
         assert!(cmp.values_match(&data).is_err());
+    }
+
+    fn value_types() -> [ValueType; 5] {
+        [
+            ValueType::U8,
+            ValueType::U16,
+            ValueType::U32,
+            ValueType::U64,
+            ValueType::U128,
+        ]
+    }
+
+    fn mem(offset: usize, value_type: ValueType) -> Operand {
+        Operand::Mem { offset, value_type }
+    }
+
+    #[test]
+    fn test_values_match_overflowing_offset_is_err() {
+        let data = [7u8; 64];
+        for value_type in value_types() {
+            for offset in (0..16).map(|k| usize::MAX - k).chain([1 << 31, 1 << 63]) {
+                let constant = ValueCmp::new(
+                    mem(offset, value_type.clone()),
+                    Comparator::Eq,
+                    Operand::Constant("0".to_string()),
+                );
+                assert!(constant.values_match(&data).is_err());
+
+                let both = ValueCmp::new(
+                    mem(0, value_type.clone()),
+                    Comparator::Eq,
+                    mem(offset, value_type.clone()),
+                );
+                assert!(both.values_match(&data).is_err());
+
+                let filters = [RpcFilterType::ValueCmp(constant)];
+                assert!(!account_matches_value_cmps(&filters, &data));
+            }
+        }
+    }
+
+    #[test]
+    fn test_values_match_last_value_in_data() {
+        let data = [7u8; 64];
+        for value_type in value_types() {
+            let last = data.len() - value_type.size();
+            let cmp = |offset| {
+                ValueCmp::new(
+                    mem(0, value_type.clone()),
+                    Comparator::Eq,
+                    mem(offset, value_type.clone()),
+                )
+            };
+            assert!(cmp(last).values_match(&data).unwrap());
+            assert!(cmp(last + 1).values_match(&data).is_err());
+        }
+    }
+
+    #[test]
+    fn test_verify_value_cmp_offset() {
+        let constant = || Operand::Constant("0".to_string());
+        for value_type in value_types() {
+            let last = MAX_ACCOUNT_DATA_LEN - value_type.size();
+            for (offset, valid) in [
+                (0, true),
+                (last, true),
+                (last + 1, false),
+                (usize::MAX, false),
+            ] {
+                let left = RpcFilterType::ValueCmp(ValueCmp::new(
+                    mem(offset, value_type.clone()),
+                    Comparator::Eq,
+                    constant(),
+                ));
+                let right = RpcFilterType::ValueCmp(ValueCmp::new(
+                    constant(),
+                    Comparator::Eq,
+                    mem(offset, value_type.clone()),
+                ));
+                for filter in [left, right] {
+                    let expected = if valid {
+                        Ok(())
+                    } else {
+                        Err(RpcFilterError::InvalidValueCmp)
+                    };
+                    assert_eq!(filter.verify(), expected, "{value_type:?} at {offset}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_verify_rejects_max_u64_offset_from_json() {
+        let json = r#"{
+            "valueCmp": {
+                "left": { "Mem": { "offset": 18446744073709551615, "value_type": "U16" } },
+                "comparator": "Eq",
+                "right": { "Constant": "0" }
+            }
+        }"#;
+        let filter: RpcFilterType = serde_json::from_str(json).unwrap();
+        assert_eq!(filter.verify(), Err(RpcFilterError::InvalidValueCmp));
     }
 
     #[test]
