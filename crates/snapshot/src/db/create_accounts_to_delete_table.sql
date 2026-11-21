@@ -7,6 +7,8 @@
 -- with the accounts to delete (which are the accounts that have multiple 
 -- versions in the temp_snapshot_account_versions table, and this table will
 -- contain all the older versions of the account)
+DROP TABLE IF EXISTS accounts_to_delete;
+
 CREATE UNLOGGED TABLE accounts_to_delete AS
 SELECT
     owner,
