@@ -61,17 +61,22 @@ pub struct AccountOwnerItem {
 
 impl AccountOwnerMap {
     pub fn new(db: DatabaseConnection, query_timeout: Duration) -> Self {
-        let accounts = Arc::new(RwLock::new(HashMap::new()));
-
-        ACCOUNTS_OWNER_MAP
-            .set(accounts.clone())
-            .expect("ACCOUNTS_OWNER_MAP already set");
-
         Self {
-            accounts: Some(accounts),
+            accounts: Some(Arc::new(RwLock::new(HashMap::new()))),
             db,
             query_timeout,
             changed_owners: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Registers this map for [`Self::debug_accounts_owner_map`]. A process registers one map.
+    ///
+    /// Note: if module is disabled, this will be a no-op
+    pub fn register_for_debug_endpoint(&self) {
+        if let Some(accounts) = &self.accounts {
+            ACCOUNTS_OWNER_MAP
+                .set(accounts.clone())
+                .expect("ACCOUNTS_OWNER_MAP already set");
         }
     }
 

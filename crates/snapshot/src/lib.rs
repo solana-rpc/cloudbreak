@@ -38,7 +38,7 @@ pub mod metrics;
 pub mod sidecar;
 pub mod stake_data;
 
-pub use db_queries::persist_epoch_stakes;
+pub use db_queries::{persist_epoch_stakes, upsert_accounts_batched};
 
 const DB_ACCOUNTS_BATCH_SIZE: usize = 200;
 

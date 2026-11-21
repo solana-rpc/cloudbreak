@@ -92,95 +92,11 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
     let (buffer_channel_tx, buffer_channel_rx) =
         tokio::sync::mpsc::channel(config.grpc.sources_channel_size);
 
-    let snapshot_processing_state = Arc::new(Mutex::new(SnapshotProcessingState::NotStarted));
-    let finalize_slot_buffer_size = Arc::new(Mutex::new(0));
-
-    let query_timeout = Duration::from_secs(config.database.save_block_queries_timeout);
-    let accounts_owner_map = if config.accounts_owner_map_enabled {
-        AccountOwnerMap::new(db.clone(), query_timeout)
-    } else {
-        AccountOwnerMap::default()
-    };
-
-    // Validates prerequisites and clears stale largest_accounts rows. Disabled
-    // tracker when neither largest-accounts section is enabled.
-    let largest_accounts = LargestAccountsTracker::from_config(&db, &config).await;
-
-    // The non-circulating tracker keeps the stake map and the membership set
-    // behind the getLargestAccounts class filter and the getSupply figures.
-    let non_circulating = NonCirculatingTracker::from_config(&db, &config).await;
-
-    // The supply tracker keeps the running total-supply figure for getSupply. It
-    // reads the previous balance from the stake map and a bounded hot-accounts
-    // cache, so it needs a full index, the owner map off, owner partitioning off,
-    // and the snapshot anchor. `from_config` validates all of it.
-    let supply_tracker = supply::persist::from_config(&db, &config, non_circulating.clone()).await;
-
-    // Fills `mints` after the snapshot load, then writes only real mint changes per block.
-    if let Some(mint_cache) = &config.mint_cache {
-        mint_cache.check_required_indexer_modules(&config)?;
-    }
-    // The epoch-stakes recomputer for getVoteAccounts reads every Vote and Stake account.
-    if let Some(vote_accounts) = &config.vote_accounts {
-        vote_accounts.check_required_indexer_modules(&config)?;
-    }
-    let mint_cache = MintCache::from_indexer_config(config.mint_cache.as_ref());
-
-    // Service health is tracked as a set of reasons (Startup is set until the startup snapshot is
-    // processed; GapFill is set while a gap fill is in progress).
-    let health = ServiceHealth::new(db.clone());
-
-    let updated_accounts_during_startup =
-        UpdatedAccountsDuringStartup::new(snapshot_processing_state.clone(), health.clone());
-
-    let (prune_slot_tx, prune_slot_rx) = tokio::sync::watch::channel(0u64);
-    // No-op when neither largest-accounts section is enabled.
-    largest_accounts::spawn_largest_accounts_pruner(db.clone(), config.clone(), prune_slot_rx);
-
-    // The cache sweeper wakes on each finalize-slot change and evicts stale
-    // unpinned entries off the block path. No-op when supply is disabled.
-    supply::maintain::spawn_supply_cache_sweeper(
-        db.clone(),
-        supply_tracker.clone(),
-        prune_slot_tx.subscribe(),
-    );
-
-    // The finalize worker hands each slot's cleanup keys here and returns.
-    let cleanup = modules::cleanup::CleanupHandle::new(config.cleanup_interval_slots);
-    modules::cleanup::spawn_cleanup_drainer(
-        cleanup.clone(),
-        Arc::new(db.clone()),
-        updated_accounts_during_startup.clone(),
-        Duration::from_secs(config.database.finalize_slot_queries_timeout),
-        config.cleanup_batch_size,
-    );
-
-    let slot_finalizer = SlotFinalizer::spawn(
-        db.clone(),
-        config.clone(),
-        updated_accounts_during_startup.clone(),
-        health.clone(),
-        prune_slot_tx,
-        cleanup,
-    );
-
-    let indexer_state = IndexerState {
-        buffer_channel_rx_len: Arc::new(Mutex::new(buffer_channel_rx.len())),
-        snapshot_processing_state: snapshot_processing_state.clone(),
-        self_healing_state: SelfHealingState::new(
-            &config,
-            slot_finalizer.clone(),
-            supply_tracker.clone(),
-        ),
-        slot_finalizer,
-        updated_accounts_during_startup,
-        finalize_slot_buffer_size: finalize_slot_buffer_size.clone(),
-        accounts_owner_map,
-        largest_accounts,
-        non_circulating,
-        supply_tracker,
-        mint_cache,
-    };
+    let indexer_state =
+        IndexerState::new(db.clone(), config.clone(), buffer_channel_rx.len()).await?;
+    indexer_state
+        .accounts_owner_map
+        .register_for_debug_endpoint();
 
     // Used for the hash-checker to signal the main loop to stop
     let grpc_cancel = Arc::new(AtomicBool::new(false));
@@ -279,6 +195,107 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
     }
 
     Ok(())
+}
+
+impl IndexerState {
+    /// Builds the indexer's state and spawns its background workers: the slot finalizer, the cleanup
+    /// drainer, the largest-accounts pruner and the supply cache sweeper.
+    pub async fn new(
+        db: DatabaseConnection,
+        config: IndexConfig,
+        buffer_channel_rx_len: usize,
+    ) -> CloudbreakResult<Self> {
+        let snapshot_processing_state = Arc::new(Mutex::new(SnapshotProcessingState::NotStarted));
+        let finalize_slot_buffer_size = Arc::new(Mutex::new(0));
+
+        let query_timeout = Duration::from_secs(config.database.save_block_queries_timeout);
+        let accounts_owner_map = if config.accounts_owner_map_enabled {
+            AccountOwnerMap::new(db.clone(), query_timeout)
+        } else {
+            AccountOwnerMap::default()
+        };
+
+        // Validates prerequisites and clears stale largest_accounts rows. Disabled
+        // tracker when neither largest-accounts section is enabled.
+        let largest_accounts = LargestAccountsTracker::from_config(&db, &config).await;
+
+        // The non-circulating tracker keeps the stake map and the membership set
+        // behind the getLargestAccounts class filter and the getSupply figures.
+        let non_circulating = NonCirculatingTracker::from_config(&db, &config).await;
+
+        // The supply tracker keeps the running total-supply figure for getSupply. It
+        // reads the previous balance from the stake map and a bounded hot-accounts
+        // cache, so it needs a full index, the owner map off, owner partitioning off,
+        // and the snapshot anchor. `from_config` validates all of it.
+        let supply_tracker =
+            supply::persist::from_config(&db, &config, non_circulating.clone()).await;
+
+        // Fills `mints` after the snapshot load, then writes only real mint changes per block.
+        if let Some(mint_cache) = &config.mint_cache {
+            mint_cache.check_required_indexer_modules(&config)?;
+        }
+        // The epoch-stakes recomputer for getVoteAccounts reads every Vote and Stake account.
+        if let Some(vote_accounts) = &config.vote_accounts {
+            vote_accounts.check_required_indexer_modules(&config)?;
+        }
+        let mint_cache = MintCache::from_indexer_config(config.mint_cache.as_ref());
+
+        // Service health is tracked as a set of reasons (Startup is set until the startup snapshot is
+        // processed; GapFill is set while a gap fill is in progress).
+        let health = ServiceHealth::new(db.clone());
+
+        let updated_accounts_during_startup =
+            UpdatedAccountsDuringStartup::new(snapshot_processing_state.clone(), health.clone());
+
+        let (prune_slot_tx, prune_slot_rx) = tokio::sync::watch::channel(0u64);
+        // No-op when neither largest-accounts section is enabled.
+        largest_accounts::spawn_largest_accounts_pruner(db.clone(), config.clone(), prune_slot_rx);
+
+        // The cache sweeper wakes on each finalize-slot change and evicts stale
+        // unpinned entries off the block path. No-op when supply is disabled.
+        supply::maintain::spawn_supply_cache_sweeper(
+            db.clone(),
+            supply_tracker.clone(),
+            prune_slot_tx.subscribe(),
+        );
+
+        // The finalize worker hands each slot's cleanup keys here and returns.
+        let cleanup = modules::cleanup::CleanupHandle::new(config.cleanup_interval_slots);
+        modules::cleanup::spawn_cleanup_drainer(
+            cleanup.clone(),
+            Arc::new(db.clone()),
+            updated_accounts_during_startup.clone(),
+            Duration::from_secs(config.database.finalize_slot_queries_timeout),
+            config.cleanup_batch_size,
+        );
+
+        let slot_finalizer = SlotFinalizer::spawn(
+            db.clone(),
+            config.clone(),
+            updated_accounts_during_startup.clone(),
+            health.clone(),
+            prune_slot_tx,
+            cleanup,
+        );
+
+        Ok(Self {
+            buffer_channel_rx_len: Arc::new(Mutex::new(buffer_channel_rx_len)),
+            snapshot_processing_state: snapshot_processing_state.clone(),
+            self_healing_state: SelfHealingState::new(
+                &config,
+                slot_finalizer.clone(),
+                supply_tracker.clone(),
+            ),
+            slot_finalizer,
+            updated_accounts_during_startup,
+            finalize_slot_buffer_size: finalize_slot_buffer_size.clone(),
+            accounts_owner_map,
+            largest_accounts,
+            non_circulating,
+            supply_tracker,
+            mint_cache,
+        })
+    }
 }
 
 async fn main_loop(
