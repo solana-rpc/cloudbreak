@@ -102,7 +102,7 @@ enum History {
     /// the close row the indexer writes at `NEWER_SLOT`.
     ClosedAfterNoLongerSelected(Table, OwnerMap),
     /// A version the filters select at `OLDER_SLOT` in the table, then the same data under another program at
-    /// `NEWER_SLOT`. With the owner map on, the indexer also writes a close row under the first program.
+    /// `NEWER_SLOT`. The indexer also writes a close row under the first program.
     MovedToAnotherProgram(Table, OwnerMap),
     /// A version the filters select at `OLDER_SLOT` in the table, the same data under another program at
     /// `MIDDLE_SLOT`, then under the first program again at `NEWER_SLOT`.
@@ -112,10 +112,10 @@ enum History {
     ClosedAfterMovingToAnotherProgram(Table, OwnerMap),
 }
 
-/// The indexer's `accounts-owner-map-enabled`, which picks the statement that writes close rows.
+/// The indexer's `accounts-owner-map-enabled`, which picks the statements that write close rows.
 #[derive(Clone, Copy, Debug)]
 enum OwnerMap {
-    /// `insertClosedAccount.sql`, which reads the account's latest owner from both tables.
+    /// `insertClosedAccount.sql` and `insertMovedAccount.sql`, which read the account's owner from both tables.
     Off,
     /// `insertClosedAccountWithMap.sql`, with the owner the map holds.
     On,
@@ -788,49 +788,41 @@ async fn read_by_pubkey<T: DeserializeOwned>(
     History::ClosedAfterNoLongerSelected(Table::SnapshotAccounts, OwnerMap::On),
     Returned::Nothing
 )]
-#[ignore = "the older row is returned after a move to another program with the owner map off"]
 #[case::no_filter_moved_over_accounts_without_owner_map(
     Filter::None,
     History::MovedToAnotherProgram(Table::Accounts, OwnerMap::Off),
     Returned::Nothing
 )]
-#[ignore = "the older row is returned after a move to another program with the owner map off"]
 #[case::no_filter_moved_over_snapshot_without_owner_map(
     Filter::None,
     History::MovedToAnotherProgram(Table::SnapshotAccounts, OwnerMap::Off),
     Returned::Nothing
 )]
-#[ignore = "the older row is returned after a move to another program with the owner map off"]
 #[case::data_size_moved_over_accounts_without_owner_map(
     Filter::DataSize,
     History::MovedToAnotherProgram(Table::Accounts, OwnerMap::Off),
     Returned::Nothing
 )]
-#[ignore = "the older row is returned after a move to another program with the owner map off"]
 #[case::data_size_moved_over_snapshot_without_owner_map(
     Filter::DataSize,
     History::MovedToAnotherProgram(Table::SnapshotAccounts, OwnerMap::Off),
     Returned::Nothing
 )]
-#[ignore = "the older row is returned after a move to another program with the owner map off"]
 #[case::memcmp_moved_over_accounts_without_owner_map(
     Filter::Memcmp,
     History::MovedToAnotherProgram(Table::Accounts, OwnerMap::Off),
     Returned::Nothing
 )]
-#[ignore = "the older row is returned after a move to another program with the owner map off"]
 #[case::memcmp_moved_over_snapshot_without_owner_map(
     Filter::Memcmp,
     History::MovedToAnotherProgram(Table::SnapshotAccounts, OwnerMap::Off),
     Returned::Nothing
 )]
-#[ignore = "the older row is returned after a move to another program with the owner map off"]
 #[case::token_owner_moved_over_accounts_without_owner_map(
     Filter::TokenOwner,
     History::MovedToAnotherProgram(Table::Accounts, OwnerMap::Off),
     Returned::Nothing
 )]
-#[ignore = "the older row is returned after a move to another program with the owner map off"]
 #[case::token_owner_moved_over_snapshot_without_owner_map(
     Filter::TokenOwner,
     History::MovedToAnotherProgram(Table::SnapshotAccounts, OwnerMap::Off),
@@ -868,7 +860,6 @@ async fn get_program_accounts_answers_the_account_state_at_the_read_slot(
     Returned::MovedAccount
 )]
 #[case::moved_with_owner_map(History::MovedToAnotherProgram, OwnerMap::On, Returned::MovedAccount)]
-#[ignore = "the other program returns the account after it moved back with the owner map off"]
 #[case::moved_and_back_without_owner_map(
     History::MovedToAnotherProgramAndBack,
     OwnerMap::Off,

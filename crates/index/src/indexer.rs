@@ -35,7 +35,7 @@ use crate::modules::{
     hash_checker::{self, HashCheckerState},
     panic_handler,
 };
-use crate::{metrics, modules, operational_endpoints};
+use crate::{db_queries, metrics, modules, operational_endpoints};
 
 #[derive(Clone)]
 pub struct IndexerState {
@@ -56,6 +56,10 @@ pub struct IndexerState {
     pub finalize_slot_buffer_size: Arc<Mutex<usize>>,
     /// Used to track the accounts owner
     pub accounts_owner_map: AccountOwnerMap,
+    /// Whether the previous owner of the accounts a block wrote is read from the database, to
+    /// close the ones that moved to another program: the owner map is off and the `accounts`
+    /// primary key holds `owner`.
+    pub look_up_moved_accounts: bool,
     pub largest_accounts: LargestAccountsTracker,
     pub non_circulating: NonCirculatingTracker,
     pub supply_tracker: SupplyTracker,
@@ -214,6 +218,8 @@ impl IndexerState {
         } else {
             AccountOwnerMap::default()
         };
+        let look_up_moved_accounts = !config.accounts_owner_map_enabled
+            && db_queries::accounts_primary_key_has_owner(&db).await?;
 
         // Validates prerequisites and clears stale largest_accounts rows. Disabled
         // tracker when neither largest-accounts section is enabled.
@@ -290,6 +296,7 @@ impl IndexerState {
             updated_accounts_during_startup,
             finalize_slot_buffer_size: finalize_slot_buffer_size.clone(),
             accounts_owner_map,
+            look_up_moved_accounts,
             largest_accounts,
             non_circulating,
             supply_tracker,

@@ -34,6 +34,7 @@ pub async fn save_block(
         buffer_channel_rx_len: _,
         finalize_slot_buffer_size,
         accounts_owner_map,
+        look_up_moved_accounts,
         largest_accounts,
         non_circulating,
         supply_tracker,
@@ -71,6 +72,8 @@ pub async fn save_block(
     // Owners are only captured when the owner map is enabled; empty owners make the
     // finalize cleanup fall back to the no-owner SQL.
     let capture_owners = accounts_owner_map.is_enabled();
+    // Each written account's owner, which the moved-accounts lookup compares with the database's.
+    let mut written_owners_for_slot = Vec::new();
 
     metrics::record_new_accounts_in_slot(block.accounts.len(), "block_accounts_total");
 
@@ -161,6 +164,9 @@ pub async fn save_block(
         if capture_owners {
             updated_accounts_owners_for_slot.push(account.owner.clone());
         }
+        if look_up_moved_accounts {
+            written_owners_for_slot.push(account.owner.clone());
+        }
 
         current_chunk.push(accounts::ActiveModel {
             pubkey: Set(account.pubkey),
@@ -213,6 +219,10 @@ pub async fn save_block(
         == SnapshotProcessingState::Finished
         || snapshot_processing_state == SnapshotProcessingState::FinishedAndCleanedUp)
         .then(|| closed_accounts_for_slot.clone());
+    let written_accounts = look_up_moved_accounts.then(|| db_queries::WrittenAccounts {
+        pubkeys: updated_accounts_for_slot.clone(),
+        owners: written_owners_for_slot,
+    });
 
     // Record the block data in the finalizer map (keyed by slot). It is held there until the slot
     // is finalized (via a finalized notification or the ancestor walk). For snapshot-repaired
@@ -245,6 +255,7 @@ pub async fn save_block(
             db_queries::insert_closed_accounts(
                 db.clone(),
                 closed,
+                written_accounts,
                 slot,
                 &config,
                 accounts_owner_map,

@@ -8,8 +8,8 @@ use std::time::Duration;
 use cloudbreak_core::{IndexConfig, modules::account_owner_map::AccountOwnerMap};
 use cloudbreak_entity::{accounts, slots};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait, QueryFilter,
-    Statement, Value,
+    ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, DbErr, EntityTrait,
+    ExecResult, QueryFilter, Statement, TransactionTrait, Value,
 };
 use tokio::{
     task::JoinHandle,
@@ -45,15 +45,26 @@ pub async fn update_service_health(db: &DatabaseConnection, healthy: bool) {
 
 const INSERT_CLOSED_ACCOUNTS_BATCH_SIZE: usize = 500;
 
+/// The accounts a block wrote, each with its owner in that block.
+pub struct WrittenAccounts {
+    pub pubkeys: Vec<Vec<u8>>,
+    pub owners: Vec<Vec<u8>>,
+}
+
 /// Inserts the closed accounts into the "accounts" table.
 ///
 /// This is used to insert the closed accounts with empty data, 0 lamports and the current slot. But using the previous owner, so that
 /// it can provide and out of the box mask, for closed accounts at the confirmed commitment level(just checking lamports > 0).
 ///
 /// Note: If the `AccountOwnerMap` is enabled, the closed accounts will be saved using the `AccountOwnerMap` instead of the database scan.
+///
+/// An account that moved to another program is closed for its previous owner, and gets the same
+/// row under it. The map records those moves itself. `written` holds the accounts the block wrote
+/// when their previous owners are to be read from the database instead, and is `None` otherwise.
 pub fn insert_closed_accounts(
     db: DatabaseConnection,
     pubkeys: Vec<Vec<u8>>,
+    written: Option<WrittenAccounts>,
     slot: u64,
     config: &IndexConfig,
     accounts_owner_map: AccountOwnerMap,
@@ -79,6 +90,17 @@ pub fn insert_closed_accounts(
                 }
             }
         } else {
+            // The moved accounts are looked up while the closed accounts' batches run.
+            let written = written.filter(|written| !written.pubkeys.is_empty());
+            let moved_accounts_handle = written.map(|written| {
+                tokio::spawn(close_moved_accounts(
+                    db.clone(),
+                    written,
+                    slot,
+                    query_timeout,
+                ))
+            });
+
             let insert_closed_account_sql = include_str!("db/insertClosedAccount.sql");
 
             let batches = pubkeys
@@ -131,6 +153,17 @@ pub fn insert_closed_accounts(
                     }
                 }
             }
+
+            if let Some(handle) = moved_accounts_handle {
+                inserted &= handle.await.unwrap_or_else(|e| {
+                    tracing::error!(
+                        "insert_moved_account: the lookup for slot {} stopped: {}",
+                        slot,
+                        e
+                    );
+                    false
+                });
+            }
         }
 
         metrics::INSERT_CLOSED_ACCOUNTS_PER_SLOT_HISTOGRAM
@@ -140,6 +173,105 @@ pub fn insert_closed_accounts(
     });
 
     Some(handle)
+}
+
+/// Writes a close row under the previous owner of each written account that moved to another
+/// program, and returns whether the statement ran.
+async fn close_moved_accounts(
+    db: DatabaseConnection,
+    written: WrittenAccounts,
+    slot: u64,
+    query_timeout: Duration,
+) -> bool {
+    let result = timeout(query_timeout, insert_moved_accounts(&db, written, slot))
+        .await
+        .unwrap_or_else(|elapsed| {
+            tracing::error!("insert_moved_account timeout ERROR: {}", elapsed);
+            Err(DbErr::RecordNotInserted)
+        });
+
+    match result {
+        Ok(res) => {
+            tracing::debug!(
+                target: "insert_moved_account",
+                "inserted {} close rows of moved accounts for slot {}",
+                res.rows_affected(),
+                slot
+            );
+            true
+        }
+        Err(e) => {
+            tracing::error!(
+                "insert_moved_account: failed to insert the close rows of moved accounts for slot {}: {}",
+                slot,
+                e
+            );
+            metrics::increment_db_errors();
+            false
+        }
+    }
+}
+
+/// Runs the statement in a transaction of its own with the JIT compiler off: compiling the
+/// statement costs more than it saves on the accounts of one block.
+async fn insert_moved_accounts(
+    db: &DatabaseConnection,
+    WrittenAccounts { pubkeys, owners }: WrittenAccounts,
+    slot: u64,
+) -> Result<ExecResult, DbErr> {
+    let transaction = db.begin().await?;
+    transaction
+        .execute_unprepared("SET LOCAL jit = off")
+        .await?;
+    let result = transaction
+        .execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            include_str!("db/insertMovedAccount.sql"),
+            [
+                bytes_array(pubkeys),
+                bytes_array(owners),
+                Value::BigInt(Some(slot as i64)),
+            ],
+        ))
+        .await?;
+    transaction.commit().await?;
+
+    Ok(result)
+}
+
+fn bytes_array(values: Vec<Vec<u8>>) -> Value {
+    Value::Array(
+        sea_orm::sea_query::ArrayType::Bytes,
+        Some(Box::new(
+            values
+                .into_iter()
+                .map(|value| Value::Bytes(Some(Box::new(value))))
+                .collect(),
+        )),
+    )
+}
+
+/// Whether the primary key of `accounts` holds `owner`. Only then can the close row under the
+/// previous owner of a moved account sit at the slot of the account's new row.
+pub async fn accounts_primary_key_has_owner(db: &DatabaseConnection) -> Result<bool, DbErr> {
+    let row = db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT EXISTS ( \
+                 SELECT 1 \
+                 FROM pg_index AS primary_key \
+                 JOIN pg_attribute AS attribute \
+                     ON attribute.attrelid = primary_key.indrelid \
+                     AND attribute.attnum = ANY(primary_key.indkey) \
+                 WHERE primary_key.indrelid = 'accounts'::regclass \
+                     AND primary_key.indisprimary \
+                     AND attribute.attname = 'owner' \
+             ) AS has_owner",
+        ))
+        .await?
+        .ok_or_else(|| DbErr::RecordNotFound("no answer about the accounts primary key".into()))?;
+
+    row.try_get("", "has_owner")
 }
 
 pub async fn insert_slot(
