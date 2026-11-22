@@ -54,7 +54,9 @@ latest_account AS (
         rent_epoch,
         data
     FROM all_versions
-    ORDER BY slot DESC
+    -- A moved account has two rows at the slot of its move: the close row under its old owner
+    -- and the live row, which is its state.
+    ORDER BY slot DESC, lamports DESC
     LIMIT 1
 )
 

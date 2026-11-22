@@ -917,7 +917,6 @@ async fn get_program_accounts_of_the_other_program_answers_the_account_state_at_
 
 #[rstest]
 #[case::without_owner_map(OwnerMap::Off)]
-#[ignore = "the read takes the close row of a moved account, which shares the slot of its live row"]
 #[case::with_owner_map(OwnerMap::On)]
 #[tokio::test]
 async fn get_account_info_answers_a_moved_account_from_its_live_row(
@@ -949,7 +948,6 @@ async fn get_account_info_answers_a_moved_account_from_its_live_row(
 
 #[rstest]
 #[case::without_owner_map(OwnerMap::Off)]
-#[ignore = "the read takes the close row of a moved account, which shares the slot of its live row"]
 #[case::with_owner_map(OwnerMap::On)]
 #[tokio::test]
 async fn get_multiple_accounts_answers_a_moved_account_from_its_live_row(
@@ -981,7 +979,6 @@ async fn get_multiple_accounts_answers_a_moved_account_from_its_live_row(
 
 #[rstest]
 #[case::without_owner_map(OwnerMap::Off)]
-#[ignore = "the read takes the close row of a moved account, which shares the slot of its live row"]
 #[case::with_owner_map(OwnerMap::On)]
 #[tokio::test]
 async fn get_balance_answers_a_moved_account_from_its_live_row(

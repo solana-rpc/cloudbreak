@@ -49,7 +49,9 @@ latest_account AS (
                 WHERE
                     accounts.pubkey = input.pubkey
                     AND accounts.slot <= $2
-                ORDER BY accounts.slot DESC
+                -- A moved account has two rows at the slot of its move: the close row under its
+                -- old owner and the live row, which is its state.
+                ORDER BY accounts.slot DESC, accounts.lamports DESC
                 LIMIT 1
             )
             UNION ALL
