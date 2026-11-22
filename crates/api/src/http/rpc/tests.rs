@@ -548,289 +548,241 @@ async fn read_by_pubkey<T: DeserializeOwned>(
 #[case::data_size_live(Filter::DataSize, History::Live, Returned::SelectedVersion)]
 #[case::memcmp_live(Filter::Memcmp, History::Live, Returned::SelectedVersion)]
 #[case::token_owner_live(Filter::TokenOwner, History::Live, Returned::SelectedVersion)]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::data_size_closed_over_accounts_without_owner_map(
     Filter::DataSize,
     History::Closed(Table::Accounts, OwnerMap::Off),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::data_size_closed_over_accounts_with_owner_map(
     Filter::DataSize,
     History::Closed(Table::Accounts, OwnerMap::On),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::data_size_closed_over_snapshot_without_owner_map(
     Filter::DataSize,
     History::Closed(Table::SnapshotAccounts, OwnerMap::Off),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::data_size_closed_over_snapshot_with_owner_map(
     Filter::DataSize,
     History::Closed(Table::SnapshotAccounts, OwnerMap::On),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::data_size_moved_over_accounts_with_owner_map(
     Filter::DataSize,
     History::MovedToAnotherProgram(Table::Accounts, OwnerMap::On),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::data_size_moved_over_snapshot_with_owner_map(
     Filter::DataSize,
     History::MovedToAnotherProgram(Table::SnapshotAccounts, OwnerMap::On),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::memcmp_closed_over_accounts_without_owner_map(
     Filter::Memcmp,
     History::Closed(Table::Accounts, OwnerMap::Off),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::memcmp_closed_over_accounts_with_owner_map(
     Filter::Memcmp,
     History::Closed(Table::Accounts, OwnerMap::On),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::memcmp_closed_over_snapshot_without_owner_map(
     Filter::Memcmp,
     History::Closed(Table::SnapshotAccounts, OwnerMap::Off),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::memcmp_closed_over_snapshot_with_owner_map(
     Filter::Memcmp,
     History::Closed(Table::SnapshotAccounts, OwnerMap::On),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::memcmp_moved_over_accounts_with_owner_map(
     Filter::Memcmp,
     History::MovedToAnotherProgram(Table::Accounts, OwnerMap::On),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::memcmp_moved_over_snapshot_with_owner_map(
     Filter::Memcmp,
     History::MovedToAnotherProgram(Table::SnapshotAccounts, OwnerMap::On),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::token_owner_closed_over_accounts_without_owner_map(
     Filter::TokenOwner,
     History::Closed(Table::Accounts, OwnerMap::Off),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::token_owner_closed_over_accounts_with_owner_map(
     Filter::TokenOwner,
     History::Closed(Table::Accounts, OwnerMap::On),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::token_owner_closed_over_snapshot_without_owner_map(
     Filter::TokenOwner,
     History::Closed(Table::SnapshotAccounts, OwnerMap::Off),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::token_owner_closed_over_snapshot_with_owner_map(
     Filter::TokenOwner,
     History::Closed(Table::SnapshotAccounts, OwnerMap::On),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::token_owner_moved_over_accounts_with_owner_map(
     Filter::TokenOwner,
     History::MovedToAnotherProgram(Table::Accounts, OwnerMap::On),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::token_owner_moved_over_snapshot_with_owner_map(
     Filter::TokenOwner,
     History::MovedToAnotherProgram(Table::SnapshotAccounts, OwnerMap::On),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::data_size_closed_after_becoming_selected_over_accounts_without_owner_map(
     Filter::DataSize,
     History::ClosedAfterBecomingSelected(Table::Accounts, OwnerMap::Off),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::data_size_closed_after_becoming_selected_over_accounts_with_owner_map(
     Filter::DataSize,
     History::ClosedAfterBecomingSelected(Table::Accounts, OwnerMap::On),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::data_size_closed_after_becoming_selected_over_snapshot_without_owner_map(
     Filter::DataSize,
     History::ClosedAfterBecomingSelected(Table::SnapshotAccounts, OwnerMap::Off),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::data_size_closed_after_becoming_selected_over_snapshot_with_owner_map(
     Filter::DataSize,
     History::ClosedAfterBecomingSelected(Table::SnapshotAccounts, OwnerMap::On),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::memcmp_closed_after_becoming_selected_over_accounts_without_owner_map(
     Filter::Memcmp,
     History::ClosedAfterBecomingSelected(Table::Accounts, OwnerMap::Off),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::memcmp_closed_after_becoming_selected_over_accounts_with_owner_map(
     Filter::Memcmp,
     History::ClosedAfterBecomingSelected(Table::Accounts, OwnerMap::On),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::memcmp_closed_after_becoming_selected_over_snapshot_without_owner_map(
     Filter::Memcmp,
     History::ClosedAfterBecomingSelected(Table::SnapshotAccounts, OwnerMap::Off),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::memcmp_closed_after_becoming_selected_over_snapshot_with_owner_map(
     Filter::Memcmp,
     History::ClosedAfterBecomingSelected(Table::SnapshotAccounts, OwnerMap::On),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::token_owner_closed_after_becoming_selected_over_accounts_without_owner_map(
     Filter::TokenOwner,
     History::ClosedAfterBecomingSelected(Table::Accounts, OwnerMap::Off),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::token_owner_closed_after_becoming_selected_over_accounts_with_owner_map(
     Filter::TokenOwner,
     History::ClosedAfterBecomingSelected(Table::Accounts, OwnerMap::On),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::token_owner_closed_after_becoming_selected_over_snapshot_without_owner_map(
     Filter::TokenOwner,
     History::ClosedAfterBecomingSelected(Table::SnapshotAccounts, OwnerMap::Off),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::token_owner_closed_after_becoming_selected_over_snapshot_with_owner_map(
     Filter::TokenOwner,
     History::ClosedAfterBecomingSelected(Table::SnapshotAccounts, OwnerMap::On),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::data_size_no_longer_selected_over_accounts(
     Filter::DataSize,
     History::NoLongerSelected(Table::Accounts),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::data_size_no_longer_selected_over_snapshot(
     Filter::DataSize,
     History::NoLongerSelected(Table::SnapshotAccounts),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::data_size_closed_after_no_longer_selected_over_accounts_without_owner_map(
     Filter::DataSize,
     History::ClosedAfterNoLongerSelected(Table::Accounts, OwnerMap::Off),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::data_size_closed_after_no_longer_selected_over_accounts_with_owner_map(
     Filter::DataSize,
     History::ClosedAfterNoLongerSelected(Table::Accounts, OwnerMap::On),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::data_size_closed_after_no_longer_selected_over_snapshot_without_owner_map(
     Filter::DataSize,
     History::ClosedAfterNoLongerSelected(Table::SnapshotAccounts, OwnerMap::Off),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::data_size_closed_after_no_longer_selected_over_snapshot_with_owner_map(
     Filter::DataSize,
     History::ClosedAfterNoLongerSelected(Table::SnapshotAccounts, OwnerMap::On),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::memcmp_no_longer_selected_over_accounts(
     Filter::Memcmp,
     History::NoLongerSelected(Table::Accounts),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::memcmp_no_longer_selected_over_snapshot(
     Filter::Memcmp,
     History::NoLongerSelected(Table::SnapshotAccounts),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::memcmp_closed_after_no_longer_selected_over_accounts_without_owner_map(
     Filter::Memcmp,
     History::ClosedAfterNoLongerSelected(Table::Accounts, OwnerMap::Off),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::memcmp_closed_after_no_longer_selected_over_accounts_with_owner_map(
     Filter::Memcmp,
     History::ClosedAfterNoLongerSelected(Table::Accounts, OwnerMap::On),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::memcmp_closed_after_no_longer_selected_over_snapshot_without_owner_map(
     Filter::Memcmp,
     History::ClosedAfterNoLongerSelected(Table::SnapshotAccounts, OwnerMap::Off),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::memcmp_closed_after_no_longer_selected_over_snapshot_with_owner_map(
     Filter::Memcmp,
     History::ClosedAfterNoLongerSelected(Table::SnapshotAccounts, OwnerMap::On),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::token_owner_no_longer_selected_over_accounts(
     Filter::TokenOwner,
     History::NoLongerSelected(Table::Accounts),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::token_owner_no_longer_selected_over_snapshot(
     Filter::TokenOwner,
     History::NoLongerSelected(Table::SnapshotAccounts),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::token_owner_closed_after_no_longer_selected_over_accounts_without_owner_map(
     Filter::TokenOwner,
     History::ClosedAfterNoLongerSelected(Table::Accounts, OwnerMap::Off),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::token_owner_closed_after_no_longer_selected_over_accounts_with_owner_map(
     Filter::TokenOwner,
     History::ClosedAfterNoLongerSelected(Table::Accounts, OwnerMap::On),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::token_owner_closed_after_no_longer_selected_over_snapshot_without_owner_map(
     Filter::TokenOwner,
     History::ClosedAfterNoLongerSelected(Table::SnapshotAccounts, OwnerMap::Off),
     Returned::Nothing
 )]
-#[ignore = "an older row is returned when the account's newest row fails the filters"]
 #[case::token_owner_closed_after_no_longer_selected_over_snapshot_with_owner_map(
     Filter::TokenOwner,
     History::ClosedAfterNoLongerSelected(Table::SnapshotAccounts, OwnerMap::On),
