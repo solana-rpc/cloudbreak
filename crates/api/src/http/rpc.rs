@@ -754,3 +754,6 @@ async fn gpa_streamed_to_buffered(
         serde_json::to_vec(&err_response).unwrap_or_default()
     }
 }
+
+#[cfg(test)]
+mod tests;

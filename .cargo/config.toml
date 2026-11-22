@@ -1,0 +1,2 @@
+[env]
+CLOUDBREAK_MIGRATION_CONFIG = { value = "example.cloudbreak.migration.toml", relative = true }

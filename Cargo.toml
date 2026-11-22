@@ -39,6 +39,7 @@ async-trait = "0.1.88"
 solana-account = "4.5.0"
 solana-pubkey = "4.3.0"
 solana-program = "4.1.0"
+solana-program-pack = "3.1.0"
 solana-runtime = { version = "=4.3.0-beta.2", features = ["agave-unstable-api"] }
 solana-accounts-db = { version = "=4.3.0-beta.2", features = ["agave-unstable-api"] }
 agave-fs = { version = "=4.3.0-beta.2", features = ["agave-unstable-api"] }
@@ -125,6 +126,9 @@ jsonrpsee = "0.26.0"
 jsonrpsee-types = "0.26.0"
 sea-orm-migration = "1.1.8"
 tempfile = "3"
+rstest = "0.27"
+testcontainers-modules = { version = "0.15", features = ["postgres", "watchdog"] }
+libc = "0.2"
 
 cloudbreak-api = { path = "crates/api" }
 cloudbreak-snapshot = { path = "crates/snapshot" }
@@ -132,3 +136,4 @@ cloudbreak-index = { path = "crates/index" }
 cloudbreak-core = { path = "crates/core" }
 cloudbreak-entity = { path = "crates/entity" }
 cloudbreak-query-tracker = { path = "crates/query-tracker" }
+cloudbreak-migration = { path = "crates/migration" }
