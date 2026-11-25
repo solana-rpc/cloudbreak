@@ -65,6 +65,12 @@ Per-index toggles for the migration-time indexes on the `accounts` table. Each k
 
 > Indexes for the `snapshot_accounts` table are created at snapshot-ingest time by the `snapshot` crate (not by migrations), so they live in `cloudbreak.snapshot.toml` (or under `[snapshot.pg-indexes]` of `cloudbreak.index.toml`) — not here. See [`example.cloudbreak.snapshot.toml`](../../example.cloudbreak.snapshot.toml).
 
+## Account data compression
+
+A migration sets lz4 TOAST compression on `data` in `accounts`, `snapshot_accounts` and every partition. It also sets lz4 as the database's `default_toast_compression`, so tables created later (for example by the snapshot loader) use it. Postgres compresses `data` values over ~2 KB on every write, and pglz made up most of the indexer's block write time. Values that are already stored keep their old compression until they are written again.
+
+lz4 needs Postgres 14 or later, built with lz4 support. The official Docker images have it.
+
 ## Choosing a partitioning shape
 
 Rough guidance for picking values in `[pg-owner-partitions]`:
@@ -158,4 +164,5 @@ The migration binary still uses the `sea-orm-cli` subcommand parser, so any flag
 - **`CLOUDBREAK_MIGRATION_CONFIG must point to a TOML migration config file`** — the binary couldn't find the env var. Export it before running (`export CLOUDBREAK_MIGRATION_CONFIG=./cloudbreak.migration.toml`) or pass it inline (`CLOUDBREAK_MIGRATION_CONFIG=./cloudbreak.migration.toml cargo run -p cloudbreak-migration`).
 - **`failed to load migration config from <path>: ...`** — the file path resolved but the TOML didn't parse against the schema. Compare against [`example.cloudbreak.migration.toml`](../../example.cloudbreak.migration.toml). Common causes: typo in a key name (keys are kebab-case, not snake_case), invalid base58 pubkey in `programs-for-list-partition`, wrong type (e.g. string where bool is expected).
 - **`pg_tracing` warning during migrations** — informational only. The migration tries to load the optional `pg_tracing` Postgres extension; if it's not installed the migration skips it and continues. The stock Docker Postgres image does not include it, so this warning is expected in local dev.
+- **`invalid value for parameter "default_toast_compression": "lz4"`** — the Postgres server was built without lz4. No migration is applied, because all pending migrations run in one transaction. Use a build with lz4 support (the official Docker images have it). See [Account data compression](#account-data-compression).
 - **Changing the TOML doesn't affect an existing database** — by design. See [Changing configuration after the initial migration](#changing-configuration-after-the-initial-migration).
