@@ -338,33 +338,44 @@ async fn fetch_accounts(
 
     tracing::debug!(target: "account_sql", "## {what} sql: {}", sql);
 
-    // A traced query has unique text, so caching its statement would only evict others.
-    let query = sqlx::query(&sql).persistent(traceparent.is_none());
-    let query = if sql_template.contains("unnest($1)") {
-        query.bind(
-            keys.iter()
-                .map(|key| key.to_bytes().to_vec())
-                .collect::<Vec<_>>(),
-        )
-    } else {
-        query.bind(keys[0].to_bytes().to_vec())
-    };
-    let query = query.bind(slot as i64);
+    let unnest = sql_template.contains("unnest($1)");
+    let keys = keys.to_vec();
+    let pool = state.database.get_postgres_connection_pool().clone();
+    let queries_timeout = state.queries_timeout;
+    let span = tracing::info_span!("account_db", method = what);
+    let fetch = async move {
+        // A traced query has unique text, so caching its statement would only evict others.
+        let query = sqlx::query(&sql).persistent(traceparent.is_none());
+        let query = if unnest {
+            query.bind(
+                keys.iter()
+                    .map(|key| key.to_bytes().to_vec())
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            query.bind(keys[0].to_bytes().to_vec())
+        };
+        let query = query.bind(slot as i64);
 
-    let pool = state.database.get_postgres_connection_pool();
-    timeout(state.queries_timeout, async {
-        let span = tracing::info_span!("account_db", method = what);
-        query.fetch_all(pool).instrument(span).await
-    })
-    .await
-    .map_err(|_elapsed| {
-        tracing::error!("{what} query timed out");
-        RpcError::InternalError
-    })?
-    .map_err(|e| {
-        tracing::error!("Database query error: {}", e);
-        RpcError::InternalError
-    })
+        timeout(queries_timeout, query.fetch_all(&pool).instrument(span)).await
+    };
+
+    // sqlx does not yield while rows keep arriving; on a blocking thread the read cannot hold an async worker.
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || runtime.block_on(fetch))
+        .await
+        .map_err(|e| {
+            tracing::error!("{what} spawn_blocking join error: {e}");
+            RpcError::InternalError
+        })?
+        .map_err(|_elapsed| {
+            tracing::error!("{what} query timed out");
+            RpcError::InternalError
+        })?
+        .map_err(|e| {
+            tracing::error!("Database query error: {}", e);
+            RpcError::InternalError
+        })
 }
 
 fn pubkey_column(row: &PgRow, column: &str) -> Result<Pubkey, RpcError> {
