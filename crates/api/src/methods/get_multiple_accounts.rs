@@ -9,7 +9,7 @@ use solana_account_decoder::{UiAccountEncoding, encode_ui_account};
 use solana_account_decoder_client_types::UiAccount;
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::config::RpcAccountInfoConfig;
-use solana_rpc_client_api::response::{Response as RpcResponse, RpcApiVersion, RpcResponseContext};
+use solana_rpc_client_api::response::Response as RpcResponse;
 
 use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
@@ -57,10 +57,7 @@ pub async fn get_multiple_accounts(
     // Short-circuit for an empty input list, return `value: []` without touching the DB.
     if parsed_pubkeys.is_empty() {
         return Ok(RpcResponse {
-            context: RpcResponseContext {
-                slot: latest_slot,
-                api_version: Some(RpcApiVersion::default()),
-            },
+            context: crate::methods::version::response_context(state, latest_slot).await,
             value: vec![],
         });
     }
@@ -142,10 +139,7 @@ pub async fn get_multiple_accounts(
     }
 
     Ok(RpcResponse {
-        context: RpcResponseContext {
-            slot: latest_slot,
-            api_version: Some(RpcApiVersion::default()),
-        },
+        context: crate::methods::version::response_context(state, latest_slot).await,
         value: result,
     })
 }

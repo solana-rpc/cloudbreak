@@ -33,7 +33,7 @@ use solana_pubkey::Pubkey;
 use solana_rpc_client_api::config::RpcSimulateTransactionConfig;
 use solana_runtime_transaction::transaction_meta::TransactionConfiguration;
 use solana_rpc_client_api::response::{
-    Response as RpcResponse, RpcBlockhash, RpcResponseContext, RpcSimulateTransactionResult,
+    Response as RpcResponse, RpcBlockhash, RpcSimulateTransactionResult,
 };
 use solana_svm::account_loader::{CheckedTransactionDetails, TransactionCheckResult};
 use solana_svm::transaction_balances::{BalanceCollector, SvmTokenInfo};
@@ -177,9 +177,11 @@ pub async fn simulate_transaction(
         && let Err(e) = sanitized_tx.verify()
     {
         return Ok(response(
+            state,
             slot,
             error_only(e, &config, loaded_addresses, replacement_blockhash),
-        ));
+        )
+        .await);
     }
 
     if requested_addresses.len() > sanitized_tx.message().account_keys().len() {
@@ -242,9 +244,11 @@ pub async fn simulate_transaction(
         Ok(configuration) => configuration,
         Err(e) => {
             return Ok(response(
+                state,
                 slot,
                 error_only(e, &config, loaded_addresses, replacement_blockhash),
-            ));
+            )
+            .await);
         }
     };
 
@@ -296,7 +300,7 @@ pub async fn simulate_transaction(
         &mint_accounts,
         block_time,
     )?;
-    Ok(response(slot, value))
+    Ok(response(state, slot, value).await)
 }
 
 const FEATURE_SET_TTL: Duration = Duration::from_secs(120);
@@ -524,15 +528,13 @@ fn decode_transaction(data: &str, encoding: UiTransactionEncoding) -> Result<Vec
     Ok(bytes)
 }
 
-fn response(
+async fn response(
+    state: &CloudbreakRpcState,
     slot: u64,
     value: RpcSimulateTransactionResult,
 ) -> RpcResponse<RpcSimulateTransactionResult> {
     RpcResponse {
-        context: RpcResponseContext {
-            slot,
-            api_version: None,
-        },
+        context: crate::methods::version::response_context(state, slot).await,
         value,
     }
 }

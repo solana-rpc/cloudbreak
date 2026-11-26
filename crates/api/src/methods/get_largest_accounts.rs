@@ -4,9 +4,7 @@ use cloudbreak_core::modules::largest_accounts::{
 use solana_commitment_config::CommitmentLevel;
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::config::{RpcLargestAccountsConfig, RpcLargestAccountsFilter};
-use solana_rpc_client_api::response::{
-    Response as RpcResponse, RpcAccountBalance, RpcResponseContext,
-};
+use solana_rpc_client_api::response::{Response as RpcResponse, RpcAccountBalance};
 use tokio::time::timeout;
 use tracing::Instrument;
 
@@ -68,10 +66,7 @@ pub async fn get_largest_accounts(
     };
 
     Ok(RpcResponse {
-        context: RpcResponseContext {
-            slot: latest_slot,
-            api_version: None,
-        },
+        context: crate::methods::version::response_context(state, latest_slot).await,
         value: rows
             .into_iter()
             .map(|(pubkey, lamports)| RpcAccountBalance {

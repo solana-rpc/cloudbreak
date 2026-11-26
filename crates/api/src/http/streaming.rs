@@ -29,7 +29,7 @@ use http_body_util::StreamBody;
 use http_body_util::combinators::UnsyncBoxBody;
 use hyper::body::Frame;
 use solana_pubkey::Pubkey;
-use solana_rpc_client_api::response::RpcResponseContext;
+use solana_rpc_client_api::response::{RpcApiVersion, RpcResponseContext};
 use tokio::time::Instant;
 
 use crate::error::RpcError;
@@ -55,6 +55,7 @@ pub async fn gpa_streaming_response_body(
     gpa_response: GpaStreamingResponse,
     gpa_global_start_time: Instant,
     ctx: Arc<RequestContext>,
+    api_version: RpcApiVersion,
 ) -> Result<UnsyncBoxBody<Bytes, io::Error>, RpcError> {
     let _guard = metrics::InFlightRequestGuard::new("gpa_streaming");
     let mut accounts_stream = gpa_response.accounts_stream;
@@ -83,7 +84,7 @@ pub async fn gpa_streaming_response_body(
         })?;
 
     let streaming_response_body_wrapper =
-        StreamingResponseBodyWrapper::new(gpa_response.context_slot, id);
+        StreamingResponseBodyWrapper::new(gpa_response.context_slot, api_version, id);
 
     let request_span = tracing::Span::current();
 
@@ -356,12 +357,20 @@ struct StreamingResponseBodyWrapper {
 impl StreamingResponseBodyWrapper {
     /// When `context_slot` is set, the JSON-RPC `result` becomes `{"context":{"slot":N},"value":[...]}` instead of a bare array.
     /// We serialize a real `RpcResponseContext` so any future fields (`apiVersion`, etc.) flow through automatically.
-    fn new(context_slot: Option<u64>, request_id: serde_json::Value) -> Self {
+    fn new(
+        context_slot: Option<u64>,
+        api_version: RpcApiVersion,
+        request_id: serde_json::Value,
+    ) -> Self {
         let request_id = serde_json::to_string(&request_id).unwrap_or_else(|_| "null".to_string());
 
         let (start, end) = match context_slot {
             Some(slot) => {
-                let ctx_json = serde_json::to_string(&RpcResponseContext::new(slot))
+                let context = RpcResponseContext {
+                    slot,
+                    api_version: Some(api_version),
+                };
+                let ctx_json = serde_json::to_string(&context)
                     .unwrap_or_else(|_| format!(r#"{{"slot":{slot}}}"#));
                 (
                     format!(r#"{{"jsonrpc":"2.0","result":{{"context":{ctx_json},"value":["#),

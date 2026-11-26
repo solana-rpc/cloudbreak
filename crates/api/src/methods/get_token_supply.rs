@@ -7,7 +7,7 @@ use solana_account_decoder::parse_token::token_amount_to_ui_amount_v3;
 use solana_account_decoder_client_types::token::UiTokenAmount;
 use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
-use solana_rpc_client_api::response::{Response as RpcResponse, RpcResponseContext};
+use solana_rpc_client_api::response::Response as RpcResponse;
 use spl_token_2022::extension::StateWithExtensions;
 use spl_token_2022::state::Mint;
 
@@ -87,10 +87,7 @@ pub async fn get_token_supply(
     let ui_token_amount = token_amount_to_ui_amount_v3(supply, additional_data);
 
     Ok(RpcResponse {
-        context: RpcResponseContext {
-            slot: latest_slot,
-            api_version: None,
-        },
+        context: crate::methods::version::response_context(state, latest_slot).await,
         value: ui_token_amount,
     })
 }
