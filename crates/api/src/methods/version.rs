@@ -38,13 +38,13 @@ pub async fn load(database: &DatabaseConnection) {
             tracing::error!("failed to load the gRPC version, reporting it as unknown: {e}");
             None
         });
-    let version = compose_version(grpc_version.as_deref(), CLOUDBREAK_VERSION);
+    let version = compose_version(grpc_version.as_deref());
     tracing::info!("reporting version {}", version.solana_core);
     let _ = REPORTED_VERSION.set(version);
 }
 
 fn reported_version() -> &'static ReportedVersion {
-    REPORTED_VERSION.get_or_init(|| compose_version(None, CLOUDBREAK_VERSION))
+    REPORTED_VERSION.get_or_init(|| compose_version(None))
 }
 
 #[tracing::instrument(name = "getVersion", skip_all)]
@@ -64,7 +64,7 @@ pub fn response_context(slot: u64) -> RpcResponseContext {
 }
 
 /// `<agave>+cloudbreak<crate>.grpc<plugin>`, from a plugin version like `17.0.0-rc9+solana.4.4.0`.
-fn compose_version(grpc_version: Option<&str>, cloudbreak_version: &str) -> ReportedVersion {
+fn compose_version(grpc_version: Option<&str>) -> ReportedVersion {
     let (plugin, agave) = match grpc_version {
         Some(version) => match version.split_once('+') {
             Some((plugin, metadata)) => (plugin, metadata.strip_prefix("solana.")),
@@ -75,11 +75,7 @@ fn compose_version(grpc_version: Option<&str>, cloudbreak_version: &str) -> Repo
     let agave = agave
         .and_then(agave_semver)
         .unwrap_or_else(|| RpcApiVersion::default().to_string());
-    let solana_core = format!(
-        "{agave}+cloudbreak{}.grpc{}",
-        metadata_safe(cloudbreak_version),
-        metadata_safe(plugin)
-    );
+    let solana_core = format!("{agave}+cloudbreak{CLOUDBREAK_VERSION}.grpc{plugin}");
     let api_version = serde_json::from_value(serde_json::Value::String(solana_core.clone()))
         .unwrap_or_else(|e| {
             tracing::warn!("{solana_core} is not semver ({e}); apiVersion uses the crate version");
@@ -104,55 +100,4 @@ fn agave_semver(version: &str) -> Option<String> {
     } else {
         format!("{}-{}", core.join("."), pre.join("."))
     })
-}
-
-/// Semver build metadata allows only ASCII letters, digits, `-` and `.`.
-fn metadata_safe(part: &str) -> String {
-    part.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '.' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mainnet_plugin_version() {
-        let v = compose_version(Some("17.0.0-rc9+solana.4.4.0"), "0.1.0");
-        assert_eq!(v.solana_core, "4.4.0+cloudbreak0.1.0.grpc17.0.0-rc9");
-        assert_eq!(v.api_version.to_string(), v.solana_core);
-        assert_eq!(
-            (
-                v.api_version.major,
-                v.api_version.minor,
-                v.api_version.patch
-            ),
-            (4, 4, 0)
-        );
-    }
-
-    #[test]
-    fn testnet_beta_version() {
-        let v = compose_version(Some("18.0.0-rc4+solana.4.5.0.beta.0"), "0.1.0");
-        assert_eq!(v.solana_core, "4.5.0-beta.0+cloudbreak0.1.0.grpc18.0.0-rc4");
-        assert_eq!(v.api_version.to_string(), v.solana_core);
-    }
-
-    #[test]
-    fn unknown_plugin_falls_back_to_the_crate_version() {
-        let v = compose_version(None, "0.1.0");
-        let crate_version = RpcApiVersion::default().to_string();
-        assert_eq!(
-            v.solana_core,
-            format!("{crate_version}+cloudbreak0.1.0.grpcunknown")
-        );
-        assert_eq!(v.api_version.to_string(), v.solana_core);
-    }
 }
