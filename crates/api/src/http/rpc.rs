@@ -5,7 +5,6 @@
 
 use bytes::Bytes;
 use cloudbreak_core::modules::rpc_filter_type::RpcProgramAccountsConfig;
-use futures::FutureExt;
 use http_body_util::combinators::UnsyncBoxBody;
 use hyper::body::Incoming;
 use hyper::{Request, StatusCode};
@@ -15,7 +14,6 @@ use solana_rpc_client_api::config::{
     RpcAccountInfoConfig, RpcContextConfig, RpcSimulateTransactionConfig, RpcSupplyConfig,
 };
 use std::io;
-use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use tokio::time::Instant;
 
@@ -57,9 +55,7 @@ pub async fn handle_rpc_request(
     };
 
     match payload {
-        RpcRequestPayload::Single(req) => {
-            process_single_request_catching(req, &state, ctx, false).await
-        }
+        RpcRequestPayload::Single(req) => process_single_request(req, &state, ctx, false).await,
         RpcRequestPayload::Batch(requests) => process_batch(requests, state, ctx).await,
     }
 }
@@ -83,22 +79,15 @@ async fn process_batch(
         let state = state.clone();
         let ctx = ctx.clone();
         let sem = semaphore.clone();
-        let id = req.id.clone();
-        handles.push((
-            id,
-            tokio::spawn(async move {
-                let _permit = sem.acquire().await.unwrap();
-                process_single_request_catching(req, &state, &ctx, true).await
-            }),
-        ));
+        handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            process_single_request(req, &state, &ctx, true).await
+        }));
     }
 
     let mut all_results = Vec::with_capacity(batch_size);
-    for (id, handle) in handles {
-        all_results.push(handle.await.unwrap_or_else(|e| {
-            tracing::error!(target: "api_request_errors_count", "batch entry task failed: {e}");
-            make_rpc_error_response(id, &RpcError::InternalError)
-        }));
+    for handle in handles {
+        all_results.push(handle.await.unwrap());
     }
 
     let responses: Vec<serde_json::Value> = all_results
@@ -118,24 +107,6 @@ async fn process_batch(
         status: StatusCode::OK,
         body: ResponseBody::Buffered(body),
     }
-}
-
-/// Runs one request and turns a panic into a -32603 response for its id.
-async fn process_single_request_catching(
-    rpc_request: JsonRpcRequest,
-    state: &Arc<CloudbreakRpcState>,
-    ctx: &Arc<RequestContext>,
-    in_batch: bool,
-) -> HttpHandlerResponse {
-    let id = rpc_request.id.clone();
-    let method = rpc_request.method.clone();
-    AssertUnwindSafe(process_single_request(rpc_request, state, ctx, in_batch))
-        .catch_unwind()
-        .await
-        .unwrap_or_else(|_| {
-            tracing::error!(target: "api_request_errors_count", "{method} panicked");
-            make_rpc_error_response(id, &RpcError::InternalError)
-        })
 }
 
 /// Note: `in_batch` param, will make the streamed response to be buffered
@@ -211,10 +182,7 @@ async fn process_single_request(
                 Err(e) => return make_error_response(id, -32602, e),
             };
             let config: Option<RpcAccountInfoConfig> =
-                match extract_optional_param(&rpc_request.params, 1) {
-                    Ok(c) => c,
-                    Err(e) => return make_error_response(id, -32602, e),
-                };
+                extract_param(&rpc_request.params, 1).ok().flatten();
 
             let result = methods::get_account_info::get_account_info(state, pubkey, config).await;
 
@@ -277,10 +245,7 @@ async fn process_single_request(
                 Err(e) => return make_error_response(id, -32602, e),
             };
             let config: Option<RpcAccountInfoConfig> =
-                match extract_optional_param(&rpc_request.params, 1) {
-                    Ok(c) => c,
-                    Err(e) => return make_error_response(id, -32602, e),
-                };
+                extract_param(&rpc_request.params, 1).ok().flatten();
 
             let result =
                 methods::get_multiple_accounts::get_multiple_accounts(state, pubkeys, config).await;
@@ -743,16 +708,15 @@ async fn json_serialize_response<T: Serialize + Send + 'static>(
         Err(e) => http_status_for_error(e),
     };
 
-    let error_id = id.clone();
     let res = match result {
         Ok(value) => tokio::task::spawn_blocking(move || {
             let response = JsonRpcResponse::success(id, value);
             serde_json::to_vec(&response)
         })
         .await
-        .unwrap_or_else(|e| {
-            tracing::error!("Failed to join handle for json_serialize_response: {e}");
-            Err(serde::ser::Error::custom("serialization task failed"))
+        .unwrap_or_else(|_| {
+            tracing::error!("Failed to join handle for json_serialize_response");
+            Ok(vec![])
         }),
         Err(e) => {
             let response = JsonRpcResponse::<()>::from_rpc_error(id, &e);
@@ -760,19 +724,12 @@ async fn json_serialize_response<T: Serialize + Send + 'static>(
         }
     };
 
-    match res {
-        Ok(bytes) => (bytes, status),
-        Err(e) => {
-            // Never answer 200 with an empty body: send -32603 for this id instead.
-            tracing::error!("Failed to json_serialize_response: {e}");
-            let response =
-                JsonRpcResponse::<()>::from_rpc_error(error_id, &RpcError::InternalError);
-            (
-                serde_json::to_vec(&response).unwrap_or_default(),
-                StatusCode::OK,
-            )
-        }
-    }
+    let bytes = res.unwrap_or_else(|_| {
+        tracing::error!("Failed to json_serialize_response");
+        vec![]
+    });
+
+    (bytes, status)
 }
 
 async fn gpa_streamed_to_buffered(

@@ -9,7 +9,7 @@ use solana_account_decoder::{UiAccountEncoding, encode_ui_account};
 use solana_account_decoder_client_types::UiAccount;
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::config::RpcAccountInfoConfig;
-use solana_rpc_client_api::response::{Response as RpcResponse, RpcApiVersion, RpcResponseContext};
+use solana_rpc_client_api::response::{Response as RpcResponse, RpcResponseContext};
 
 use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
@@ -59,7 +59,7 @@ pub async fn get_multiple_accounts(
         return Ok(RpcResponse {
             context: RpcResponseContext {
                 slot: latest_slot,
-                api_version: Some(RpcApiVersion::default()),
+                api_version: None,
             },
             value: vec![],
         });
@@ -98,12 +98,16 @@ pub async fn get_multiple_accounts(
 
         let owner = account.owner;
 
-        // An owner this node does not index fails the request, as in getAccountInfo; null would mean "no account".
+        // Per-position indexer-filter check: if the owner is excluded, we return None at that position and log a tracing error.
         if !state.indexer_filter.is_program_selected(&owner) {
-            return Err(RpcError::AccountOwnerExcluded {
-                pubkey: pubkey.to_string(),
-                owner: owner.to_string(),
-            });
+            tracing::error!(
+                target: "gma_indexer_filter",
+                pubkey = %pubkey,
+                owner = %owner,
+                "getMultipleAccounts: skipping account because owner is excluded by the current indexer filter"
+            );
+            result.push(None);
+            continue;
         }
 
         let additional_mint_data: Option<AccountAdditionalDataV3> =
@@ -144,7 +148,7 @@ pub async fn get_multiple_accounts(
     Ok(RpcResponse {
         context: RpcResponseContext {
             slot: latest_slot,
-            api_version: Some(RpcApiVersion::default()),
+            api_version: None,
         },
         value: result,
     })

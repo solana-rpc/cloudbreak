@@ -9,7 +9,7 @@ use solana_account_decoder::{UiAccountEncoding, encode_ui_account};
 use solana_account_decoder_client_types::UiAccount;
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::config::RpcAccountInfoConfig;
-use solana_rpc_client_api::response::{Response as RpcResponse, RpcApiVersion, RpcResponseContext};
+use solana_rpc_client_api::response::{Response as RpcResponse, RpcResponseContext};
 
 use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
@@ -69,7 +69,7 @@ pub async fn get_account_info(
         return Ok(RpcResponse {
             context: RpcResponseContext {
                 slot: latest_slot,
-                api_version: Some(RpcApiVersion::default()),
+                api_version: None,
             },
             value: None,
         });
@@ -125,7 +125,7 @@ pub async fn get_account_info(
     Ok(RpcResponse {
         context: RpcResponseContext {
             slot: latest_slot,
-            api_version: Some(RpcApiVersion::default()),
+            api_version: None,
         },
         value: Some(ui_account),
     })
