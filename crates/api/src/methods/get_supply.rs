@@ -1,9 +1,10 @@
 use solana_commitment_config::CommitmentLevel;
 use solana_rpc_client_api::{
     config::RpcSupplyConfig,
-    response::{Response as RpcResponse, RpcResponseContext, RpcSupply},
+    response::{Response as RpcResponse, RpcSupply},
 };
 
+use crate::methods::version::response_context;
 use crate::{error::RpcError, http::CloudbreakRpcState, methods::resolve_commitment};
 
 const MAX_SUPPLY_STALENESS_SLOTS: u64 = 150;
@@ -92,10 +93,7 @@ pub async fn get_supply(
     };
 
     Ok(RpcResponse {
-        context: RpcResponseContext {
-            slot: row.slot,
-            api_version: None,
-        },
+        context: response_context(row.slot),
         value: RpcSupply {
             total: row.total,
             circulating: row.total.saturating_sub(non_circulating),

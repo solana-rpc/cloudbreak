@@ -8,7 +8,7 @@ use sea_orm::sqlx::Row;
 use sea_orm::sqlx::{self};
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::config::RpcContextConfig;
-use solana_rpc_client_api::response::{Response as RpcResponse, RpcResponseContext};
+use solana_rpc_client_api::response::Response as RpcResponse;
 use tokio::time::timeout;
 use tracing::Instrument;
 
@@ -16,6 +16,7 @@ use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
 use crate::methods::processed;
 use crate::{db_query, metrics};
+use crate::methods::version::response_context;
 
 #[tracing::instrument(name = "get_balance_rpc", skip_all, fields(pubkey = %pubkey))]
 pub async fn get_balance(
@@ -49,10 +50,7 @@ pub async fn get_balance(
                 return Err(RpcError::MinContextSlotNotReached { context_slot: blocks.slot });
             }
             return Ok(RpcResponse {
-                context: RpcResponseContext {
-                    slot: blocks.slot,
-                    api_version: None,
-                },
+                context: response_context(blocks.slot),
                 value: lamports,
             });
         }
@@ -117,10 +115,7 @@ pub async fn get_balance(
 
     let (Some(owner_bytes), Some(lamports)) = (owner_bytes, lamports) else {
         return Ok(RpcResponse {
-            context: RpcResponseContext {
-                slot: context_slot,
-                api_version: None,
-            },
+            context: response_context(context_slot),
             value: 0,
         });
     };
@@ -135,10 +130,7 @@ pub async fn get_balance(
     }
 
     Ok(RpcResponse {
-        context: RpcResponseContext {
-            slot: context_slot,
-            api_version: None,
-        },
+        context: response_context(context_slot),
         value: lamports as u64,
     })
 }

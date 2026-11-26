@@ -29,12 +29,12 @@ use http_body_util::StreamBody;
 use http_body_util::combinators::UnsyncBoxBody;
 use hyper::body::Frame;
 use solana_pubkey::Pubkey;
-use solana_rpc_client_api::response::RpcResponseContext;
 use tokio::time::Instant;
 
 use crate::error::RpcError;
 use crate::http::RequestContext;
 use crate::methods::get_program_accounts::{GpaStreamingResponse, encoding_to_string};
+use crate::methods::version::response_context;
 use crate::metrics;
 use crate::modules::cache::MaybeJsonAccount;
 
@@ -355,13 +355,13 @@ struct StreamingResponseBodyWrapper {
 
 impl StreamingResponseBodyWrapper {
     /// When `context_slot` is set, the JSON-RPC `result` becomes `{"context":{"slot":N},"value":[...]}` instead of a bare array.
-    /// We serialize a real `RpcResponseContext` so any future fields (`apiVersion`, etc.) flow through automatically.
+    /// The context is a real `RpcResponseContext`, so it carries `apiVersion` like every other response.
     fn new(context_slot: Option<u64>, request_id: serde_json::Value) -> Self {
         let request_id = serde_json::to_string(&request_id).unwrap_or_else(|_| "null".to_string());
 
         let (start, end) = match context_slot {
             Some(slot) => {
-                let ctx_json = serde_json::to_string(&RpcResponseContext::new(slot))
+                let ctx_json = serde_json::to_string(&response_context(slot))
                     .unwrap_or_else(|_| format!(r#"{{"slot":{slot}}}"#));
                 (
                     format!(r#"{{"jsonrpc":"2.0","result":{{"context":{ctx_json},"value":["#),

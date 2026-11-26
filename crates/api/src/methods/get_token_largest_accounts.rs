@@ -8,9 +8,7 @@ use sea_orm::sqlx::{self};
 use solana_account_decoder::parse_token::token_amount_to_ui_amount_v3;
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_pubkey::Pubkey;
-use solana_rpc_client_api::response::{
-    Response as RpcResponse, RpcResponseContext, RpcTokenAccountBalance,
-};
+use solana_rpc_client_api::response::{Response as RpcResponse, RpcTokenAccountBalance};
 use tokio::time::timeout;
 use tracing::Instrument;
 
@@ -18,6 +16,7 @@ use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
 use crate::methods::get_largest_accounts::fetch_largest_record;
 use crate::methods::resolve_commitment;
+use crate::methods::version::response_context;
 use crate::{db_query, metrics};
 use cloudbreak_core::utils::token::{MintState, is_token_program};
 
@@ -106,10 +105,7 @@ pub async fn get_token_largest_accounts(
     };
 
     Ok(RpcResponse {
-        context: RpcResponseContext {
-            slot: latest_slot,
-            api_version: None,
-        },
+        context: response_context(latest_slot),
         value: rows
             .into_iter()
             .map(|(address, amount)| RpcTokenAccountBalance {

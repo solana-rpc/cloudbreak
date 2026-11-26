@@ -175,19 +175,20 @@ impl Account {
 
     fn from_row(row: &PgRow, with_mint: bool) -> Result<Self, RpcError> {
         let mint_data = if with_mint {
-            row.try_get::<Vec<u8>, _>("mint_data").ok().map(Arc::new)
+            column::<Option<Vec<u8>>>(row, "mint_data")?.map(Arc::new)
         } else {
             None
         };
+        let rent_epoch = column::<rust_decimal::Decimal>(row, "rent_epoch")?;
         Ok(Self {
-            lamports: row.get::<i64, _>("lamports") as u64,
+            lamports: column::<i64>(row, "lamports")? as u64,
             owner: pubkey_column(row, "owner")?,
-            executable: row.get("executable"),
-            rent_epoch: row
-                .get::<rust_decimal::Decimal, _>("rent_epoch")
-                .to_u64()
-                .unwrap_or(0),
-            data: Arc::new(row.get("data")),
+            executable: column(row, "executable")?,
+            rent_epoch: rent_epoch.to_u64().ok_or_else(|| {
+                tracing::error!("rent_epoch {rent_epoch} does not fit in u64");
+                RpcError::InternalError
+            })?,
+            data: Arc::new(column(row, "data")?),
             mint_data,
         })
     }
@@ -311,7 +312,7 @@ async fn resolve_mints(
     .await?;
     let mut found = HashMap::with_capacity(rows.len());
     for row in &rows {
-        let data = Arc::new(row.get::<Vec<u8>, _>("data"));
+        let data = Arc::new(column::<Vec<u8>>(row, "data")?);
         found.insert(pubkey_column(row, "pubkey")?, data);
     }
     for (index, mint) in queried {
@@ -363,6 +364,17 @@ async fn fetch_accounts(
     })?
     .map_err(|e| {
         tracing::error!("Database query error: {}", e);
+        RpcError::InternalError
+    })
+}
+
+/// Decodes one column; a bad value is a -32603 for the request, never a panic.
+fn column<'r, T: sqlx::Decode<'r, sqlx::Postgres> + sqlx::Type<sqlx::Postgres>>(
+    row: &'r PgRow,
+    name: &str,
+) -> Result<T, RpcError> {
+    row.try_get(name).map_err(|e| {
+        tracing::error!("failed to decode column {name}: {e}");
         RpcError::InternalError
     })
 }

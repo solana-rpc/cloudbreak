@@ -9,13 +9,14 @@ use solana_account_decoder::{UiAccountEncoding, encode_ui_account};
 use solana_account_decoder_client_types::UiAccount;
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::config::RpcAccountInfoConfig;
-use solana_rpc_client_api::response::{Response as RpcResponse, RpcResponseContext};
+use solana_rpc_client_api::response::Response as RpcResponse;
 
 use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
 use crate::methods::processed;
 use crate::metrics;
 use crate::utils::encoding::check_account_data_len_for_encoding;
+use crate::methods::version::response_context;
 use cloudbreak_core::utils::token::{MintState, is_token_program};
 
 #[tracing::instrument(name = "gma_rpc", skip_all, fields(num_pubkeys = pubkeys.len()))]
@@ -57,10 +58,7 @@ pub async fn get_multiple_accounts(
     // Short-circuit for an empty input list, return `value: []` without touching the DB.
     if parsed_pubkeys.is_empty() {
         return Ok(RpcResponse {
-            context: RpcResponseContext {
-                slot: latest_slot,
-                api_version: None,
-            },
+            context: response_context(latest_slot),
             value: vec![],
         });
     }
@@ -98,16 +96,12 @@ pub async fn get_multiple_accounts(
 
         let owner = account.owner;
 
-        // Per-position indexer-filter check: if the owner is excluded, we return None at that position and log a tracing error.
+        // An owner this node does not index fails the request, as in getAccountInfo; null would mean "no account".
         if !state.indexer_filter.is_program_selected(&owner) {
-            tracing::error!(
-                target: "gma_indexer_filter",
-                pubkey = %pubkey,
-                owner = %owner,
-                "getMultipleAccounts: skipping account because owner is excluded by the current indexer filter"
-            );
-            result.push(None);
-            continue;
+            return Err(RpcError::AccountOwnerExcluded {
+                pubkey: pubkey.to_string(),
+                owner: owner.to_string(),
+            });
         }
 
         let additional_mint_data: Option<AccountAdditionalDataV3> =
@@ -146,10 +140,7 @@ pub async fn get_multiple_accounts(
     }
 
     Ok(RpcResponse {
-        context: RpcResponseContext {
-            slot: latest_slot,
-            api_version: None,
-        },
+        context: response_context(latest_slot),
         value: result,
     })
 }

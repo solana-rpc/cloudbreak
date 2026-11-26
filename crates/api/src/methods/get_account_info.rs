@@ -9,13 +9,14 @@ use solana_account_decoder::{UiAccountEncoding, encode_ui_account};
 use solana_account_decoder_client_types::UiAccount;
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::config::RpcAccountInfoConfig;
-use solana_rpc_client_api::response::{Response as RpcResponse, RpcResponseContext};
+use solana_rpc_client_api::response::Response as RpcResponse;
 
 use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
 use crate::methods::processed;
 use crate::metrics;
 use crate::utils::encoding::check_account_data_len_for_encoding;
+use crate::methods::version::response_context;
 use cloudbreak_core::utils::token::{MintState, is_token_program};
 
 #[tracing::instrument(name = "gai_rpc", skip_all, fields(pubkey = %pubkey))]
@@ -67,10 +68,7 @@ pub async fn get_account_info(
     let Some(account) = accounts.into_iter().next().flatten() else {
         // No account for this pubkey (absent, or its newest version is closed). Account not found.
         return Ok(RpcResponse {
-            context: RpcResponseContext {
-                slot: latest_slot,
-                api_version: None,
-            },
+            context: response_context(latest_slot),
             value: None,
         });
     };
@@ -123,10 +121,7 @@ pub async fn get_account_info(
     );
 
     Ok(RpcResponse {
-        context: RpcResponseContext {
-            slot: latest_slot,
-            api_version: None,
-        },
+        context: response_context(latest_slot),
         value: Some(ui_account),
     })
 }

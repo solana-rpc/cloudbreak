@@ -33,7 +33,7 @@ use solana_pubkey::Pubkey;
 use solana_rpc_client_api::config::RpcSimulateTransactionConfig;
 use solana_runtime_transaction::transaction_meta::TransactionConfiguration;
 use solana_rpc_client_api::response::{
-    Response as RpcResponse, RpcBlockhash, RpcResponseContext, RpcSimulateTransactionResult,
+    Response as RpcResponse, RpcBlockhash, RpcSimulateTransactionResult,
 };
 use solana_svm::account_loader::{CheckedTransactionDetails, TransactionCheckResult};
 use solana_svm::transaction_balances::{BalanceCollector, SvmTokenInfo};
@@ -61,6 +61,7 @@ use tracing::Instrument;
 use crate::db_query;
 use crate::error::RpcError;
 use crate::http::{CachedFeatureSet, CloudbreakRpcState};
+use crate::methods::version::response_context;
 use cloudbreak_core::utils::token::{MintState, is_token_program};
 
 /// Default cluster lamports-per-signature
@@ -529,10 +530,7 @@ fn response(
     value: RpcSimulateTransactionResult,
 ) -> RpcResponse<RpcSimulateTransactionResult> {
     RpcResponse {
-        context: RpcResponseContext {
-            slot,
-            api_version: None,
-        },
+        context: response_context(slot),
         value,
     }
 }

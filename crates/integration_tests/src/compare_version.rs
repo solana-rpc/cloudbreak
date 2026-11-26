@@ -11,11 +11,10 @@ use std::time::{Duration, Instant};
 #[derive(Parser, Debug)]
 #[command(name = "compare-version")]
 #[command(about = "\
-Compare getVersion between cloudbreak and a cluster RPC. Cloudbreak returns a \
-composite `solana-core` string of the form `solana<X>-grpc<Y>-cloudbreak<Z>`, \
-where <X> is the cluster's solana version. The cluster RPC returns just <X>. \
-This test verifies that rpc1's `solana-core` contains `solana<rpc2_solana_core>` \
-as a substring.")]
+Compare getVersion between cloudbreak and a cluster RPC. Cloudbreak returns \
+`solana-core` as `<X>+cloudbreak<Y>.grpc<Z>`, where <X> is the cluster's solana \
+version. The cluster RPC returns just <X>. This test verifies that rpc1's version \
+before the `+` equals rpc2's `solana-core`.")]
 pub struct Args {
     /// Cloudbreak RPC endpoint URL (returns composite version)
     #[arg(long)]
@@ -57,17 +56,19 @@ pub async fn run(args: &Args) -> Result<()> {
     println!("{:<12} {:>5}ms  {}", args.rpc1_name, dur1, v1);
     println!("{:<12} {:>5}ms  {}", args.rpc2_name, dur2, v2);
 
-    let expected_substring = format!("solana{}", v2);
-    if v1.contains(&expected_substring) {
+    let v1_solana = v1.split('+').next().unwrap_or(&v1);
+    if v1_solana == v2 {
         println!(
-            "\nMATCH {} embeds cluster solana version {:?}",
+            "\nMATCH {} reports cluster solana version {:?}",
             args.rpc1_name, v2
         );
         Ok(())
     } else {
         Err(anyhow!(
-            "MISMATCH: {} returned {:?} which does not contain {:?}",
-            args.rpc1_name, v1, expected_substring
+            "MISMATCH: {} returned {:?}, whose version before '+' is not {:?}",
+            args.rpc1_name,
+            v1,
+            v2
         ))
     }
 }
