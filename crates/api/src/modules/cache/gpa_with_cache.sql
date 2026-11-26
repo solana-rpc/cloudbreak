@@ -3,93 +3,63 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
--- Newest version per pubkey on narrow rows. Only `accounts` holds several versions per pubkey;
--- `snapshot_accounts` holds one, and a newer version of it is always in `accounts`.
 WITH
-accounts_latest AS MATERIALIZED (
-    SELECT DISTINCT ON (accounts.pubkey)
+program_accounts AS MATERIALIZED (
+    SELECT
         accounts.pubkey,
-        accounts.slot,
+        accounts.owner,
         accounts.lamports,
-        accounts.ctid AS row_id
+        accounts.slot,
+        accounts.executable,
+        accounts.rent_epoch,
+        accounts.data,
+        accounts.token_mint,
+        accounts.token_owner
     FROM accounts
     WHERE
         accounts.owner = {program}
         AND accounts.slot <= {latest_slot}
     -- {accounts_filters}
-    ORDER BY accounts.pubkey ASC, accounts.slot DESC
-)
-
-SELECT
-    latest.pubkey,
-    fresh.owner,
-    fresh.lamports,
-    latest.slot,
-    fresh.executable,
-    fresh.rent_epoch,
-    fresh.data,
-    fresh.token_mint
-FROM (
-    SELECT DISTINCT ON (winners.pubkey)
-        winners.pubkey,
-        winners.slot,
-        winners.lamports,
-        winners.row_id,
-        winners.in_accounts
-    FROM (
-        SELECT
-            accounts_latest.pubkey,
-            accounts_latest.slot,
-            accounts_latest.lamports,
-            accounts_latest.row_id,
-            TRUE AS in_accounts
-        FROM accounts_latest
-        UNION ALL
-        SELECT
-            snapshot_accounts.pubkey,
-            snapshot_accounts.slot,
-            snapshot_accounts.lamports,
-            snapshot_accounts.ctid AS row_id,
-            FALSE AS in_accounts
-        FROM snapshot_accounts
-        WHERE
-            snapshot_accounts.owner = {program}
-            AND snapshot_accounts.slot <= {latest_slot}
-    -- {snapshot_filters}
-    ) AS winners
-    -- A pubkey in both tables keeps its `accounts` version, which is always the newer one.
-    ORDER BY winners.pubkey ASC, winners.in_accounts DESC
-) AS latest
--- The full row, read from the winner's own table, only for winners newer than the cache.
-LEFT JOIN LATERAL (
-    SELECT
-        accounts.owner,
-        accounts.lamports,
-        accounts.executable,
-        accounts.rent_epoch,
-        accounts.data,
-        accounts.token_mint
-    FROM accounts
-    WHERE
-        latest.in_accounts
-        AND latest.slot > {cache_slot}
-        AND accounts.owner = {program}
-        AND accounts.ctid = latest.row_id
     UNION ALL
     SELECT
+        snapshot_accounts.pubkey,
         snapshot_accounts.owner,
         snapshot_accounts.lamports,
+        snapshot_accounts.slot,
         snapshot_accounts.executable,
         snapshot_accounts.rent_epoch,
         snapshot_accounts.data,
-        snapshot_accounts.token_mint
+        snapshot_accounts.token_mint,
+        snapshot_accounts.token_owner
     FROM snapshot_accounts
     WHERE
-        NOT latest.in_accounts
-        AND latest.slot > {cache_slot}
-        AND snapshot_accounts.owner = {program}
-        AND snapshot_accounts.ctid = latest.row_id
-) AS fresh ON TRUE
+        snapshot_accounts.owner = {program}
+        AND snapshot_accounts.slot <= {latest_slot}
+-- {snapshot_filters}
+)
+
+SELECT
+    pubkey,
+    CASE WHEN slot <= {cache_slot} THEN NULL ELSE owner END, -- noqa: AL03
+    CASE WHEN slot <= {cache_slot} THEN NULL ELSE lamports END AS lamports,
+    CASE WHEN slot <= {cache_slot} THEN slot ELSE slot END AS slot,
+    CASE WHEN slot <= {cache_slot} THEN NULL ELSE executable END AS executable,
+    CASE WHEN slot <= {cache_slot} THEN NULL ELSE rent_epoch END AS rent_epoch,
+    CASE WHEN slot <= {cache_slot} THEN NULL ELSE data END, -- noqa: AL03
+    CASE WHEN slot <= {cache_slot} THEN NULL ELSE token_mint END AS token_mint
+FROM (
+    SELECT DISTINCT ON (program_accounts.pubkey)
+        program_accounts.pubkey,
+        program_accounts.owner,
+        program_accounts.lamports,
+        program_accounts.slot,
+        program_accounts.executable,
+        program_accounts.rent_epoch,
+        program_accounts.data,
+        program_accounts.token_mint
+    FROM program_accounts
+    ORDER BY program_accounts.pubkey ASC, program_accounts.slot DESC
+) AS latest
 WHERE
     latest.lamports > 0
     -- Drop a winner superseded at or below the query slot by a row the filters skipped: a non-matching
@@ -102,4 +72,5 @@ WHERE
             AND newer.slot > latest.slot
             AND newer.slot <= {latest_slot}
     )
+-- DISTINCT ON already sorts by pubkey; this makes the output order explicit.
 ORDER BY latest.pubkey ASC;
