@@ -355,7 +355,6 @@ async fn process_single_request(
                 gpa_response,
                 gpa_global_start_time,
                 ctx.clone(),
-                methods::version::api_version(),
             )
             .await
             {
@@ -409,7 +408,6 @@ async fn process_single_request(
                 gpa_response,
                 gpa_global_start_time,
                 ctx.clone(),
-                methods::version::api_version(),
             )
             .await
             {
@@ -636,7 +634,6 @@ async fn process_single_request(
                 gpa_response,
                 gpa_global_start_time,
                 ctx.clone(),
-                methods::version::api_version(),
             )
             .await
             {
@@ -696,7 +693,6 @@ async fn process_single_request(
                 gpa_response,
                 gpa_global_start_time,
                 ctx.clone(),
-                methods::version::api_version(),
             )
             .await
             {

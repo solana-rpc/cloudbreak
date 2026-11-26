@@ -56,14 +56,10 @@ pub async fn get_version(
     }))
 }
 
-pub fn api_version() -> RpcApiVersion {
-    reported_version().api_version.clone()
-}
-
 pub fn response_context(slot: u64) -> RpcResponseContext {
     RpcResponseContext {
         slot,
-        api_version: Some(api_version()),
+        api_version: Some(reported_version().api_version.clone()),
     }
 }
 
