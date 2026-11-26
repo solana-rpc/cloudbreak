@@ -58,6 +58,7 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
         .await
         // sqlx puts the whole connection string, password included, in its error.
         .map_err(|_| anyhow::anyhow!("failed to create index listener database connection"))?;
+    methods::version::load(&database).await;
 
     let query_tracker_client: Option<QueryTrackerClient> = match &config.query_tracker_client {
         Some(qt_config) => {

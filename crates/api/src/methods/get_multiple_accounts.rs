@@ -16,6 +16,7 @@ use crate::http::CloudbreakRpcState;
 use crate::methods::processed;
 use crate::metrics;
 use crate::utils::encoding::check_account_data_len_for_encoding;
+use crate::methods::version::response_context;
 use cloudbreak_core::utils::token::{MintState, is_token_program};
 
 #[tracing::instrument(name = "gma_rpc", skip_all, fields(num_pubkeys = pubkeys.len()))]
@@ -57,7 +58,7 @@ pub async fn get_multiple_accounts(
     // Short-circuit for an empty input list, return `value: []` without touching the DB.
     if parsed_pubkeys.is_empty() {
         return Ok(RpcResponse {
-            context: crate::methods::version::response_context(state, latest_slot).await,
+            context: response_context(latest_slot),
             value: vec![],
         });
     }
@@ -139,7 +140,7 @@ pub async fn get_multiple_accounts(
     }
 
     Ok(RpcResponse {
-        context: crate::methods::version::response_context(state, latest_slot).await,
+        context: response_context(latest_slot),
         value: result,
     })
 }

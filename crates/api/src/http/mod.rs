@@ -327,7 +327,7 @@ fn extract_param<T: serde::de::DeserializeOwned>(
             .ok_or_else(|| missing_params_message(index))
             .and_then(|v| serde_json::from_value(v.clone()).map_err(invalid_params_message)),
         serde_json::Value::Null => Err(missing_params_message(index)),
-        _ => Err("Parameters must be an array".to_string()),
+        _ => Err("`params` should be an array".to_string()),
     }
 }
 
@@ -343,7 +343,18 @@ fn extract_optional_param<T: serde::de::DeserializeOwned>(
                 .map_err(invalid_params_message),
         },
         serde_json::Value::Null => Ok(None),
-        _ => Err("Parameters must be an array".to_string()),
+        _ => Err("`params` should be an array".to_string()),
+    }
+}
+
+/// Agave reports a short `params` with the method's required count, not the first missing index.
+fn require_params(params: &serde_json::Value, required: usize) -> Result<(), String> {
+    match params {
+        serde_json::Value::Array(arr) if arr.len() < required => {
+            Err(missing_params_message(required - 1))
+        }
+        serde_json::Value::Null => Err(missing_params_message(required - 1)),
+        _ => Ok(()),
     }
 }
 
@@ -383,5 +394,50 @@ pub fn http_status_for_error(err: &RpcError) -> StatusCode {
             service_unavailable: true,
         } => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::OK,
+    }
+}
+
+#[cfg(test)]
+mod param_message_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn missing_and_invalid_params_match_agave() {
+        let missing = "`params` should have at least 1 argument(s)";
+        assert_eq!(extract_param::<String>(&json!([]), 0).unwrap_err(), missing);
+        assert_eq!(
+            extract_param::<String>(&json!(null), 0).unwrap_err(),
+            missing
+        );
+        assert_eq!(
+            extract_param::<String>(&json!([1]), 0).unwrap_err(),
+            "Invalid params: invalid type: integer `1`, expected a string."
+        );
+        assert_eq!(
+            extract_param::<String>(&json!({"a": 1}), 0).unwrap_err(),
+            "`params` should be an array"
+        );
+    }
+
+    #[test]
+    fn short_params_report_the_required_count() {
+        let two = "`params` should have at least 2 argument(s)";
+        assert_eq!(require_params(&json!([]), 2).unwrap_err(), two);
+        assert_eq!(require_params(&json!(["owner"]), 2).unwrap_err(), two);
+        assert_eq!(require_params(&json!(null), 2).unwrap_err(), two);
+        assert!(require_params(&json!(["owner", {}]), 2).is_ok());
+    }
+
+    #[test]
+    fn bad_optional_config_is_an_error_and_null_is_none() {
+        let config = extract_optional_param::<solana_rpc_client_api::config::RpcAccountInfoConfig>;
+        assert!(config(&json!(["k", null]), 1).unwrap().is_none());
+        assert!(config(&json!(["k"]), 1).unwrap().is_none());
+        let err = config(&json!(["k", {"encoding": "foo"}]), 1).unwrap_err();
+        assert!(
+            err.starts_with("Invalid params: unknown variant `foo`"),
+            "{err}"
+        );
     }
 }

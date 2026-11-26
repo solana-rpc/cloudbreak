@@ -11,6 +11,7 @@ use tracing::Instrument;
 use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
 use crate::methods::resolve_commitment;
+use crate::methods::version::response_context;
 use crate::metrics;
 
 /// Reads the persisted top-N record for `mint` through the core read path,
@@ -66,7 +67,7 @@ pub async fn get_largest_accounts(
     };
 
     Ok(RpcResponse {
-        context: crate::methods::version::response_context(state, latest_slot).await,
+        context: response_context(latest_slot),
         value: rows
             .into_iter()
             .map(|(pubkey, lamports)| RpcAccountBalance {

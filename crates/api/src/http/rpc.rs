@@ -26,6 +26,7 @@ use crate::http::streaming::gpa_streaming_response_body;
 use crate::http::{
     JsonRpcRequest, JsonRpcResponse, RequestContext, RpcRequestPayload, extract_optional_param,
     extract_param, http_status_for_error, make_error_response, make_rpc_error_response,
+    require_params,
 };
 use crate::methods::get_token_accounts_by_owner::TokenAccountsFilter;
 use crate::methods::slot::RpcGetSlotConfig;
@@ -132,8 +133,13 @@ async fn process_single_request_catching(
     AssertUnwindSafe(process_single_request(rpc_request, state, ctx, in_batch))
         .catch_unwind()
         .await
-        .unwrap_or_else(|_| {
-            tracing::error!(target: "api_request_errors_count", "{method} panicked");
+        .unwrap_or_else(|panic| {
+            let reason = panic
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("non-string panic payload");
+            tracing::error!(target: "api_request_errors_count", "{method} panicked: {reason}");
             make_rpc_error_response(id, &RpcError::InternalError)
         })
 }
@@ -349,7 +355,7 @@ async fn process_single_request(
                 gpa_response,
                 gpa_global_start_time,
                 ctx.clone(),
-                methods::version::api_version(state).await,
+                methods::version::api_version(),
             )
             .await
             {
@@ -403,7 +409,7 @@ async fn process_single_request(
                 gpa_response,
                 gpa_global_start_time,
                 ctx.clone(),
-                methods::version::api_version(state).await,
+                methods::version::api_version(),
             )
             .await
             {
@@ -596,6 +602,9 @@ async fn process_single_request(
         "getTokenAccountsByOwner" => {
             let gpa_global_start_time = Instant::now();
 
+            if let Err(e) = require_params(&rpc_request.params, 2) {
+                return make_error_response(id, -32602, e);
+            }
             let owner: String = match extract_param(&rpc_request.params, 0) {
                 Ok(o) => o,
                 Err(e) => return make_error_response(id, -32602, e),
@@ -627,7 +636,7 @@ async fn process_single_request(
                 gpa_response,
                 gpa_global_start_time,
                 ctx.clone(),
-                methods::version::api_version(state).await,
+                methods::version::api_version(),
             )
             .await
             {
@@ -653,6 +662,9 @@ async fn process_single_request(
         "getTokenAccountsByDelegate" => {
             let gpa_global_start_time = Instant::now();
 
+            if let Err(e) = require_params(&rpc_request.params, 2) {
+                return make_error_response(id, -32602, e);
+            }
             let delegate: String = match extract_param(&rpc_request.params, 0) {
                 Ok(d) => d,
                 Err(e) => return make_error_response(id, -32602, e),
@@ -684,7 +696,7 @@ async fn process_single_request(
                 gpa_response,
                 gpa_global_start_time,
                 ctx.clone(),
-                methods::version::api_version(state).await,
+                methods::version::api_version(),
             )
             .await
             {

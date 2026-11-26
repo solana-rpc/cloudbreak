@@ -16,6 +16,7 @@ use crate::http::CloudbreakRpcState;
 use crate::methods::processed;
 use crate::metrics;
 use crate::utils::encoding::check_account_data_len_for_encoding;
+use crate::methods::version::response_context;
 use cloudbreak_core::utils::token::{MintState, is_token_program};
 
 #[tracing::instrument(name = "gai_rpc", skip_all, fields(pubkey = %pubkey))]
@@ -67,7 +68,7 @@ pub async fn get_account_info(
     let Some(account) = accounts.into_iter().next().flatten() else {
         // No account for this pubkey (absent, or its newest version is closed). Account not found.
         return Ok(RpcResponse {
-            context: crate::methods::version::response_context(state, latest_slot).await,
+            context: response_context(latest_slot),
             value: None,
         });
     };
@@ -120,7 +121,7 @@ pub async fn get_account_info(
     );
 
     Ok(RpcResponse {
-        context: crate::methods::version::response_context(state, latest_slot).await,
+        context: response_context(latest_slot),
         value: Some(ui_account),
     })
 }

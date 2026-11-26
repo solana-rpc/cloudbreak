@@ -356,7 +356,7 @@ struct StreamingResponseBodyWrapper {
 
 impl StreamingResponseBodyWrapper {
     /// When `context_slot` is set, the JSON-RPC `result` becomes `{"context":{"slot":N},"value":[...]}` instead of a bare array.
-    /// We serialize a real `RpcResponseContext` so any future fields (`apiVersion`, etc.) flow through automatically.
+    /// The context is a real `RpcResponseContext`, so it carries `apiVersion` like every other response.
     fn new(
         context_slot: Option<u64>,
         api_version: RpcApiVersion,

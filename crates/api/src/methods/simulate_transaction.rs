@@ -61,6 +61,7 @@ use tracing::Instrument;
 use crate::db_query;
 use crate::error::RpcError;
 use crate::http::{CachedFeatureSet, CloudbreakRpcState};
+use crate::methods::version::response_context;
 use cloudbreak_core::utils::token::{MintState, is_token_program};
 
 /// Default cluster lamports-per-signature
@@ -177,11 +178,9 @@ pub async fn simulate_transaction(
         && let Err(e) = sanitized_tx.verify()
     {
         return Ok(response(
-            state,
             slot,
             error_only(e, &config, loaded_addresses, replacement_blockhash),
-        )
-        .await);
+        ));
     }
 
     if requested_addresses.len() > sanitized_tx.message().account_keys().len() {
@@ -244,11 +243,9 @@ pub async fn simulate_transaction(
         Ok(configuration) => configuration,
         Err(e) => {
             return Ok(response(
-                state,
                 slot,
                 error_only(e, &config, loaded_addresses, replacement_blockhash),
-            )
-            .await);
+            ));
         }
     };
 
@@ -300,7 +297,7 @@ pub async fn simulate_transaction(
         &mint_accounts,
         block_time,
     )?;
-    Ok(response(state, slot, value).await)
+    Ok(response(slot, value))
 }
 
 const FEATURE_SET_TTL: Duration = Duration::from_secs(120);
@@ -528,13 +525,12 @@ fn decode_transaction(data: &str, encoding: UiTransactionEncoding) -> Result<Vec
     Ok(bytes)
 }
 
-async fn response(
-    state: &CloudbreakRpcState,
+fn response(
     slot: u64,
     value: RpcSimulateTransactionResult,
 ) -> RpcResponse<RpcSimulateTransactionResult> {
     RpcResponse {
-        context: crate::methods::version::response_context(state, slot).await,
+        context: response_context(slot),
         value,
     }
 }

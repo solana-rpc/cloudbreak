@@ -16,6 +16,7 @@ use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
 use crate::methods::get_largest_accounts::fetch_largest_record;
 use crate::methods::resolve_commitment;
+use crate::methods::version::response_context;
 use crate::{db_query, metrics};
 use cloudbreak_core::utils::token::{MintState, is_token_program};
 
@@ -104,7 +105,7 @@ pub async fn get_token_largest_accounts(
     };
 
     Ok(RpcResponse {
-        context: crate::methods::version::response_context(state, latest_slot).await,
+        context: response_context(latest_slot),
         value: rows
             .into_iter()
             .map(|(address, amount)| RpcTokenAccountBalance {

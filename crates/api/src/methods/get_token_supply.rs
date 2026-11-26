@@ -15,6 +15,7 @@ use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
 use crate::methods::processed;
 use crate::metrics;
+use crate::methods::version::response_context;
 use cloudbreak_core::utils::token::{MintState, is_token_program};
 
 #[tracing::instrument(name = "get_token_supply_rpc", skip_all, fields(pubkey = %mint))]
@@ -87,7 +88,7 @@ pub async fn get_token_supply(
     let ui_token_amount = token_amount_to_ui_amount_v3(supply, additional_data);
 
     Ok(RpcResponse {
-        context: crate::methods::version::response_context(state, latest_slot).await,
+        context: response_context(latest_slot),
         value: ui_token_amount,
     })
 }

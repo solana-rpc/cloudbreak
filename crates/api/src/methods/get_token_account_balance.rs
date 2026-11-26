@@ -12,6 +12,7 @@ use solana_rpc_client_api::response::Response as RpcResponse;
 use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
 use crate::methods::processed;
+use crate::methods::version::response_context;
 use crate::metrics;
 use cloudbreak_core::utils::token::{MintState, is_token_program};
 
@@ -109,7 +110,7 @@ pub async fn get_token_account_balance(
     let ui_token_amount = token_amount_to_ui_amount_v3(amount, additional_data);
 
     Ok(RpcResponse {
-        context: crate::methods::version::response_context(state, latest_slot).await,
+        context: response_context(latest_slot),
         value: ui_token_amount,
     })
 }

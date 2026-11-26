@@ -8,20 +8,14 @@ use crate::{
     http::{CloudbreakApiResponse, CloudbreakRpcState},
 };
 use cloudbreak_core::EnvironmentInfo;
+use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize};
 use solana_rpc_client_api::response::{RpcApiVersion, RpcResponseContext};
-use std::sync::{LazyLock, RwLock};
-use std::time::{Duration, Instant};
+use std::sync::OnceLock;
 
-/// The tag the binary was built from, or the crate version for local builds.
-const CLOUDBREAK_VERSION: &str = match option_env!("CLOUDBREAK_VERSION") {
-    Some(version) => version,
-    None => env!("CARGO_PKG_VERSION"),
-};
-const VERSION_CACHE_TTL: Duration = Duration::from_secs(600);
+const CLOUDBREAK_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-static VERSION_CACHE: LazyLock<RwLock<Option<(Instant, ReportedVersion)>>> =
-    LazyLock::new(|| RwLock::new(None));
+static REPORTED_VERSION: OnceLock<ReportedVersion> = OnceLock::new();
 
 /// One version string for `getVersion` and every response's `context.apiVersion`.
 #[derive(Debug, Clone)]
@@ -36,52 +30,45 @@ pub struct RpcVersionInfo {
     pub solana_core: String,
 }
 
+/// Reads the indexer's gRPC version once at startup; later changes need an API restart.
+pub async fn load(database: &DatabaseConnection) {
+    let grpc_version = EnvironmentInfo::load_grpc_version(database)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("failed to load the gRPC version, reporting it as unknown: {e}");
+            None
+        });
+    let version = compose_version(grpc_version.as_deref(), CLOUDBREAK_VERSION);
+    tracing::info!("reporting version {}", version.solana_core);
+    let _ = REPORTED_VERSION.set(version);
+}
+
+fn reported_version() -> &'static ReportedVersion {
+    REPORTED_VERSION.get_or_init(|| compose_version(None, CLOUDBREAK_VERSION))
+}
+
 #[tracing::instrument(name = "getVersion", skip_all)]
 pub async fn get_version(
-    state: &CloudbreakRpcState,
+    _state: &CloudbreakRpcState,
 ) -> Result<CloudbreakApiResponse<RpcVersionInfo>, RpcError> {
-    let version = reported_version(state).await?;
     Ok(CloudbreakApiResponse::Response(RpcVersionInfo {
-        solana_core: version.solana_core,
+        solana_core: reported_version().solana_core.clone(),
     }))
 }
 
-/// `apiVersion` for a response; the Solana crate version if the indexer's is unknown.
-pub async fn api_version(state: &CloudbreakRpcState) -> RpcApiVersion {
-    reported_version(state)
-        .await
-        .map(|version| version.api_version)
-        .unwrap_or_default()
+pub fn api_version() -> RpcApiVersion {
+    reported_version().api_version.clone()
 }
 
-pub async fn response_context(state: &CloudbreakRpcState, slot: u64) -> RpcResponseContext {
+pub fn response_context(slot: u64) -> RpcResponseContext {
     RpcResponseContext {
         slot,
-        api_version: Some(api_version(state).await),
+        api_version: Some(api_version()),
     }
 }
 
-async fn reported_version(state: &CloudbreakRpcState) -> Result<ReportedVersion, RpcError> {
-    if let Ok(cache) = VERSION_CACHE.read()
-        && let Some((cached_at, version)) = cache.as_ref()
-        && cached_at.elapsed() < VERSION_CACHE_TTL
-    {
-        return Ok(version.clone());
-    }
-
-    let grpc_version = EnvironmentInfo::load_grpc_version(&state.database)
-        .await
-        .map_err(|_| RpcError::InternalError)?;
-    let version = build_version(grpc_version.as_deref(), CLOUDBREAK_VERSION);
-
-    if let Ok(mut cache) = VERSION_CACHE.write() {
-        *cache = Some((Instant::now(), version.clone()));
-    }
-    Ok(version)
-}
-
-/// `<agave>+cloudbreak<build>.grpc<plugin>`, from a plugin version like `17.0.0-rc9+solana.4.4.0`.
-fn build_version(grpc_version: Option<&str>, cloudbreak_version: &str) -> ReportedVersion {
+/// `<agave>+cloudbreak<crate>.grpc<plugin>`, from a plugin version like `17.0.0-rc9+solana.4.4.0`.
+fn compose_version(grpc_version: Option<&str>, cloudbreak_version: &str) -> ReportedVersion {
     let (plugin, agave) = match grpc_version {
         Some(version) => match version.split_once('+') {
             Some((plugin, metadata)) => (plugin, metadata.strip_prefix("solana.")),
@@ -92,16 +79,16 @@ fn build_version(grpc_version: Option<&str>, cloudbreak_version: &str) -> Report
     let agave = agave
         .and_then(agave_semver)
         .unwrap_or_else(|| RpcApiVersion::default().to_string());
-    let cloudbreak = cloudbreak_version.trim_start_matches('v');
-    let cloudbreak = cloudbreak.split('+').next().unwrap_or(cloudbreak);
-
     let solana_core = format!(
         "{agave}+cloudbreak{}.grpc{}",
-        metadata_safe(cloudbreak),
+        metadata_safe(cloudbreak_version),
         metadata_safe(plugin)
     );
-    let api_version =
-        serde_json::from_value(serde_json::Value::String(solana_core.clone())).unwrap_or_default();
+    let api_version = serde_json::from_value(serde_json::Value::String(solana_core.clone()))
+        .unwrap_or_else(|e| {
+            tracing::warn!("{solana_core} is not semver ({e}); apiVersion uses the crate version");
+            RpcApiVersion::default()
+        });
     ReportedVersion {
         solana_core,
         api_version,
@@ -142,11 +129,8 @@ mod tests {
 
     #[test]
     fn mainnet_plugin_version() {
-        let v = build_version(Some("17.0.0-rc9+solana.4.4.0"), "v0.1.0-22582ef");
-        assert_eq!(
-            v.solana_core,
-            "4.4.0+cloudbreak0.1.0-22582ef.grpc17.0.0-rc9"
-        );
+        let v = compose_version(Some("17.0.0-rc9+solana.4.4.0"), "0.1.0");
+        assert_eq!(v.solana_core, "4.4.0+cloudbreak0.1.0.grpc17.0.0-rc9");
         assert_eq!(v.api_version.to_string(), v.solana_core);
         assert_eq!(
             (
@@ -159,21 +143,15 @@ mod tests {
     }
 
     #[test]
-    fn testnet_beta_and_release_tag_metadata() {
-        let v = build_version(
-            Some("18.0.0-rc4+solana.4.5.0.beta.0"),
-            "0.1.0-staging.48+solana-rpc-cloudbreak",
-        );
-        assert_eq!(
-            v.solana_core,
-            "4.5.0-beta.0+cloudbreak0.1.0-staging.48.grpc18.0.0-rc4"
-        );
+    fn testnet_beta_version() {
+        let v = compose_version(Some("18.0.0-rc4+solana.4.5.0.beta.0"), "0.1.0");
+        assert_eq!(v.solana_core, "4.5.0-beta.0+cloudbreak0.1.0.grpc18.0.0-rc4");
         assert_eq!(v.api_version.to_string(), v.solana_core);
     }
 
     #[test]
     fn unknown_plugin_falls_back_to_the_crate_version() {
-        let v = build_version(None, "0.1.0");
+        let v = compose_version(None, "0.1.0");
         let crate_version = RpcApiVersion::default().to_string();
         assert_eq!(
             v.solana_core,
