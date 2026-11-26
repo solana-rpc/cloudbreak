@@ -324,11 +324,9 @@ fn extract_param<T: serde::de::DeserializeOwned>(
     match params {
         serde_json::Value::Array(arr) => arr
             .get(index)
-            .ok_or_else(|| format!("Missing parameter at index {}", index))
-            .and_then(|v| {
-                serde_json::from_value(v.clone()).map_err(|e| format!("Invalid parameter: {}", e))
-            }),
-        serde_json::Value::Null => Err(format!("Missing parameter at index {}", index)),
+            .ok_or_else(|| missing_params_message(index))
+            .and_then(|v| serde_json::from_value(v.clone()).map_err(invalid_params_message)),
+        serde_json::Value::Null => Err(missing_params_message(index)),
         _ => Err("Parameters must be an array".to_string()),
     }
 }
@@ -342,11 +340,20 @@ fn extract_optional_param<T: serde::de::DeserializeOwned>(
             None | Some(serde_json::Value::Null) => Ok(None),
             Some(v) => serde_json::from_value(v.clone())
                 .map(Some)
-                .map_err(|e| format!("Invalid parameter: {}", e)),
+                .map_err(invalid_params_message),
         },
         serde_json::Value::Null => Ok(None),
         _ => Err("Parameters must be an array".to_string()),
     }
+}
+
+// Same texts as Agave's jsonrpc-core, so clients see identical -32602 messages.
+fn missing_params_message(index: usize) -> String {
+    format!("`params` should have at least {} argument(s)", index + 1)
+}
+
+fn invalid_params_message(e: serde_json::Error) -> String {
+    format!("Invalid params: {e}.")
 }
 
 fn make_error_response(id: serde_json::Value, code: i32, message: String) -> HttpHandlerResponse {
