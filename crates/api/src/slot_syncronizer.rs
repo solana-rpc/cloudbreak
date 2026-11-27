@@ -4,22 +4,23 @@
  */
 
 //! Keeps the confirmed and finalized slots and the service health in memory. The `slots_notify`
-//! trigger sends every real change of a `slots` row on [`SLOTS_CHANNEL`]; this task applies it.
+//! trigger sends every real change of a `slots` row on [`SLOTS_CHANNEL`]; this thread applies it.
 //! A lost connection, a bad payload or [`IDLE_TIMEOUT`] without a notification panics.
 //! With `[processed-accounts]` enabled it also publishes the processed [`Anchor`]. With
 //! `[mint-cache]` it applies each confirmed slot's mint changes before publishing the slot.
 
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cloudbreak_core::ApiConfig;
 use cloudbreak_core::modules::mint_cache::MintCache;
 use cloudbreak_core::modules::processed::Anchor;
-use sea_orm::DatabaseConnection;
 use sea_orm::sqlx::postgres::PgListener;
 use serde::Deserialize;
 use solana_commitment_config::CommitmentLevel;
-use tokio::{sync::watch, task::JoinHandle};
+use tokio::sync::{oneshot, watch};
+
+use crate::metrics;
 
 /// The channel the `slots_notify` trigger sends on.
 pub const SLOTS_CHANNEL: &str = "cloudbreak_slots";
@@ -77,36 +78,54 @@ pub struct SlotRow {
     pub health: bool,
     /// Set on the confirmed row only.
     pub blockhash: Option<String>,
+    /// Postgres wall clock in unix microseconds when the trigger ran.
+    pub written_at_us: i64,
 }
 
 /// Starts the slot syncronizer, or returns `None` when `[slot-syncronizer]` is disabled.
-/// The task only ends by panicking; the caller must treat that as fatal.
+/// The receiver resolves only when the thread ends, which it does only by panicking: treat it as fatal.
 pub fn start_slot_syncronizer(
-    db: DatabaseConnection,
     config: &ApiConfig,
     anchor_tx: watch::Sender<Option<Anchor>>,
     mint_cache: MintCache,
-) -> Option<(JoinHandle<()>, Arc<RwLock<SlotSyncronizerData>>)> {
+) -> Option<(oneshot::Receiver<()>, Arc<RwLock<SlotSyncronizerData>>)> {
     if !config.slot_syncronizer.enabled {
         return None;
     }
 
     let data = Arc::new(RwLock::new(SlotSyncronizerData::default()));
     let anchor_tx = config.processed_accounts_enabled().then_some(anchor_tx);
-    let handle = tokio::spawn(run(db, data.clone(), anchor_tx, mint_cache));
+    let url = config.database.url.clone();
+    let (alive_tx, alive_rx) = oneshot::channel();
+    // Own thread, runtime and connection
+    std::thread::Builder::new()
+        .name("slot-syncronizer".to_string())
+        .spawn({
+            let data = data.clone();
+            move || {
+                // Dropped when the thread ends, which resolves the caller's receiver.
+                let _alive = alive_tx;
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("slot syncronizer: failed to build its runtime")
+                    .block_on(run(&url, data, anchor_tx, mint_cache));
+            }
+        })
+        .expect("slot syncronizer: failed to spawn its thread");
 
-    Some((handle, data))
+    Some((alive_rx, data))
 }
 
 /// Listens on [`SLOTS_CHANNEL`] and applies each notification. Until the first one arrives the
 /// slots are 0 and the node reads as unhealthy.
 async fn run(
-    db: DatabaseConnection,
+    url: &str,
     data: Arc<RwLock<SlotSyncronizerData>>,
     anchor_tx: Option<watch::Sender<Option<Anchor>>>,
     mint_cache: MintCache,
 ) {
-    let mut listener = PgListener::connect_with(db.get_postgres_connection_pool())
+    let mut listener = PgListener::connect(url)
         .await
         .expect("slot syncronizer: failed to connect the listener");
     listener
@@ -137,6 +156,27 @@ async fn run(
                 .on_confirmed(row.slot as u64, row.blockhash.as_deref(), row.health);
         }
         apply(&data, anchor_tx.as_ref(), &row);
+        record_notify_delay(&row);
+    }
+}
+
+/// Records the time from the trigger's `written_at_us` until the row is applied. A negative delay
+/// (a clock step) is not recorded.
+fn record_notify_delay(row: &SlotRow) {
+    let commitment = if row.commitment == COMMITMENT_CONFIRMED {
+        "confirmed"
+    } else {
+        "finalized"
+    };
+    let now_us = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as i64;
+    let delay_us = now_us - row.written_at_us;
+    if delay_us >= 0 {
+        metrics::CLOUDBREAK_API_SLOT_NOTIFY_DELAY_US
+            .with_label_values(&[commitment])
+            .observe(delay_us as f64);
     }
 }
 
@@ -196,6 +236,7 @@ mod tests {
             block_time: slot * 10,
             health,
             blockhash: blockhash.map(str::to_string),
+            written_at_us: slot * 1_000,
         }
     }
 
@@ -206,12 +247,12 @@ mod tests {
     #[test]
     fn payload_parses_with_and_without_blockhash() {
         let row: SlotRow = serde_json::from_str(
-            r#"{"commitment":1,"slot":100,"block_time":1000,"health":true,"blockhash":"abc"}"#,
+            r#"{"commitment":1,"slot":100,"block_time":1000,"health":true,"blockhash":"abc","written_at_us":100000}"#,
         )
         .unwrap();
         assert_eq!(row, self::row(1, 100, true, Some("abc")));
         let row: SlotRow = serde_json::from_str(
-            r#"{"commitment":2,"slot":90,"block_time":900,"health":false,"blockhash":null}"#,
+            r#"{"commitment":2,"slot":90,"block_time":900,"health":false,"blockhash":null,"written_at_us":90000}"#,
         )
         .unwrap();
         assert_eq!(row, self::row(2, 90, false, None));

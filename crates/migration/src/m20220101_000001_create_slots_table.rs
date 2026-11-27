@@ -49,7 +49,8 @@ impl MigrationTrait for Migration {
                             'slot', NEW.slot,
                             'block_time', NEW.block_time,
                             'health', NEW.health,
-                            'blockhash', NEW.blockhash
+                            'blockhash', NEW.blockhash,
+                            'written_at_us', (extract(epoch from clock_timestamp()) * 1000000)::bigint
                         )::text
                     );
                     RETURN NEW;

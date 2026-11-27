@@ -6,6 +6,8 @@
 pub mod bandwidth;
 pub mod big_mint_scans;
 pub mod cache;
+pub mod long_poll;
 pub mod mint_resolver;
+pub mod runtime_lag;
 pub mod supply_cache;
 pub mod vote_accounts_cache;

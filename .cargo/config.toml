@@ -1,0 +1,4 @@
+# Enables Tokio's unstable task poll hooks, used by the opt-in long-poll detector
+# (`[metrics] long-poll-threshold-ms`). A RUSTFLAGS environment variable replaces this list.
+[build]
+rustflags = ["--cfg", "tokio_unstable"]

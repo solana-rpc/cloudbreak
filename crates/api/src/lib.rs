@@ -33,6 +33,17 @@ mod grpc_feed;
 mod slot_syncronizer;
 mod utils;
 
+/// Applies the API config's runtime options to the Tokio runtime `builder`, before it is built.
+/// A config that does not load changes nothing; `run` reports the error.
+pub fn configure_runtime(builder: &mut tokio::runtime::Builder, config: &str) {
+    let Ok(config) = ApiConfig::try_load(config) else {
+        return;
+    };
+    if let Some(threshold_ms) = config.metrics.long_poll_threshold_ms {
+        modules::long_poll::install(builder, Duration::from_millis(threshold_ms));
+    }
+}
+
 pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
     let config = ApiConfig::try_load(config)?;
     if let Some(processed) = &config.processed_accounts {
@@ -93,7 +104,6 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
     let (anchor_tx, anchor_rx) = tokio::sync::watch::channel(None);
     let (mut slot_syncronizer_handle, slot_syncronizer_data) =
         match slot_syncronizer::start_slot_syncronizer(
-            database.clone(),
             &config,
             anchor_tx,
             mint_cache.clone(),

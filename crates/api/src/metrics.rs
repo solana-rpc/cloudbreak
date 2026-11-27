@@ -212,6 +212,21 @@ lazy_static::lazy_static! {
         ),
         &["reason"],
     ).unwrap();
+
+    /// Microseconds from the `slots_notify` trigger to the slot syncronizer applying the row, by
+    /// `commitment`. Wall clocks: with the API on another node than Postgres it includes their offset.
+    pub static ref CLOUDBREAK_API_SLOT_NOTIFY_DELAY_US: HistogramVec = HistogramVec::new(
+        HistogramOpts::new(
+            "cloudbreak_api_slot_notify_delay_us",
+            "Microseconds from the slots row write to the slot syncronizer applying it, labelled by commitment"
+        )
+        .buckets(vec![
+            5.0, 50.0, 100.0, 200.0, 300.0, 500.0, 750.0, 1_000.0, 1_500.0, 2_000.0, 3_000.0,
+            5_000.0, 7_500.0, 10_000.0, 20_000.0, 50_000.0, 100_000.0, 250_000.0, 500_000.0,
+            1_000_000.0,
+        ]),
+        &["commitment"],
+    ).unwrap();
 }
 
 /// Tracks a GPA cache insertion while it is queued on, or running on, the
@@ -330,11 +345,22 @@ pub fn setup_metrics(config: &ApiConfig) -> anyhow::Result<()> {
             config.metrics.client_ip_bandwidth_enabled,
         );
 
+        // Runtime stall diagnostics, off by default. The long-poll hooks are installed when the runtime is built.
+        crate::modules::runtime_lag::register(
+            &METRICS_REGISTRY,
+            config.metrics.runtime_lag_probe_enabled,
+        );
+        crate::modules::long_poll::register(&METRICS_REGISTRY, config.metrics.long_poll_threshold_ms);
+
         if config.grpc_enabled() {
             register!(GRPC_ERRORS);
             register!(GRPC_TIMEOUT_ERRORS);
             register!(GRPC_TOTAL_UPDATES_RECEIVED);
             register!(GRPC_BUFFER_CHANNEL_SIZE_SENDER);
+        }
+
+        if config.slot_syncronizer.enabled {
+            register!(CLOUDBREAK_API_SLOT_NOTIFY_DELAY_US);
         }
 
         if config.processed_accounts_enabled() {
