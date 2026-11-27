@@ -8,14 +8,16 @@ WITH
         SELECT
             pubkey,
             owner,
-            slot
+            slot,
+            lamports
         FROM accounts
         WHERE pubkey = ANY($1)
         UNION ALL
         SELECT
             pubkey,
             owner,
-            slot
+            slot,
+            lamports
         FROM snapshot_accounts
         WHERE pubkey = ANY($1)
     ),
@@ -24,7 +26,9 @@ WITH
             pubkey,
             owner
         FROM all_accounts
-        ORDER BY pubkey ASC, slot DESC
+        -- A moved account has two rows at the slot of its move: the close row under its old owner
+        -- and the live row, whose owner is the one it has.
+        ORDER BY pubkey ASC, slot DESC, lamports DESC
     )
 INSERT INTO accounts (pubkey, owner, lamports, slot, executable, rent_epoch, data, write_version)
 SELECT

@@ -98,3 +98,12 @@ solana-hash = { workspace = true }
 solana-transaction-status-client-types = { workspace = true }
 solana-nonce-account = { workspace = true }
 bincode = { workspace = true }
+
+[dev-dependencies]
+cloudbreak-migration = { workspace = true }
+rstest = { workspace = true }
+testcontainers-modules = { workspace = true }
+libc = { workspace = true }
+cloudbreak-index = { workspace = true }
+cloudbreak-snapshot = { workspace = true }
+solana-program-pack = { workspace = true }

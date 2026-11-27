@@ -51,6 +51,18 @@ SELECT * FROM (
     FROM program_accounts
     ORDER BY program_accounts.pubkey ASC, program_accounts.slot DESC
 ) AS latest
-WHERE lamports > 0
+WHERE
+    lamports > 0
+    -- A newer row of the account under the program is its state at the read slot. The filters
+    -- left it out (a close row, a version they do not select), so the account is not returned.
+    AND NOT EXISTS (
+        SELECT 1
+        FROM accounts
+        WHERE
+            accounts.owner = {program}
+            AND accounts.pubkey = latest.pubkey
+            AND accounts.slot > latest.slot
+            AND accounts.slot <= {latest_slot}
+    )
 -- DISTINCT ON already sorts by pubkey; this makes the output order explicit.
 ORDER BY latest.pubkey ASC;
