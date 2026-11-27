@@ -53,7 +53,7 @@ pub async fn get_account_info(
         include_str!("../db/getAccountInfo.sql")
     };
 
-    let accounts = processed::read_accounts(
+    let (accounts, latest_slot) = processed::read_accounts(
         state,
         &read,
         std::slice::from_ref(&pubkey),

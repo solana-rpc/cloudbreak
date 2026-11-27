@@ -70,13 +70,6 @@ impl Read {
             None => state.latest_slot_and_block_time(self.commitment).await,
         }
     }
-
-    /// The Postgres slot bound: the blocks anchor, or the request slot.
-    fn sql_slot_bound(&self, latest_slot: u64) -> u64 {
-        self.blocks
-            .as_ref()
-            .map_or(latest_slot, |blocks| blocks.anchor_slot)
-    }
 }
 
 /// Resolves the request commitment. `method` is the metric label.
@@ -206,9 +199,11 @@ impl Account {
     }
 }
 
-/// Reads `keys` in order, `None` for an absent or closed key. Without blocks
-/// every key reads Postgres with `sql_template` at `latest_slot`. With blocks,
-/// a live key comes from memory and an unknown key reads Postgres at the anchor.
+/// Reads `keys` in order, `None` for an absent or closed key, and returns the
+/// context slot. Without blocks every key reads Postgres at the `slots` row for
+/// the commitment, read in the same snapshot, and that row is the context slot.
+/// With blocks, a live key comes from memory, an unknown key reads Postgres at
+/// the anchor, and the context slot stays `latest_slot`.
 /// `$1` in the template binds one bytea, or a bytea array when the template
 /// unnests it. `what` names the method in logs.
 pub(crate) async fn read_accounts(
@@ -219,7 +214,7 @@ pub(crate) async fn read_accounts(
     latest_slot: u64,
     with_mint: bool,
     what: &str,
-) -> Result<Vec<Option<Account>>, RpcError> {
+) -> Result<(Vec<Option<Account>>, u64), RpcError> {
     let in_blocks: Vec<ProcessedAccount<'_>> = match &read.blocks {
         Some(blocks) => blocks
             .read_span(what)
@@ -234,9 +229,15 @@ pub(crate) async fn read_accounts(
         .collect();
 
     let mut found = HashMap::with_capacity(unknown.len());
+    let mut context_slot = latest_slot;
     if !unknown.is_empty() {
-        let bound = read.sql_slot_bound(latest_slot);
-        for row in fetch_accounts(state, sql_template, &unknown, bound, what).await? {
+        let anchor = read.blocks.as_ref().map(|blocks| blocks.anchor_slot);
+        let (rows, bound) =
+            fetch_accounts(state, sql_template, &unknown, anchor, read.commitment, what).await?;
+        if anchor.is_none() {
+            context_slot = bound;
+        }
+        for row in rows {
             found.insert(
                 pubkey_column(&row, "pubkey")?,
                 Account::from_row(&row, with_mint)?,
@@ -250,7 +251,7 @@ pub(crate) async fn read_accounts(
     {
         resolve_mints(state, blocks, &mut accounts, &in_blocks).await?;
     }
-    Ok(accounts)
+    Ok((accounts, context_slot))
 }
 
 /// Pairs each key with its account from the blocks, from Postgres, or `None`.
@@ -301,11 +302,12 @@ async fn resolve_mints(
     mints.sort_unstable();
     mints.dedup();
     let sql_template = include_str!("../db/getMultipleAccounts.sql");
-    let rows = fetch_accounts(
+    let (rows, _) = fetch_accounts(
         state,
         sql_template,
         &mints,
-        blocks.anchor_slot,
+        Some(blocks.anchor_slot),
+        CommitmentLevel::Confirmed,
         "processed mint",
     )
     .await?;
@@ -322,14 +324,18 @@ async fn resolve_mints(
     Ok(())
 }
 
-/// Runs `sql_template` for `keys` bounded at `slot` under the API query timeout.
+/// Runs `sql_template` for `keys` under the API query timeout and returns the
+/// rows with the slot bound. The bound is `anchor`, or else the `slots` row at
+/// `commitment` read in the same snapshot as the accounts, so finalize cleanup
+/// can never have removed a key's newest row at or below it.
 async fn fetch_accounts(
     state: &CloudbreakRpcState,
     sql_template: &str,
     keys: &[Pubkey],
-    slot: u64,
+    anchor: Option<u64>,
+    commitment: CommitmentLevel,
     what: &str,
-) -> Result<Vec<PgRow>, RpcError> {
+) -> Result<(Vec<PgRow>, u64), RpcError> {
     let traceparent = db_query::traceparent_comment();
     let sql = match &traceparent {
         Some(comment) => format!("{comment} {sql_template}"),
@@ -349,12 +355,32 @@ async fn fetch_accounts(
     } else {
         query.bind(keys[0].to_bytes().to_vec())
     };
-    let query = query.bind(slot as i64);
 
     let pool = state.database.get_postgres_connection_pool();
     timeout(state.queries_timeout, async {
         let span = tracing::info_span!("account_db", method = what);
-        query.fetch_all(pool).instrument(span).await
+        if let Some(slot) = anchor {
+            let rows = query
+                .bind(slot as i64)
+                .fetch_all(pool)
+                .instrument(span)
+                .await?;
+            return Ok((rows, slot));
+        }
+        let mut tx = pool
+            .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .await?;
+        let slot: i64 = sqlx::query_scalar("SELECT slot FROM slots WHERE commitment = $1")
+            .bind(commitment as i32)
+            .fetch_one(&mut *tx)
+            .await?;
+        let rows = query
+            .bind(slot)
+            .fetch_all(&mut *tx)
+            .instrument(span)
+            .await?;
+        tx.commit().await?;
+        Ok::<_, sqlx::Error>((rows, slot as u64))
     })
     .await
     .map_err(|_elapsed| {

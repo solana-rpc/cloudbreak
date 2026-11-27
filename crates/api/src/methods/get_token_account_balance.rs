@@ -33,7 +33,7 @@ pub async fn get_token_account_balance(
 
     // The mint JOIN supplies the mint data the balance needs.
     let sql_template = include_str!("../db/getAccountInfoWithMintData.sql");
-    let accounts = processed::read_accounts(
+    let (accounts, latest_slot) = processed::read_accounts(
         state,
         &read,
         std::slice::from_ref(&pubkey),
