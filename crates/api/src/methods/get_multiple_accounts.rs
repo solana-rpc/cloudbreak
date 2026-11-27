@@ -77,7 +77,7 @@ pub async fn get_multiple_accounts(
 
     // One entry per input pubkey, in order. None = the account does not exist
     // (or its latest version is closed).
-    let accounts = processed::read_accounts(
+    let (accounts, latest_slot) = processed::read_accounts(
         state,
         &read,
         &parsed_pubkeys,

@@ -34,7 +34,7 @@ pub async fn get_token_supply(
     let (latest_slot, block_time) = read.slot_and_block_time(state).await?;
 
     let sql_template = include_str!("../db/getAccountInfo.sql");
-    let accounts = processed::read_accounts(
+    let (accounts, latest_slot) = processed::read_accounts(
         state,
         &read,
         std::slice::from_ref(&pubkey),
