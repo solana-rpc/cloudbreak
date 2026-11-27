@@ -98,8 +98,59 @@ pub fn start_slot_syncronizer(
     let data = Arc::new(RwLock::new(SlotSyncronizerData::default()));
     let anchor_tx = config.processed_accounts_enabled().then_some(anchor_tx);
     let handle = tokio::spawn(run(db, data.clone(), anchor_tx, mint_cache));
+    spawn_dedicated_listener(config.database.url.clone());
 
     Some((handle, data))
+}
+
+/// Records the notify delay as `stage="received_dedicated"` from a second listener on its own OS
+/// thread, runtime and connection. Against `received` it separates API scheduling from Postgres.
+fn spawn_dedicated_listener(url: String) {
+    let spawned = std::thread::Builder::new()
+        .name("slot-notify-probe".to_string())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(e) => {
+                    tracing::error!(target: "slot_syncronizer", "notify probe runtime: {e}");
+                    return;
+                }
+            };
+            runtime.block_on(async move {
+                let mut listener = match PgListener::connect(&url).await {
+                    Ok(listener) => listener,
+                    Err(e) => {
+                        tracing::error!(target: "slot_syncronizer", "notify probe connect: {e}");
+                        return;
+                    }
+                };
+                if let Err(e) = listener.listen(SLOTS_CHANNEL).await {
+                    tracing::error!(target: "slot_syncronizer", "notify probe LISTEN: {e}");
+                    return;
+                }
+                // `recv` reconnects by itself; a payload it cannot parse is skipped.
+                loop {
+                    match listener.recv().await {
+                        Ok(notification) => {
+                            let payload = notification.payload();
+                            if let Ok(row) = serde_json::from_str::<SlotRow>(payload) {
+                                record_notify_delay(&row, "received_dedicated");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(target: "slot_syncronizer", "notify probe: {e}");
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    }
+                }
+            });
+        });
+    if let Err(e) = spawned {
+        tracing::error!(target: "slot_syncronizer", "notify probe thread: {e}");
+    }
 }
 
 /// Listens on [`SLOTS_CHANNEL`] and applies each notification. Until the first one arrives the
