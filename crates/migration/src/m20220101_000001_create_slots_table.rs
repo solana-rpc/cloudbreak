@@ -31,8 +31,8 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // Sends every real change of a row on `cloudbreak_slots` for the API slot syncronizer.
-        // A no-op update (such as a health write that changes nothing) sends nothing.
+        // Sends every real change of a row on `cloudbreak_slots` for the API slot syncronizer; a no-op
+        // update sends nothing. `written_at_us` is the Postgres wall clock in unix µs at the trigger.
         manager
             .get_connection()
             .execute_unprepared(
@@ -49,7 +49,8 @@ impl MigrationTrait for Migration {
                             'slot', NEW.slot,
                             'block_time', NEW.block_time,
                             'health', NEW.health,
-                            'blockhash', NEW.blockhash
+                            'blockhash', NEW.blockhash,
+                            'written_at_us', (extract(epoch from clock_timestamp()) * 1000000)::bigint
                         )::text
                     );
                     RETURN NEW;

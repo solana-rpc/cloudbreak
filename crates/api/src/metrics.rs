@@ -212,6 +212,31 @@ lazy_static::lazy_static! {
         ),
         &["reason"],
     ).unwrap();
+
+    /// Microseconds from the `slots_notify` trigger run to the slot syncronizer, by `commitment`
+    /// and `stage` (`received`, or `applied` to the cache). Both are wall clocks: with the API
+    /// on another node than Postgres it also counts the offset between the two hosts' clocks.
+    pub static ref CLOUDBREAK_API_SLOT_NOTIFY_DELAY_US: HistogramVec = HistogramVec::new(
+        HistogramOpts::new(
+            "cloudbreak_api_slot_notify_delay_us",
+            "Microseconds from the slots row write to the slot syncronizer, labelled by commitment and stage"
+        )
+        .buckets(vec![
+            5.0, 50.0, 100.0, 200.0, 300.0, 500.0, 750.0, 1_000.0, 1_500.0, 2_000.0, 3_000.0,
+            5_000.0, 7_500.0, 10_000.0, 20_000.0, 50_000.0, 100_000.0, 250_000.0, 500_000.0,
+            1_000_000.0,
+        ]),
+        &["commitment", "stage"],
+    ).unwrap();
+
+    /// Notify delays below zero: a clock step, or clock offset between the Postgres and API hosts.
+    pub static ref CLOUDBREAK_API_SLOT_NOTIFY_NEGATIVE_DELAY_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new(
+            "cloudbreak_api_slot_notify_negative_delay_total",
+            "Slot notifications whose measured delay was negative, labelled by commitment and stage"
+        ),
+        &["commitment", "stage"],
+    ).unwrap();
 }
 
 /// Tracks a GPA cache insertion while it is queued on, or running on, the
@@ -335,6 +360,11 @@ pub fn setup_metrics(config: &ApiConfig) -> anyhow::Result<()> {
             register!(GRPC_TIMEOUT_ERRORS);
             register!(GRPC_TOTAL_UPDATES_RECEIVED);
             register!(GRPC_BUFFER_CHANNEL_SIZE_SENDER);
+        }
+
+        if config.slot_syncronizer.enabled {
+            register!(CLOUDBREAK_API_SLOT_NOTIFY_DELAY_US);
+            register!(CLOUDBREAK_API_SLOT_NOTIFY_NEGATIVE_DELAY_TOTAL);
         }
 
         if config.processed_accounts_enabled() {
